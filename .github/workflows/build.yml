@@ -58,7 +58,7 @@ jobs:
     - name: "Install"
       uses: awalsh128/cache-apt-pkgs-action@latest
       with:
-        packages: git build-essential cmake ccache libgl1-mesa-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libicu-dev
+        packages: git build-essential cmake ccache ninja-build libgl1-mesa-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libicu-dev
         version: 1.0
 
     - name: ccache
@@ -70,9 +70,10 @@ jobs:
 
     - name: Configure Build Files
       run: |
-        cmake -DCMAKE_BUILD_TYPE=${{ matrix.config }} -B build \
+        cmake -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.config }} -B build \
           -DCMAKE_C_COMPILER_LAUNCHER=ccache \
-          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+          -DCMAKE_DISABLE_PRECOMPILE_HEADERS=ON
 
     - name: Build Project Alice (GUI, manual dispatch only)
       if: github.event_name == 'workflow_dispatch'
