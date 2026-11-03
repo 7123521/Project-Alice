@@ -57,8 +57,11 @@ jobs:
           buildtree-
 
     - name: Pin source timestamps to the cached build
+      shell: bash
       run: |
         set -eu
+        cd "${GITHUB_WORKSPACE:-$PWD}"
+        echo "cwd=$(pwd)"
         mkdir -p build
         if [ -f build/.cached_sha ]; then
           BASE=$(cat build/.cached_sha)
