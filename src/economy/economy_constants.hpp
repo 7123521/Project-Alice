@@ -2,6 +2,11 @@
 
 #include "culture_constants.hpp"
 
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <vector>
+
 namespace economy {
 
 // EXPERIMENT (ALICE_EXP_GOLD_ANCHOR=1): keep the *real* size of the gold money injection constant by
