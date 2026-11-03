@@ -147,6 +147,7 @@ list(APPEND ALICE_INCREMENTAL_SOURCES_LIST_GUI_OTHER
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_leader_tooltip.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_modifier_tooltips.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_trigger_tooltips.cpp"
+	"${PROJECT_SOURCE_DIR}/src/gui/immediate_mode.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/province_tiles/province_tiles.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_province_window.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_trigger_tooltips.cpp"
@@ -302,6 +303,7 @@ list(APPEND ALICE_SIM_SOURCES_LIST
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_effect_tooltips.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_modifier_tooltips.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_trigger_tooltips.cpp"
+	"${PROJECT_SOURCE_DIR}/src/gui/immediate_mode.cpp"
 	${ALICE_INCREMENTAL_SOURCES_LIST_RARELY_CHANGED}
 	${ALICE_INCREMENTAL_SOURCES_LIST_SCRIPTING}
 	${ALICE_INCREMENTAL_SOURCES_LIST_SVG}
