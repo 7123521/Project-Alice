@@ -5,9 +5,28 @@ if(WIN32)
 	add_library(lib_luajit INTERFACE)
 	target_link_libraries(lib_luajit INTERFACE ${PROJECT_SOURCE_DIR}/libs/luajit.lib)
 else()
-	# PATCHED: no network fetch; use system libluajit with vendored headers
-	message(STATUS "Using system LuaJIT (local patch)")
-	add_library(lib_luajit INTERFACE)
-	target_include_directories(lib_luajit INTERFACE ${PROJECT_SOURCE_DIR}/src/scripting/luajit)
-	target_link_libraries(lib_luajit INTERFACE /usr/lib/x86_64-linux-gnu/libluajit-5.1.so.2)
+	message(STATUS "Fetching luajit...")
+	include(ExternalProject)
+	ExternalProject_Add(
+		luajit
+
+		SOURCE_DIR ${CMAKE_CURRENT_BINARY_DIR}/luajit/source
+
+		GIT_REPOSITORY https://luajit.org/git/luajit.git
+		GIT_TAG origin/v2.1
+		GIT_SHALLOW FALSE
+		GIT_PROGRESS TRUE
+
+		CONFIGURE_COMMAND ""
+		BUILD_COMMAND make
+
+		BUILD_IN_SOURCE TRUE
+		BUILD_BYPRODUCTS ${CMAKE_CURRENT_BINARY_DIR}/luajit/source/luajit.h
+		BUILD_BYPRODUCTS ${CMAKE_CURRENT_BINARY_DIR}/luajit/source/src/libluajit.so
+		INSTALL_COMMAND make install DESTDIR=${DESTDIR} PREFIX=<INSTALL_DIR>
+	)
+	add_library(lib_luajit INTERFACE ${CMAKE_CURRENT_BINARY_DIR}/luajit/source/luajit.h)
+	add_dependencies(lib_luajit luajit)
+	target_link_libraries(lib_luajit INTERFACE ${CMAKE_CURRENT_BINARY_DIR}/luajit/source/src/libluajit.so)
 endif()
+
