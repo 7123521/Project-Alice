@@ -128,8 +128,11 @@ jobs:
           echo
           echo "== ccache =="; ccache --show-stats || true
           echo
-          echo "== ccache decisions =="
-          CCACHE_LOGFILE=/tmp/ccache.log ccache --show-log-stats 2>&1 | tail -20 || true
+          echo "== ccache result codes (why each compile was a hit or a miss) =="
+          grep -o '"result": "[a-z_]*"' /tmp/ccache.log 2>/dev/null | sort | uniq -c | sort -rn | head -15 || echo "(no ccache log)"
+          echo
+          echo "== ccache miss hints =="
+          grep -o '"reason": "[^"]*"' /tmp/ccache.log 2>/dev/null | sort | uniq -c | sort -rn | head -10 || true
           echo
           echo "== rebuild count (how many objects ninja rebuilt) =="
           grep -c 'Building CXX' build/build.log 2>/dev/null || echo 0
