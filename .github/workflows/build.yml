@@ -50,12 +50,15 @@ jobs:
 
     - name: Configure
       run: |
+        set -o pipefail
+        mkdir -p build
         cmake -G Ninja -B build \
           -DCMAKE_BUILD_TYPE=Release \
           -DCMAKE_C_COMPILER=clang \
           -DCMAKE_CXX_COMPILER=clang++ \
           -DCMAKE_C_COMPILER_LAUNCHER=ccache \
-          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+          2>&1 | tee build/configure.log
 
     - name: Build headless (AliceIncremental)
       run: cmake --build build --parallel --target AliceIncremental
@@ -75,6 +78,7 @@ jobs:
         echo "all shared libraries resolve"
 
     - name: Collect report
+      if: always()
       run: |
         {
           echo "commit: ${{ github.sha }}"
@@ -86,12 +90,17 @@ jobs:
           echo
           echo "== ccache =="; ccache --show-stats || true
           echo
-          echo "== binary =="; ls -la build/AliceIncremental
+          echo "== binary =="; ls -la build/AliceIncremental 2>/dev/null || true
+          echo
+          echo "== configure log tail =="; tail -60 build/configure.log 2>/dev/null || echo "(no configure log)"
+          echo
+          echo "== cmake configure log =="; tail -60 build/CMakeFiles/CMakeConfigureLog.yaml 2>/dev/null || echo "(none)" 
           echo "== ldd =="; ldd build/AliceIncremental || true
         } > build/ci-report.txt
         cat build/ci-report.txt
 
     - name: Strip and compress
+      if: success()
       run: |
         for b in AliceIncremental Alice; do
           [ -f "build/$b" ] || continue
@@ -101,7 +110,7 @@ jobs:
         ls -la build/Alice* || true
 
     - name: Publish dev build
-      if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
+      if: always() && (github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main')
       uses: softprops/action-gh-release@v2
       with:
         tag_name: dev-latest
