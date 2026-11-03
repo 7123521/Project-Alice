@@ -129,7 +129,7 @@ set_source_files_properties(
 )
 
 list(APPEND ALICE_INCREMENTAL_SOURCES_LIST_GUI_OTHER
-	"${PROJECT_SOURCE_DIR}/src/gui/gui_element_types.cpp"
+	"${PROJECT_SOURCE_DIR}/src/gui/gui_graphics.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_main_menu.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_console.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_event.cpp"
@@ -278,7 +278,7 @@ list(APPEND ALICE_SIM_SOURCES_LIST
 	"${PROJECT_SOURCE_DIR}/src/graphics/opengl_wrapper.cpp"
 	"${PROJECT_SOURCE_DIR}/src/graphics/texture.cpp"
 	# the headless Lua API exposes ui::element_base, whose three virtual-method
-	# definitions live in this file even though the rest of the GUI is not needed
+	# definitions live in gui_graphics.cpp even though the rest of the GUI is not needed
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_element_types.cpp"
 	${ALICE_INCREMENTAL_SOURCES_LIST_GAMESTATE}
 	"${PROJECT_SOURCE_DIR}/src/map/map_modes.cpp"
