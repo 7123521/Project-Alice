@@ -170,6 +170,8 @@ list(APPEND ALICE_INCREMENTAL_SOURCES_LIST_GUI_OTHER
 	"${PROJECT_SOURCE_DIR}/src/parsing/parsers.cpp"
 	"${PROJECT_SOURCE_DIR}/src/platform_specific.cpp"
 	"${PROJECT_SOURCE_DIR}/src/provinces/province.cpp"
+	"${PROJECT_SOURCE_DIR}/src/gui/economy_viewer.cpp"
+	"${PROJECT_SOURCE_DIR}/src/gui/gui_effect_tooltips.cpp"
 	"${PROJECT_SOURCE_DIR}/src/scripting/effects.cpp"
 	"${PROJECT_SOURCE_DIR}/src/scripting/events.cpp"
 	"${PROJECT_SOURCE_DIR}/src/scripting/triggers.cpp"
