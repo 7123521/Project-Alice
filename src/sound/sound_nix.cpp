@@ -181,7 +181,7 @@ void initialize_sound_system(sys::state& state) {
 		{ &state.sound_ptr->province_select_sounds[2], NATIVE("NU_ProvSelect3.wav") },
 		{ &state.sound_ptr->province_select_sounds[3], NATIVE("NU_ProvSelect4.wav") },
 	};
-	auto const assets_directory = simple_fs::open_directory(root_dir, NATIVE("\\assets"));
+	auto const assets_directory = simple_fs::open_directory(root_dir, NATIVE("assets"));
 	for(const auto& e : new_sound_table) {
 		auto file_peek = simple_fs::peek_file(assets_directory, e.name);
 		e.audio->set_file(file_peek ? simple_fs::get_full_name(*file_peek) : native_string());

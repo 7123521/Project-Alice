@@ -17,6 +17,21 @@ char to_lowercase(unsigned char c) {
 }
 // check if there are any matching files with diffrent case. Vic2 itself and many mods expect caseless match when looking for files. Eg several gfx files in vanilla
 // Even if it is technically not the linux standard, it has to read the Vic2 files which the developers expected to be windows-only
+namespace simple_fs_detail {
+std::vector<native_string> split_path(native_string_view path) {
+	std::vector<native_string> parts;
+	size_t start = 0;
+	for(size_t i = 0; i <= path.size(); ++i) {
+		if(i == path.size() || path[i] == '/') {
+			if(i > start)
+				parts.emplace_back(path.substr(start, i - start));
+			start = i + 1;
+		}
+	}
+	return parts;
+}
+}
+
 std::optional<unopened_file> find_file_caseless(const directory& dir, native_string_view file_name) {
 	native_string file_name_str = native_string{ file_name };
 	std::transform(file_name_str.cbegin(), file_name_str.cend(), file_name_str.begin(), to_lowercase);
@@ -392,6 +407,62 @@ std::optional<file> open_file(directory const& dir, native_string_view file_name
 			return std::optional<file>(file(file_descriptor, full_path));
 		}
 	}
+	// PATCHED: 文件名含路径分隔符时，逐级做大小写不敏感解析。
+	// mod 普遍在 Windows 上开发（大小写不敏感文件系统），其内部引用经常与
+	// 实际文件名大小写不一致；Windows 下能打开，Linux 下直接 miss，表现为
+	// 黑图/缺纹理。这里恢复与 Windows 相同的语义。
+		// PATCHED: 逐级大小写不敏感解析 + 末段扩展名无关匹配。
+		// mod 普遍在 Windows 上开发（大小写不敏感文件系统），内部引用与实际
+		// 文件名的大小写经常不一致；Windows 能打开，Linux 直接 miss，表现为黑图。
+		// 这里按引擎的 root 优先级（mod 在前）逐级恢复 Windows 语义。
+		if(!dir.parent_system)
+			return std::optional<file>{}; // PATCHED: root 目录无 parent_system，交回原逻辑
+		for(size_t ri = dir.parent_system->ordered_roots.size(); ri-- > 0;) {
+			native_string accum = dir.relative_path;
+			bool ok = true;
+			auto parts = simple_fs_detail::split_path(file_name);
+			for(size_t idx = 0; idx < parts.size() && ok; ++idx) {
+				native_string probe = dir.parent_system->ordered_roots[ri] + accum;
+				DIR* dp = opendir(probe.c_str());
+				if(!dp) { ok = false; break; }
+				native_string want_lower;
+				for(auto c : parts[idx]) want_lower.push_back(to_lowercase(static_cast<unsigned char>(c)));
+				native_string want_stem;
+				if(idx + 1 == parts.size()) {
+					auto dot = want_lower.rfind(NATIVE('.'));
+					if(dot != native_string::npos) want_stem = want_lower.substr(0, dot);
+				}
+				std::optional<native_string> exact, stemmatch;
+				struct dirent* ent;
+				while((ent = readdir(dp)) != nullptr) {
+					native_string nm = ent->d_name;
+					if(nm == NATIVE(".") || nm == NATIVE("..")) continue;
+					native_string lower;
+					for(auto c : nm) lower.push_back(to_lowercase(static_cast<unsigned char>(c)));
+					if(!exact && lower == want_lower) exact = nm;
+					if(!stemmatch && !want_stem.empty()) {
+						auto dot = lower.rfind(NATIVE('.'));
+						if(dot != native_string::npos && lower.substr(0, dot) == want_stem) stemmatch = nm;
+					}
+				}
+				closedir(dp);
+				auto chosen = exact ? *exact : (stemmatch ? *stemmatch : native_string{});
+				if(chosen.empty()) { ok = false; break; }
+				accum += NATIVE('/') + chosen;
+			}
+			if(ok) {
+				native_string full = dir.parent_system->ordered_roots[ri] + accum;
+				if(!simple_fs::is_ignored_path(*dir.parent_system, full)) {
+					struct stat st;
+					if(stat(full.c_str(), &st) == 0 && S_ISREG(st.st_mode)) {
+						int fd = open(full.c_str(), O_RDONLY | O_NONBLOCK);
+						if(fd != -1)
+							return std::optional<file>(file(fd, full));
+					}
+				}
+			}
+		}
+
 	auto caseless_file = find_file_caseless(dir, file_name);
 	if(caseless_file) {
 		auto opened_file = open_file(*caseless_file);

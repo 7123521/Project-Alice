@@ -2,6 +2,9 @@
 #include "province.hpp"
 #include "province_templates.hpp"
 #include "system_state.hpp"
+#include "economy_constants.hpp"
+#include <vector>
+#include <algorithm>
 #include <set>
 
 namespace trade_network {
@@ -514,6 +517,64 @@ void generate_sea_trade_routes(sys::state& state) {
 		state.world.trade_route_set_is_sea_route(new_route_from, true);
 		state.world.trade_route_set_owner(new_route_to, best_parent[i].parent);
 		state.world.trade_route_set_owner(new_route_from, best_parent[i].parent);
+	}
+
+	// EXPERIMENT (ALICE_EXP_TRADE_TWOPASS): the author's own plan from 2026-10-08 -- "one pass which
+	// filters away all small nodes and establishes connection between bodies of high mass and a second
+	// local pass, which establishes connections between bodies of low mass and high mass". The existing
+	// score (base/distance)^3 keeps every long-haul edge out, so a market like 1836 San Francisco has no
+	// route to any manufacturing centre at all. This pass deliberately ignores that distance penalty.
+	if(economy::experiment_trade_twopass() > 0) {
+		size_t const hub_count = size_t(economy::experiment_trade_twopass());
+		std::vector<sea_trade_candidate_data> hubs = candidates;
+		std::sort(hubs.begin(), hubs.end(), [](sea_trade_candidate_data const& a, sea_trade_candidate_data const& b) {
+			return a.population > b.population;
+		});
+		if(hubs.size() > hub_count)
+			hubs.resize(hub_count);
+
+		auto route_exists = [&](dcon::market_id a, dcon::market_id b) {
+			bool found = false;
+			state.world.market_for_each_trade_route_as_origin(a, [&](auto r) {
+				if(state.world.trade_route_get_target(r) == b)
+					found = true;
+			});
+			return found;
+		};
+		auto connect = [&](sea_trade_candidate_data const& a, sea_trade_candidate_data const& b) {
+			if(a.market == b.market || route_exists(a.market, b.market))
+				return;
+			auto r1 = state.world.force_create_trade_route(a.market, b.market);
+			auto r2 = state.world.force_create_trade_route(b.market, a.market);
+			state.world.trade_route_set_is_sea_route(r1, true);
+			state.world.trade_route_set_is_sea_route(r2, true);
+			state.world.trade_route_set_owner(r1, a.market);
+			state.world.trade_route_set_owner(r2, a.market);
+		};
+
+		// pass 1: every hub with every hub
+		for(size_t i = 0; i < hubs.size(); ++i) {
+			for(size_t j = i + 1; j < hubs.size(); ++j) {
+				connect(hubs[i], hubs[j]);
+			}
+		}
+		// pass 2: every coastal market to its nearest hubs. Connecting to a single nearest hub leaves a
+		// market dependent on whatever that one hub happens to produce; feeding it the nearest few raises the
+		// chance that the goods it lacks (clothes, liquor, ammunition -- final consumption goods, which are
+		// produced in very few places) actually reach it.
+		size_t const links_per_market = size_t(economy::experiment_trade_twopass_links());
+		for(auto& origin : candidates) {
+			std::vector<std::pair<float, sea_trade_candidate_data const*>> by_dist;
+			by_dist.reserve(hubs.size());
+			for(auto& hub : hubs) {
+				if(hub.market == origin.market)
+					continue;
+				by_dist.emplace_back(province::direct_distance_km(state, origin.coast, hub.coast), &hub);
+			}
+			std::sort(by_dist.begin(), by_dist.end(), [](auto const& a, auto const& b) { return a.first < b.first; });
+			for(size_t i = 0; i < by_dist.size() && i < links_per_market; ++i)
+				connect(origin, *by_dist[i].second);
+		}
 	}
 }
 

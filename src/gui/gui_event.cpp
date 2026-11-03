@@ -533,6 +533,12 @@ void event_image::on_update(sys::state& state) noexcept {
 		base_data.data.image.gfx_object = state.world.national_event_get_image(std::get<event::pending_human_n_event>(content).e);
 	else if(std::holds_alternative<event::pending_human_f_n_event>(content))
 		base_data.data.image.gfx_object = state.world.free_national_event_get_image(std::get<event::pending_human_f_n_event>(content).e);
+	// PATCHED: 诊断黑图——输出事件图的 gfx/纹理/元素尺寸
+	if(base_data.data.image.gfx_object) {
+		auto const& g = state.ui_defs.gfx[base_data.data.image.gfx_object];
+		auto k = state.to_string_view(state.ui_defs.textures[g.primary_texture_handle]);
+		fprintf(stderr, "[alice-evimg] gfx=%u tex_key=%.60s tex_size=%ux%u elem_size=%hux%hu loaded=%d",			uint16_t(base_data.data.image.gfx_object.index()), k.data(),			state.open_gl.asset_textures[g.primary_texture_handle].size_x,			state.open_gl.asset_textures[g.primary_texture_handle].size_y,			base_data.size.x, base_data.size.y,			int(state.open_gl.asset_textures[g.primary_texture_handle].loaded));
+	}
 }
 
 void event_desc_text::on_create(sys::state& state) noexcept {

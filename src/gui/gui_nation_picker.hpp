@@ -335,6 +335,14 @@ protected:
 				sys::save_header h;
 				if(content.file_size > sys::sizeof_save_header(h))
 					sys::read_save_header(reinterpret_cast<uint8_t const*>(content.data), h);
+				// A save written by a different build may carry an incompatible header layout;
+				// the parsed tag/cgov can then be out of range and drawing the flag texture
+				// would index outside the texture table. Skip such entries instead of crashing.
+				const bool tag_in_range = size_t(h.tag.index()) < state.world.national_identity_size();
+				const bool gov_in_range = !h.cgov || size_t(h.cgov.index()) < state.world.government_flag_size();
+				if(!tag_in_range || !gov_in_range)
+					continue;
+
 				if(h.checksum.is_equal(state.scenario_checksum)) {
 					row_contents.push_back(std::make_shared<save_item>(save_item{ simple_fs::get_file_name(f), h.timestamp, h.d, h.tag, h.cgov, false, true, std::string(h.save_name) }));
 				}

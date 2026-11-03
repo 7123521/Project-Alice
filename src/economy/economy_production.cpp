@@ -1847,7 +1847,8 @@ void update_rgo_profit(sys::state& state) {
 			auto produced = state.world.province_get_rgo_output(province, c);
 			auto move_to_nation = produced
 				* state.defines.gold_to_cash_rate
-				* state.world.commodity_get_cost(c);
+				* state.world.commodity_get_cost(c)
+				* (economy::experiment_gold_anchor() ? economy::gold_scale() : 1.f);
 			assert(std::isfinite(move_to_nation) && produced >= 0.0f);
 			// #CAUTION# changes nation values!
 			auto cur_money = state.world.nation_get_treasury(controller);
@@ -2102,6 +2103,14 @@ void update_employment(sys::state& state, bool ignore_reality, float presim_empl
 			if(ignore_reality) {
 				sales_expected_rate = 1.f;
 			}
+			// Money rgos (gold / precious goods) are bought by the controller at a fixed rate and are
+			// excluded from supply/demand registration, so the market never quotes a sales probability
+			// for them: the field stays at its initialised 0, and the employment gradient reads that as
+			// "this good can never be sold", which empties every gold mine within a year. Gold always has
+			// a buyer (the state), so report it as sellable.
+			if(state.world.commodity_get_money_rgo(c)) {
+				sales_expected_rate = 1.f;
+			}
 			auto spending_per_worker_perception = wage_per_worker * (1.f + aristocrats_greed);
 			auto gradient = gradient_employment_i<ve::fp_vector>(
 				(workers_optimism + (1.f - workers_optimism) * workers_availability)
@@ -2252,6 +2261,16 @@ void update_employment(sys::state& state, bool ignore_reality, float presim_empl
 		// ideally decided by factory budget but it is what it is
 
 		auto budget = factory_profit_to_wage_bound * state.world.factory_get_size(facids) * output_per_worker * price_output;
+		// EXPERIMENT (ALICE_EXP_FACTORY_BUDGET_PROFIT=1): upstream computes the hiring budget from gross
+		// output value only. When input prices rise, gross output still contains the input cost, so the
+		// budget shrinks even though the factory may still be profitable, and employment falls with it.
+		// Using profit (output value minus input cost) matches the budget to the quantity it represents.
+		if(economy::experiment_factory_budget_profit()) {
+			auto per_worker_input = state.world.factory_get_input_expected_cost_per_worker(facids);
+			auto gross = output_per_worker * price_output;
+			budget = factory_profit_to_wage_bound * state.world.factory_get_size(facids)
+				* ve::max(ve::fp_vector{ 0.f }, gross - per_worker_input);
+		}
 
 		unqualified_next = ve::max(0.f, ve::min(state.world.factory_get_size(facids), ve::min(budget / wage_no_education - 1.f, unqualified_next)));
 		primary_next = ve::max(0.f, ve::min(state.world.factory_get_size(facids), ve::min(budget / wage_basic_education - 1.f, primary_next)));
@@ -2381,7 +2400,18 @@ void update_employment(sys::state& state, bool ignore_reality, float presim_empl
 				auto output_cost = base_artisan_output_cost(state, markets, cid, expected_price);
 				auto input_cost = inputs_data.total_cost * artisan_input_multiplier(state, nations);
 
-				auto base_output_cost_per_worker = output_cost / artisans_per_employment_unit * sales_expectation_perception * purchase_expectation_perception;
+				// EXPERIMENT (ALICE_EXP_ARTISAN_ENTRY=k): the expected revenue of an artisan is discounted by the
+				// *currently realised* probability of selling, so in a money-limited market (where only a
+				// fraction of the basket can be afforded) profit per worker is ~0 and no artisan ever enters --
+				// even when the price is a hundred times the cost. Vic2's artisans instead look at whether the
+				// good is profitable at the current price. k is the floor applied to that sale probability when
+				// the entry decision is made (0 disables the experiment).
+				auto entry_optimism = economy::experiment_artisan_entry();
+				auto entry_sales_perception = sales_expectation_perception;
+				if(entry_optimism > 0.f) {
+					entry_sales_perception = ve::max(sales_expectation_perception, ve::fp_vector{ entry_optimism });
+				}
+				auto base_output_cost_per_worker = output_cost / artisans_per_employment_unit * entry_sales_perception * purchase_expectation_perception;
 				auto base_input_cost_per_worker = input_cost / artisans_per_employment_unit;
 
 				auto current_employment_target = state.world.province_get_artisan_score(ids, cid);
@@ -2400,11 +2430,23 @@ void update_employment(sys::state& state, bool ignore_reality, float presim_empl
 					0.f
 				);
 
+				// EXPERIMENT (ALICE_EXP_ARTISAN_OPTIMISM=k): the growth of the artisan allocation is gated by
+				// max(0, (sat - 0.7) * 3.33) where sat = "can I sell it" x "can I buy my inputs". In a shortage
+				// economy neither is ever true, so the gate is permanently shut and the artisan share collapses to
+				// zero -- which is fatal for an 1836 world where almost all manufacturing is done by artisans.
+				// A floor on that perception is exactly the "optimism" the author describes in the source comment.
+				auto artisan_sat = sales_expectation_perception * purchase_expectation_perception;
+				if(economy::experiment_artisan_optimism() > 0.f) {
+					artisan_sat = ve::max(artisan_sat, ve::fp_vector{ economy::experiment_artisan_optimism() });
+				}
+				if(entry_optimism > 0.f) {
+					artisan_sat = ve::max(artisan_sat, ve::fp_vector{ entry_optimism });
+				}
 				auto employment_change = gradient_to_employment_change<ve::fp_vector>(
 					presim_employment_mult * gradient,
 					0.f,
 					current_employment_actual,
-					sales_expectation_perception * purchase_expectation_perception
+					artisan_sat
 				);
 				auto decay = 0.999999f;
 				auto new_employment = ve::select(mask, ve::max(current_employment_actual * decay + employment_change, 0.0f), 0.f);

@@ -3607,11 +3607,11 @@ void mod_file::add_to_file_system(simple_fs::file_system& fs){
 	for(auto s : replace_paths) {
 		auto const replace_path = simple_fs::correct_slashes(simple_fs::utf8_to_native(s));
 		if(replace_path == NATIVE("history")) {
-			simple_fs::add_ignore_path(fs, simple_fs::list_roots(fs)[0] + NATIVE("\\history\\countries"));
-			simple_fs::add_ignore_path(fs, simple_fs::list_roots(fs)[0] + NATIVE("\\history\\diplomacy"));
-			simple_fs::add_ignore_path(fs, simple_fs::list_roots(fs)[0] + NATIVE("\\history\\provinces"));
-			simple_fs::add_ignore_path(fs, simple_fs::list_roots(fs)[0] + NATIVE("\\history\\units"));
-			simple_fs::add_ignore_path(fs, simple_fs::list_roots(fs)[0] + NATIVE("\\history\\wars"));
+			simple_fs::add_ignore_path(fs, simple_fs::list_roots(fs)[0] + NATIVE_DIR_SEPARATOR + NATIVE("history")+ NATIVE_DIR_SEPARATOR + NATIVE("countries"));
+			simple_fs::add_ignore_path(fs, simple_fs::list_roots(fs)[0] + NATIVE_DIR_SEPARATOR + NATIVE("history")+ NATIVE_DIR_SEPARATOR + NATIVE("diplomacy"));
+			simple_fs::add_ignore_path(fs, simple_fs::list_roots(fs)[0] + NATIVE_DIR_SEPARATOR + NATIVE("history")+ NATIVE_DIR_SEPARATOR + NATIVE("provinces"));
+			simple_fs::add_ignore_path(fs, simple_fs::list_roots(fs)[0] + NATIVE_DIR_SEPARATOR + NATIVE("history")+ NATIVE_DIR_SEPARATOR + NATIVE("units"));
+			simple_fs::add_ignore_path(fs, simple_fs::list_roots(fs)[0] + NATIVE_DIR_SEPARATOR + NATIVE("history")+ NATIVE_DIR_SEPARATOR + NATIVE("wars"));
 		} else if(replace_path == NATIVE("history\\pops")
 			|| replace_path == NATIVE("map")
 			|| replace_path == NATIVE("map\\terrain")) {

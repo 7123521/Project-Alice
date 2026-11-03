@@ -33,6 +33,22 @@
 
 namespace economy {
 
+// EXPERIMENT SWITCH (local branch only; default 0 == upstream behaviour)
+inline float experiment_price_floor() {
+	static float const v = []() {
+		auto s = std::getenv("ALICE_EXP_PRICE_FLOOR");
+		return s ? float(std::atof(s)) : 0.f;
+	}();
+	return v;
+}
+inline float presim_stock_cap() {
+	static float const v = []() {
+		auto s = std::getenv("ALICE_EXP_STOCK_CAP");
+		return s ? float(std::atof(s)) : 0.f;
+	}();
+	return v;
+}
+
 dcon::province_id construction_get_location(const sys::state& state, dcon::province_land_construction_id con) {
 		return state.world.pop_get_province_from_pop_location( state.world.province_land_construction_get_pop(con));
 }
@@ -1474,7 +1490,7 @@ void initialize(sys::state& state) {
 	state.world.for_each_nation([&](dcon::nation_id n) {
 		auto fn = fatten(state.world, n);
 		fn.set_administrative_spending(int8_t(35));
-		fn.set_military_spending(int8_t(60));
+		fn.set_military_spending(int8_t(economy::experiment_military_spending_init()));
 		fn.set_education_spending(int8_t(100));
 		fn.set_social_spending(int8_t(100));
 		fn.set_land_spending(int8_t(100));
@@ -1877,6 +1893,10 @@ void populate_army_consumption(sys::state& state) {
 			auto percentage_weight = state.world.market_get_government_stockpile_demand_weights(markets, base_commodity);
 			auto total_demand = demand_buffer_get(controllers, com_id);
 			auto can_purchase = total_demand * percentage_weight * can_afford_mult;
+			// DIAGNOSTIC (ALICE_EXP_STATE_DEMAND=k): scale the army's registered demand (default 1). Used to test
+			// whether the permanently unfilled part of demand -- and therefore the endless price rise -- is state
+			// procurement, which is capped at 150% of requirement whenever the treasury can pay.
+			can_purchase = can_purchase * ve::fp_vector{ economy::experiment_state_demand() };
 			state.world.market_set_army_demand(markets, base_commodity, ve::select(controllers_valid, can_purchase, 0.0f));
 		});
 	});
@@ -2495,9 +2515,55 @@ std::vector<full_construction_factory> estimate_private_investment_construct(sys
 			continue;
 		}
 
-		auto selected = desired_types[
-			rng::reduce(uint32_t(rng::get_random(state, uint32_t((n.id.index() << 6) ^ s.index()))), uint32_t(desired_types.size()))
-		];
+		// EXPERIMENT (ALICE_EXP_CONSTRUCTION_WEIGHTED=1): the choice among the "desired" factory types is
+		// uniformly random upstream, so a good that is scarce (and therefore enormously profitable) gets the
+		// same chance as any other eligible factory. Weight the pick by the margin of the output so that
+		// capital actually flows toward what is scarce.
+		dcon::factory_type_id selected{};
+		auto construction_mode = economy::experiment_construction_weighted();
+		if(construction_mode > 0.f) {
+			auto weight_of = [&](dcon::factory_type_id t) -> float {
+				if(construction_mode >= 2.f) {
+					// mode 2: expected profit rate per unit of construction cost (the same quantity the
+					// eligibility filter already computes, so low-price but high-volume goods are not starved)
+					auto wage = state.world.province_get_labor_price(s, economy::labor::basic_education) * 2.f;
+					auto build_cost = economy::factory_type_build_cost(state, n, s, t, true) + 0.1f;
+					auto outv = economy::factory_type_output_cost(state, n, market, t);
+					auto inv = economy::factory_type_input_cost(state, n, market, t) + 0.1f;
+					float profit = outv - inv - wage * state.world.factory_type_get_base_workforce(t);
+					return std::max(0.01f, profit) / build_cost;
+				}
+				// mode 1: output margin over base cost
+				auto oc = state.world.factory_type_get_output(t);
+				auto base_cost = state.world.commodity_get_cost(oc);
+				if(base_cost <= 0.f)
+					return 1.f;
+				return std::clamp(economy::price_slow(state, market, oc) / base_cost, 0.1f, 20.f);
+			};
+			float total_w = 0.f;
+			for(auto t : desired_types)
+				total_w += weight_of(t);
+			float r = (float(rng::get_random(state, uint32_t((n.id.index() << 6) ^ s.index())) & 0xFFFF) / 65535.f) * total_w;
+			for(auto t : desired_types) {
+				selected = t;
+				r -= weight_of(t);
+				if(r <= 0.f)
+					break;
+			}
+			// mechanism counter: record which goods actually received new construction
+			{
+				dcon::commodity_id oc = state.world.factory_type_get_output(selected).id;
+				if(oc && oc.index() < economy::probe_build_count().size())
+					economy::probe_build_count()[oc.index()] += 1.0;
+			}
+		} else {
+			selected = desired_types[
+				rng::reduce(uint32_t(rng::get_random(state, uint32_t((n.id.index() << 6) ^ s.index()))), uint32_t(desired_types.size()))
+			];
+			dcon::commodity_id oc = state.world.factory_type_get_output(selected).id;
+			if(oc && oc.index() < economy::probe_build_count().size())
+				economy::probe_build_count()[oc.index()] += 1.0;
+		}
 
 		if(
 			state.world.factory_type_get_is_coastal(selected)
@@ -3440,9 +3506,17 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 					auto everyday_base = state.world.pop_type_get_everyday_needs(pop_type, c);
 					auto luxury_base = state.world.pop_type_get_luxury_needs(pop_type, c);
 
-					auto life_costs = prices * life_base * life_needs_mult * life_weights;
-					auto everyday_costs = prices * everyday_base * everyday_needs_mult * everyday_weights * invention_factor;
-					auto luxury_costs = prices * luxury_base * luxury_needs_mult * luxury_weights * invention_factor;
+					// The nation flag "has this commodity been unlocked" was computed just above and then
+					// never used: every pop was charged for radio, telephones, automobiles and aeroplanes even
+					// in 1836, when those goods have no producers at all. Their prices sit at the ceiling, so
+					// they dominated the needs basket (and therefore the military payouts that are computed
+					// from it) and crushed every pop's "can I afford my basket" ratio.
+					auto needs_active = economy::experiment_needs_unlocked()
+						? ve::select(is_active, ve::fp_vector{ 1.f }, ve::fp_vector{ 0.f })
+						: ve::fp_vector{ 1.f };
+					auto life_costs = prices * life_base * life_needs_mult * life_weights * needs_active;
+					auto everyday_costs = prices * everyday_base * everyday_needs_mult * everyday_weights * invention_factor * needs_active;
+					auto luxury_costs = prices * luxury_base * luxury_needs_mult * luxury_weights * invention_factor * needs_active;
 
 					state.world.market_set_life_needs_costs(
 						markets,
@@ -3518,9 +3592,17 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 					auto everyday_base = state.world.pop_type_get_everyday_needs(pop_type, c);
 					auto luxury_base = state.world.pop_type_get_luxury_needs(pop_type, c);
 
-					auto life_costs = prices * life_base * life_needs_mult * life_weights;
-					auto everyday_costs = prices * everyday_base * everyday_needs_mult * everyday_weights * invention_factor;
-					auto luxury_costs = prices * luxury_base * luxury_needs_mult * luxury_weights * invention_factor;
+					// The nation flag "has this commodity been unlocked" was computed just above and then
+					// never used: every pop was charged for radio, telephones, automobiles and aeroplanes even
+					// in 1836, when those goods have no producers at all. Their prices sit at the ceiling, so
+					// they dominated the needs basket (and therefore the military payouts that are computed
+					// from it) and crushed every pop's "can I afford my basket" ratio.
+					auto needs_active = economy::experiment_needs_unlocked()
+						? ve::select(is_active, ve::fp_vector{ 1.f }, ve::fp_vector{ 0.f })
+						: ve::fp_vector{ 1.f };
+					auto life_costs = prices * life_base * life_needs_mult * life_weights * needs_active;
+					auto everyday_costs = prices * everyday_base * everyday_needs_mult * everyday_weights * invention_factor * needs_active;
+					auto luxury_costs = prices * luxury_base * luxury_needs_mult * luxury_weights * invention_factor * needs_active;
 
 					state.world.market_set_life_needs_costs(
 						markets,
@@ -3595,9 +3677,17 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 					auto everyday_base = state.world.pop_type_get_everyday_needs(pop_type, c);
 					auto luxury_base = state.world.pop_type_get_luxury_needs(pop_type, c);
 
-					auto life_costs = prices * life_base * life_needs_mult * life_weights;
-					auto everyday_costs = prices * everyday_base * everyday_needs_mult * everyday_weights * invention_factor;
-					auto luxury_costs = prices * luxury_base * luxury_needs_mult * luxury_weights * invention_factor;
+					// The nation flag "has this commodity been unlocked" was computed just above and then
+					// never used: every pop was charged for radio, telephones, automobiles and aeroplanes even
+					// in 1836, when those goods have no producers at all. Their prices sit at the ceiling, so
+					// they dominated the needs basket (and therefore the military payouts that are computed
+					// from it) and crushed every pop's "can I afford my basket" ratio.
+					auto needs_active = economy::experiment_needs_unlocked()
+						? ve::select(is_active, ve::fp_vector{ 1.f }, ve::fp_vector{ 0.f })
+						: ve::fp_vector{ 1.f };
+					auto life_costs = prices * life_base * life_needs_mult * life_weights * needs_active;
+					auto everyday_costs = prices * everyday_base * everyday_needs_mult * everyday_weights * invention_factor * needs_active;
+					auto luxury_costs = prices * luxury_base * luxury_needs_mult * luxury_weights * invention_factor * needs_active;
 
 					state.world.market_set_life_needs_costs(
 						markets,
@@ -5380,6 +5470,12 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 			auto hull = ve::apply([&](dcon::nation_id n) { return state.world.nation_get_unit_stats(n, uid).defence_or_hull; }, nation);
 			auto momentum_per_ship = speed * hull;
 			auto ready_ships = ve::floor(state.world.market_get_owned_ships(market, uid));
+			// DIAGNOSTIC (ALICE_EXP_SHIP_MULT=k): scale the transport capacity each existing ship provides,
+			// without creating ships or money. Used to test whether the per-market price spread is limited by
+			// transport capacity at all.
+			if(economy::experiment_ship_mult() != 1.f) {
+				ready_ships = ready_ships * ve::fp_vector{ economy::experiment_ship_mult() };
+			}
 
 			auto existing_momentum = state.world.market_get_naval_transportation_supply(market);
 			state.world.market_set_naval_transportation_supply(market, existing_momentum + momentum_per_ship * ready_ships);
@@ -5719,6 +5815,53 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 
 	set_profile_point(state, "update labor prices");
 
+	// DIAGNOSTIC (ALICE_EXP_INJECT_GOOD / ALICE_EXP_INJECT_MULT): top every market's stockpile of the named
+	// commodity up to k times its demand.
+	if(economy::experiment_inject_good() && economy::experiment_inject_mult() > 0.f) {
+		auto ymd = state.current_date.to_ymd(state.start_date);
+		if(ymd.day == 1) {
+			static dcon::commodity_id inject_id{};
+			static std::string inject_name{};
+			if(!inject_id && inject_name != economy::experiment_inject_good()) {
+				inject_name = economy::experiment_inject_good();
+				state.world.for_each_commodity([&](dcon::commodity_id c) {
+					if(!inject_id && text::produce_simple_string(state, state.world.commodity_get_name(c)) == inject_name)
+						inject_id = c;
+				});
+			}
+			if(inject_id) {
+				auto k = ve::fp_vector{ economy::experiment_inject_mult() };
+				state.world.execute_serial_over_market([&](auto markets) {
+					auto demand = state.world.market_get_demand(markets, inject_id);
+					auto have = state.world.market_get_stockpile(markets, inject_id);
+					state.world.market_set_stockpile(markets, inject_id, ve::max(have, demand * k));
+				});
+			}
+		}
+	}
+
+	// EXPERIMENT (ALICE_EXP_GOLD_ANCHOR=1): keep the real size of the gold injection constant by scaling the
+	// gold->cash rate with world real output (daily supply valued at base costs). Recomputed monthly.
+	if(economy::experiment_gold_anchor() && !presimulation && economy::experiment_gold_anchor_after_presim()) {
+		auto ymd = state.current_date.to_ymd(state.start_date);
+		if(ymd.day == 1) {
+			double Y = 0.0;
+			state.world.for_each_market([&](dcon::market_id m) {
+				state.world.for_each_commodity([&](dcon::commodity_id c) {
+					if(c == economy::money)
+						return;
+					Y += double(state.world.market_get_supply(m, c)) * double(state.world.commodity_get_cost(c));
+				});
+			});
+			if(Y > 0.0) {
+				if(economy::gold_reference_output() <= 0.f)
+					economy::gold_reference_output() = float(Y);
+				// money creation must grow with real output (so that M/Y stays bounded), not shrink with it
+				economy::gold_scale() = float(Y) / economy::gold_reference_output();
+			}
+		}
+	}
+
 	concurrency::parallel_for(uint32_t(1), total_commodities, [&](uint32_t k) {
 		dcon::commodity_id cid{ dcon::commodity_id::value_base_t(k) };
 		//handling gold cost separetely
@@ -5739,7 +5882,40 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 #ifndef NDEBUG
 			ve::apply([&](auto value) { assert(std::isfinite(value)); }, next_price);
 #endif
-			auto next_price_clamped = ve::min(ve::max(next_price, price_properties::commodity::min), price_properties::commodity::max);
+			// EXPERIMENT (ALICE_EXP_PRICE_FLOOR=k): the absolute floor (1e-12) makes abundant goods free.
+			// Producers then earn nothing and stop producing -- which is fatal in an 1836 world where almost
+			// all manufactures come from artisans. Use a floor proportional to the good's base cost instead.
+			auto price_floor = ve::fp_vector{ price_properties::commodity::min };
+			if(economy::experiment_price_floor() > 0.f) {
+				price_floor = ve::fp_vector{ state.world.commodity_get_cost(cid) * economy::experiment_price_floor() };
+			}
+			// LOCAL BRANCH: mod-configurable cost-proportional floor (defines.commodity_price_floor_ratio).
+			// 0 keeps the upstream absolute floor, so mods that do not set it behave exactly as before.
+			if(state.defines.commodity_price_floor_ratio > 0.f) {
+				price_floor = ve::max(price_floor,
+					ve::fp_vector{ state.world.commodity_get_cost(cid) * state.defines.commodity_price_floor_ratio });
+			}
+
+			auto next_price_clamped = ve::min(ve::max(next_price, price_floor), price_properties::commodity::max);
+
+			// EXPERIMENT (ALICE_EXP_COST_ANCHOR=k): slow pull toward the base cost, see the comment on the switch
+			if(economy::experiment_cost_anchor() > 0.f) {
+				auto cost = ve::fp_vector{ state.world.commodity_get_cost(cid) };
+				auto before = next_price_clamped;
+				auto rel = ve::min(ve::max((cost - next_price_clamped) / ve::max(cost, ve::fp_vector{ 1e-9f }),
+					ve::fp_vector{ -1.f }), ve::fp_vector{ 1.f });
+				next_price_clamped = next_price_clamped * (ve::fp_vector{ 1.f } + rel * ve::fp_vector{ economy::experiment_cost_anchor() });
+				next_price_clamped = ve::min(ve::max(next_price_clamped, price_floor), ve::fp_vector{ price_properties::commodity::max });
+				// mechanism counter: how much of the move came from the anchor, and in which direction
+				double up = 0.0, down = 0.0;
+				ve::apply([&](auto b, auto a) {
+					if(a > b * 1.0001f) up += 1.0;
+					else if(a < b * 0.9999f) down += 1.0;
+				}, before, next_price_clamped);
+				auto& pu = economy::probe_anchor_up();
+				auto& pd = economy::probe_anchor_down();
+				if(cid.index() < pu.size()) { pu[cid.index()] += up; pd[cid.index()] += down; }
+			}
 
 			auto current_confidence = state.world.market_get_price_confidence(ids, cid);
 			auto price_ratio = current_price / next_price_clamped;
@@ -5755,6 +5931,23 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 			state.world.market_set_price_confidence(ids, cid, next_confidence);
 		});
 	});
+
+	// EXPERIMENT (ALICE_EXP_STOCK_CAP=k): during presimulation the merchants can silently accumulate
+	// years' worth of stock (a price of ~0 makes buying nearly free), after which the daily dump
+	// (stock/1095) is the only supply the market sees and the price is pinned to the floor forever.
+	// Cap the accumulated stock at k days of demand.
+	if(presimulation && economy::presim_stock_cap() > 0.f) {
+		state.world.execute_serial_over_market([&](auto ids) {
+			state.world.for_each_commodity([&](dcon::commodity_id c) {
+				if(state.world.commodity_get_money_rgo(c))
+					return;
+				auto demand = state.world.market_get_demand(ids, c);
+				auto cap = ve::max(ve::fp_vector{ 0.01f }, demand) * economy::presim_stock_cap();
+				auto st = state.world.market_get_stockpile(ids, c);
+				state.world.market_set_stockpile(ids, c, ve::min(st, cap));
+			});
+		});
+	}
 
 	set_profile_point(state, "update commodity prices");
 

@@ -48,9 +48,16 @@ jobs:
       run: |
         cmake --build build --parallel --target Alice
 
-    # - name: Build Project Alice Incremental
-    #   run: |
-    #     cmake --build build --parallel --target AliceIncremental
+    - name: Build Project Alice Incremental
+      run: |
+        cmake --build build --parallel --target AliceIncremental
+
+    - name: Upload Linux binary
+      uses: actions/upload-artifact@v4
+      with:
+        name: alice-linux-${{ github.sha }}
+        path: build/AliceIncremental
+        if-no-files-found: error
 
   windows-build:
     strategy:

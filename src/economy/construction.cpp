@@ -1048,6 +1048,7 @@ void populate_government_construction_consumption(sys::state& state) {
 			auto percentage_weight = state.world.market_get_government_stockpile_demand_weights(markets, base_commodity);
 			auto total_demand = demand_buffer_get(controllers, base_commodity);
 			auto can_purchase = total_demand * percentage_weight * can_afford_mult;
+			can_purchase = can_purchase * ve::fp_vector{ economy::experiment_state_demand() };
 			state.world.market_set_government_construction_demand(markets, base_commodity, ve::select(controllers_valid, can_purchase, 0.0f));
 		});
 	});

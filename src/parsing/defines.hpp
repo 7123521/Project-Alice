@@ -10,6 +10,8 @@
 	LUA_DEFINES_LIST_ELEMENT(base_country_tax_efficiency, 0.200000)                                                                \
 	LUA_DEFINES_LIST_ELEMENT(base_country_admin_efficiency, 0.200000)                                                              \
 	LUA_DEFINES_LIST_ELEMENT(gold_to_cash_rate, 1.000000)                                                                          \
+	/* LOCAL BRANCH: minimum commodity price as a fraction of base cost. 0 keeps the upstream absolute floor */ \
+	LUA_DEFINES_LIST_ELEMENT(commodity_price_floor_ratio, 0.000000)                                                                \
 	LUA_DEFINES_LIST_ELEMENT(gold_to_worker_pay_rate, 3.000000)                                                                    \
 	LUA_DEFINES_LIST_ELEMENT(great_nations_count, 8.000000)                                                                        \
 	LUA_DEFINES_LIST_ELEMENT(greatness_days, 365.000000)                                                                           \

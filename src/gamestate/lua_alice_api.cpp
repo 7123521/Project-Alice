@@ -145,6 +145,8 @@ void lua_scripted_element::set_text(sys::state& state, std::string const& new_te
 void lua_scripted_element::on_reset_text(sys::state& state) noexcept  {
 }
 void lua_scripted_element::on_create(sys::state& state) noexcept  {
+	if(!alice_state_ptr)
+		return;
 	auto found = alice_state_ptr->lua_registered_ui_functions.find(on_update_lname);
 	if(found != alice_state_ptr->lua_registered_ui_functions.end()) {
 		on_update_lref = found->second;

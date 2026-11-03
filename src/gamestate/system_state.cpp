@@ -1190,7 +1190,7 @@ void state::on_create() {
 			OutputDebugStringA(lua_tostring(lua_ui_environment, -1));
 #endif
 			lua_settop(lua_ui_environment, 0);
-			std::abort();
+			console_log(std::string("UI Lua error: ") + lua_tostring(lua_ui_environment, -1));
 		}
 
 		status = luaL_dostring(lua_ui_environment, lua_ui_script.c_str());
@@ -1199,7 +1199,7 @@ void state::on_create() {
 			OutputDebugStringA(lua_tostring(lua_ui_environment, -1));
 #endif
 			lua_settop(lua_ui_environment, 0);
-			std::abort();
+			console_log(std::string("UI Lua error: ") + lua_tostring(lua_ui_environment, -1));
 		}
 	}
 
@@ -4571,6 +4571,8 @@ void state::on_scenario_load() {
 
 	dispatch.detach();
 
+#endif
+
 	// Lua init. Save lua ui environment for later when UI is available
 
 	lua_alice_api::set_state(this);
@@ -4587,7 +4589,7 @@ void state::on_scenario_load() {
 			OutputDebugStringA(lua_tostring(lua_game_loop_environment, -1));
 #endif
 			lua_settop(lua_game_loop_environment, 0);
-			std::abort();
+			console_log(std::string("Lua error: ") + lua_tostring(lua_game_loop_environment, -1));
 		}
 		status = luaL_dostring(lua_game_loop_environment, lua_game_loop_script.c_str());
 		if(status) {
@@ -4595,12 +4597,9 @@ void state::on_scenario_load() {
 			OutputDebugStringA(lua_tostring(lua_game_loop_environment, -1));
 #endif
 			lua_settop(lua_game_loop_environment, 0);
-			std::abort();
+			console_log(std::string("Lua error: ") + lua_tostring(lua_game_loop_environment, -1));
 		}
 	}
-
-
-#endif
 
 }
 

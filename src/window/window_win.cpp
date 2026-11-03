@@ -1566,19 +1566,26 @@ void release_text_services_object(text_services_object* ptr) {
 
 
 win32_text_services::win32_text_services() {
+	// PATCHED: skip TSF entirely; it is unavailable under Wine and raises
+	// RPC_S_SERVER_UNAVAILABLE, which terminates the process.
+	manager_ptr = nullptr;
+#if defined(ALICE_ENABLE_TSF)
 	CoCreateInstance(CLSID_TF_ThreadMgr, NULL, CLSCTX_INPROC_SERVER,
 		IID_ITfThreadMgr, (void**)&manager_ptr);
+#endif
 }
 win32_text_services::~win32_text_services() {
 	safe_release(manager_ptr);
 }
 
 void win32_text_services::start_text_services() {
-	manager_ptr->Activate(&client_id);
+	if(manager_ptr)
+		manager_ptr->Activate(&client_id);
 	//manager_ptr->SuspendKeystrokeHandling();
 }
 void win32_text_services::end_text_services() {
-	manager_ptr->Deactivate();
+	if(manager_ptr)
+		manager_ptr->Deactivate();
 }
 void win32_text_services::on_text_change(text_services_object* ts, uint32_t old_start, uint32_t old_end, uint32_t new_end) {
 	if(send_notifications && ts->advise_sink && ts->notify_on_text_change) {
@@ -1599,7 +1606,7 @@ void win32_text_services::set_focus(sys::state& win, text_services_object* o) {
 	//manager_ptr->SetFocus(o->document);
 
 	auto hwnd = win.win_ptr->hwnd;
-	if(hwnd) {
+	if(manager_ptr && hwnd) {
 		ITfDocumentMgr* old_doc = nullptr;
 		manager_ptr->AssociateFocus((HWND)hwnd, o ? o->document : nullptr, &old_doc);
 		safe_release(old_doc);

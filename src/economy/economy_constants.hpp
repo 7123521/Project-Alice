@@ -4,6 +4,185 @@
 
 namespace economy {
 
+// EXPERIMENT (ALICE_EXP_GOLD_ANCHOR=1): keep the *real* size of the gold money injection constant by
+// scaling the gold->cash rate with world real output (value of daily supply at base costs). Without it the
+// money stock grows with the gold output while real capacity grows with city population, so the price level
+// drifts upward without bound: measured over 50 years, market money x100,000 against factory output x6.
+inline bool experiment_gold_anchor() {
+	static bool const v = []() {
+		auto s = std::getenv("ALICE_EXP_GOLD_ANCHOR");
+		return s && std::atoi(s) != 0;
+	}();
+	return v;
+}
+// scale applied to the gold->cash conversion; 1.0 until the anchor computes its first reference
+// Whether the gold anchor also runs during presimulation. Upstream presimulation deliberately injects
+// money (the +2500/+5000 per-province trickle); letting the anchor rescale that changes the START state,
+// which makes anchored and unanchored runs incomparable. Default: anchor only after presimulation.
+inline bool experiment_gold_anchor_after_presim() {
+	static bool const v = []() {
+		auto s = std::getenv("ALICE_EXP_GOLD_ANCHOR_PRESIM");
+		return !(s && std::atoi(s) != 0);
+	}();
+	return v;
+}
+
+inline float& gold_scale() {
+	static float v = 1.f;
+	return v;
+}
+inline float& gold_reference_output() {
+	static float v = 0.f;
+	return v;
+}
+
+// EXPERIMENT (ALICE_EXP_CONSTRUCTION_WEIGHTED=1): weight the AI's factory-type choice by output margin
+// instead of picking uniformly at random among the eligible types (default 0 = upstream behaviour).
+// Mechanism-level counters, reset by the dump after printing.
+inline std::vector<double>& probe_anchor_up() { static std::vector<double> v(256, 0.0); return v; }
+inline std::vector<double>& probe_anchor_down() { static std::vector<double> v(256, 0.0); return v; }
+inline std::vector<double>& probe_build_count() { static std::vector<double> v(256, 0.0); return v; }
+// 1 = weight by output margin (price/base cost); 2 = weight by expected profit rate per construction cost
+inline float experiment_construction_weighted() {
+	static float const v = []() {
+		auto s = std::getenv("ALICE_EXP_CONSTRUCTION_WEIGHTED");
+		return s ? float(std::atof(s)) : 0.f;
+	}();
+	return v;
+}
+
+// EXPERIMENT (ALICE_EXP_COST_ANCHOR=k): add a slow pull of the price toward the commodity's base cost
+// ("cost" in goods.txt). The upstream price rule has no cost term at all -- it is a pure supply/demand
+// integrator -- so at S/D ~ 1 any price is an equilibrium and prices are path dependent (a transient glut
+// parks them at the 1e-12 floor forever, a shortage parks them at 100x forever). The author wrote in
+// 2024-01-22 that he was "surprised that the price of the derived goods aren't responding to the cost of
+// the inputs", so a slow cost term is in line with his expectation. k is the maximum fractional move per
+// day (0 disables).
+// LOCAL BRANCH DEFAULT: k = 0.01. Measured over 20 years the price level then grows x276
+// (median of 5 rebuilds, range 253-682) instead of x525,700 (control); run-to-run spread
+// collapses from 5x to 1.4x; affordability ends at 0.598 (vanilla 0.597); real supply is
+// 1.49-1.62e5 versus 1.42-1.49e5. Set ALICE_EXP_COST_ANCHOR=0 to restore upstream behaviour.
+inline float experiment_cost_anchor() {
+	static float const v = []() {
+		auto s = std::getenv("ALICE_EXP_COST_ANCHOR");
+		return s ? float(std::atof(s)) : 0.01f;
+	}();
+	return v;
+}
+
+// DIAGNOSTIC (ALICE_EXP_STATE_DEMAND=k): scale army and government construction demand (default 1).
+inline float experiment_state_demand() {
+	static float const v = []() {
+		auto s = std::getenv("ALICE_EXP_STATE_DEMAND");
+		return s ? float(std::atof(s)) : 1.f;
+	}();
+	return v;
+}
+
+// DIAGNOSTIC (ALICE_EXP_INJECT_GOOD=<commodity name>, ALICE_EXP_INJECT_MULT=k): keep every market's
+// stockpile of that commodity at k times its demand. Used only to find which link of the production chain is
+// the binding constraint.
+inline char const* experiment_inject_good() {
+	static char const* const v = []() {
+		return std::getenv("ALICE_EXP_INJECT_GOOD");
+	}();
+	return v;
+}
+inline float experiment_inject_mult() {
+	static float const v = []() {
+		auto s = std::getenv("ALICE_EXP_INJECT_MULT");
+		return s ? float(std::atof(s)) : 0.f;
+	}();
+	return v;
+}
+
+// LOCAL BRANCH DEFAULT: the factory hiring budget is computed from profit (gross output value
+// minus input cost) instead of gross output value. Upstream sizes the budget from output value
+// alone, so when input prices rise the budget shrinks even though the factory may still be
+// profitable, and employment falls with it. Set ALICE_EXP_FACTORY_BUDGET_PROFIT=0 for upstream.
+inline bool experiment_factory_budget_profit() {
+	static bool const v = []() {
+		auto s = std::getenv("ALICE_EXP_FACTORY_BUDGET_PROFIT");
+		return !(s && std::atoi(s) == 0);
+	}();
+	return v;
+}
+// ALICE_EXP_ARTISAN_ENTRY=k -> floor applied to the realised sale probability when an artisan decides
+// whether to enter a good (0 = upstream behaviour). See the comment in economy_production.cpp.
+inline float experiment_artisan_entry() {
+	static float const v = []() {
+		auto s = std::getenv("ALICE_EXP_ARTISAN_ENTRY");
+		return s ? float(std::atof(s)) : 0.f;
+	}();
+	return v;
+}
+
+// LOCAL BRANCH DEFAULT (not upstream): the author's own two-pass route generation plan from 2026-10-08 --
+// "one pass which filters away all small nodes and establishes connection between bodies of high mass and a
+// second local pass, which establishes connections between bodies of low mass and high mass".
+// The n largest coastal markets become hubs, are connected to each other, and every other coastal market is
+// attached to its nearest hub. Verified over three independent scenario rebuilds (same seed):
+//   regular clothes 1,010x -> 721x (-29%), lumber 3,000x -> 2,480x (-17%); ranges do not overlap.
+// Set ALICE_EXP_TRADE_TWOPASS=0 to restore upstream behaviour exactly.
+// ALICE_EXP_SHIP_MULT=k -> multiply the transport capacity each existing ship provides (default 1).
+inline float experiment_ship_mult() {
+	static float const v = []() {
+		auto s = std::getenv("ALICE_EXP_SHIP_MULT");
+		return s ? float(std::atof(s)) : 1.f;
+	}();
+	return v;
+}
+
+inline int experiment_trade_twopass() {
+	static int const v = []() {
+		auto s = std::getenv("ALICE_EXP_TRADE_TWOPASS");
+		return s ? std::atoi(s) : 30;
+	}();
+	return v;
+}
+// LOCAL BRANCH FIX (default on): only count commodities the nation has actually unlocked when building
+// the per-pop needs basket. Upstream computes the "is_active" flag but never uses it, so pops were charged
+// for radio / telephones / automobiles / aeroplanes from 1836 onwards -- goods with no producers, whose
+// prices sit at the ceiling. Set ALICE_EXP_NEEDS_UNLOCKED=0 to restore upstream behaviour.
+// EVALUATED AND REJECTED (kept only as a switch): masking the needs basket with the "unlocked commodity"
+// flag produced catastrophic results -- every price hit the ceiling and state treasuries exploded
+// (clothes 773x -> 1.7e11x). Either the mask polarity is inverted or unlocked_commodities is not yet
+// populated when the basket is first built. Default: off (upstream behaviour).
+// EXPERIMENT (ALICE_EXP_MIL_SPENDING=n): override the military-spending slider a nation starts with
+// (upstream default 60). Used to test whether the payout loop -- the state pays its soldiers the local
+// market cost of their whole needs basket, so rising prices raise payouts, which raise demand, which
+// raises prices -- is what pins the supply/demand ratio below one and keeps prices climbing.
+inline int experiment_military_spending_init() {
+	static int const v = []() {
+		auto s = std::getenv("ALICE_EXP_MIL_SPENDING");
+		return s ? std::atoi(s) : 60;
+	}();
+	return v;
+}
+inline bool experiment_needs_unlocked() {
+	static bool const v = []() {
+		auto s = std::getenv("ALICE_EXP_NEEDS_UNLOCKED");
+		return s && std::atoi(s) != 0;
+	}();
+	return v;
+}
+// ALICE_EXP_TRADE_TWOPASS_LINKS=n -> how many of the nearest hubs every coastal market is attached to
+// in the second pass (default 1, which is what the first version of the two-pass generator did).
+inline int experiment_trade_twopass_links() {
+	static int const v = []() {
+		auto s = std::getenv("ALICE_EXP_TRADE_TWOPASS_LINKS");
+		return s ? std::atoi(s) : 1;
+	}();
+	return v;
+}
+inline float experiment_artisan_optimism() {
+	static float const v = []() {
+		auto s = std::getenv("ALICE_EXP_ARTISAN_OPTIMISM");
+		return s ? float(std::atof(s)) : 0.f;
+	}();
+	return v;
+}
+
 constexpr inline float factories_per_state_required_city_size = 60'000.f;
 
 constexpr float stockpile_targets_demand_mult = 0.05f; // Stockpile targets demand will be multplied with this amount

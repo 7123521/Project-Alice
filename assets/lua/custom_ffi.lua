@@ -1,5 +1,7 @@
 -- local ffi = require("ffi")
 
+if not ffi then ffi = require("ffi") end
+
 ---@class unit_definition
 ---@field build_time number
 ---@field default_organisation number

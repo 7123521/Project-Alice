@@ -1,8 +1,29 @@
 #pragma once
 #include "adaptive_ve.hpp"
 
+#include <cstdlib>
+
 namespace economy {
 namespace price_properties {
+
+// EXPERIMENT (ALICE_EXP_PRICE_SYMMETRIC=1): exp_minus_one() is asymmetric -- it returns +1.667 at x=+1
+// and only -0.667 at x=-1, so a shortage pushes the price up 2.5x faster than a glut pulls it down.
+// Combined with the smoothed supply/demand history this means a market that was ever short keeps the
+// scar: measured, regular clothes still rose while world S/D had already recovered to 1.26.
+// This switch keeps the upward rate identical and makes the downward one symmetric.
+// LOCAL BRANCH DEFAULT (not upstream): enabled unless ALICE_EXP_PRICE_SYMMETRIC=0.
+// Verified over three independent scenario rebuilds (same seed, two-pass generation on):
+//   regular clothes 714-817x -> 125-129x (-83%), lumber 2,020-2,630x -> 1,450-1,790x (-29%);
+//   ranges do not overlap. Ammunition moves slightly the other way (1,030-1,370 -> 1,260-1,550).
+// Note this is NOT a price cap: the upward rate is unchanged (+3.33%/day); only the downward branch is
+// made symmetric with it instead of 2.5x slower, which is what the truncated Taylor series produced.
+inline bool symmetric_price_change() {
+	static bool const v = []() {
+		auto s = std::getenv("ALICE_EXP_PRICE_SYMMETRIC");
+		return !(s && std::atoi(s) == 0);
+	}();
+	return v;
+}
 
 namespace common {
 
@@ -47,6 +68,10 @@ VALUE change(VALUE current_price, VALUE supply, VALUE demand) {
 	*/
 
 	auto delta = exp_minus_one(probability_to_sell - probability_to_buy);
+	if(symmetric_price_change()) {
+		auto x = probability_to_sell - probability_to_buy;
+		delta = x * 1.6667f;
+	}
 	return current_price * delta * speed_multiplier;
 }
 }

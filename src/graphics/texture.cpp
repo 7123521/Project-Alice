@@ -883,6 +883,9 @@ GLuint load_file_and_return_handle(native_string const& native_name, simple_fs::
 		return asset_texture.texture_handle;
 	}
 	asset_texture.loaded = true; // because we tried to load it (and failed) and trying again will be wasteful
+	// PATCHED: 诊断——记录加载失败的贴图 key，方便定位黑图问题
+	if(native_name.find(NATIVE("pictures")) != native_string::npos)
+		fprintf(stderr, "[alice-tex] LOAD FAILED: %s\n", simple_fs::native_to_utf8(native_name).c_str());
 	return 0;
 }
 
