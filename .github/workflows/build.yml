@@ -67,6 +67,7 @@ jobs:
         set -eu
         cd "${GITHUB_WORKSPACE:-$PWD}"
         echo "cwd=$(pwd)"
+        git config --global --add safe.directory "$(pwd)"
         mkdir -p build
         if [ -f build/.cached_sha ]; then
           BASE=$(cat build/.cached_sha)
