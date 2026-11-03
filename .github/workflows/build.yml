@@ -34,7 +34,7 @@ jobs:
         DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
           ca-certificates git build-essential cmake ninja-build ccache clang lld \
           libgl1-mesa-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev \
-          libicu-dev zlib1g-dev
+          libicu-dev zlib1g-dev libluajit-5.1-2 file
         echo "=== toolchain ==="
         clang++ --version | head -2
         cmake --version | head -1

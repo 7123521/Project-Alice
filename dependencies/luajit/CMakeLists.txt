@@ -5,28 +5,19 @@ if(WIN32)
 	add_library(lib_luajit INTERFACE)
 	target_link_libraries(lib_luajit INTERFACE ${PROJECT_SOURCE_DIR}/libs/luajit.lib)
 else()
-	message(STATUS "Fetching luajit...")
-	include(ExternalProject)
-	ExternalProject_Add(
-		luajit
-
-		SOURCE_DIR ${CMAKE_CURRENT_BINARY_DIR}/luajit/source
-
-		GIT_REPOSITORY https://luajit.org/git/luajit.git
-		GIT_TAG origin/v2.1
-		GIT_SHALLOW FALSE
-		GIT_PROGRESS TRUE
-
-		CONFIGURE_COMMAND ""
-		BUILD_COMMAND make
-
-		BUILD_IN_SOURCE TRUE
-		BUILD_BYPRODUCTS ${CMAKE_CURRENT_BINARY_DIR}/luajit/source/luajit.h
-		BUILD_BYPRODUCTS ${CMAKE_CURRENT_BINARY_DIR}/luajit/source/src/libluajit.so
-		INSTALL_COMMAND make install DESTDIR=${DESTDIR} PREFIX=<INSTALL_DIR>
-	)
-	add_library(lib_luajit INTERFACE ${CMAKE_CURRENT_BINARY_DIR}/luajit/source/luajit.h)
-	add_dependencies(lib_luajit luajit)
-	target_link_libraries(lib_luajit INTERFACE ${CMAKE_CURRENT_BINARY_DIR}/luajit/source/src/libluajit.so)
+	# Link the system LuaJIT and use the headers vendored in src/scripting/luajit.
+	#
+	# Building LuaJIT here with ExternalProject produced a library whose SONAME
+	# (libluajit-5.1.so.2) lives only inside the build tree, so the compiled binary
+	# failed to start outside of it: "libluajit-5.1.so.2 => not found". Linking the
+	# distro package instead keeps the binary runnable on the target machine and
+	# removes a network fetch from configure.
+	find_library(LUAJIT_LIBRARY NAMES luajit-5.1 luajit)
+	if(NOT LUAJIT_LIBRARY)
+		message(FATAL_ERROR "LuaJIT shared library not found. Install it first: libluajit-5.1-2 (Debian/Ubuntu) or luajit (other distributions).")
+	endif()
+	message(STATUS "Using system LuaJIT: ${LUAJIT_LIBRARY}")
+	add_library(lib_luajit INTERFACE)
+	target_include_directories(lib_luajit INTERFACE ${PROJECT_SOURCE_DIR}/src/scripting/luajit)
+	target_link_libraries(lib_luajit INTERFACE ${LUAJIT_LIBRARY})
 endif()
-
