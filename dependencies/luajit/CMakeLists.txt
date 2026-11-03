@@ -14,7 +14,7 @@ else()
 	# removes a network fetch from configure.
 	find_library(LUAJIT_LIBRARY NAMES luajit-5.1 luajit)
 	if(NOT LUAJIT_LIBRARY)
-		message(FATAL_ERROR "LuaJIT shared library not found. Install it first: libluajit-5.1-2 (Debian/Ubuntu) or luajit (other distributions).")
+		message(FATAL_ERROR "LuaJIT development library not found (find_library needs libluajit-5.1.so, which ships in the -dev package). Install: libluajit-5.1-dev (Debian/Ubuntu) or luajit-dev (other distributions).")
 	endif()
 	message(STATUS "Using system LuaJIT: ${LUAJIT_LIBRARY}")
 	add_library(lib_luajit INTERFACE)
