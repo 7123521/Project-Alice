@@ -186,6 +186,7 @@ list(APPEND ALICE_INCREMENTAL_SOURCES_LIST_GUI_OTHER
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_element_base.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_element_types.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_graphics.cpp"
+	"${PROJECT_SOURCE_DIR}/src/gui/gui_event.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_leaders.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/ui_state.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_element_base.cpp"
@@ -288,6 +289,7 @@ list(APPEND ALICE_SIM_SOURCES_LIST
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_element_base.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_element_types.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_graphics.cpp"
+	"${PROJECT_SOURCE_DIR}/src/gui/gui_event.cpp"
 	${ALICE_INCREMENTAL_SOURCES_LIST_GAMESTATE}
 	"${PROJECT_SOURCE_DIR}/src/map/map_modes.cpp"
 	"${PROJECT_SOURCE_DIR}/src/military/military.cpp"
