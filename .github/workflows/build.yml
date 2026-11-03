@@ -23,6 +23,10 @@ jobs:
 
     name: Debian trixie (Release)
 
+    env:
+      CCACHE_LOGFILE: /tmp/ccache.log
+      CCACHE_DEBUG: ""
+
     steps:
     - uses: actions/checkout@v4
       with:
@@ -89,6 +93,8 @@ jobs:
           echo "== memory =="; free -h
           echo
           echo "== ccache =="; ccache --show-stats || true
+          echo
+          echo "== ccache uncacheable reasons =="; ccache --show-log-stats 2>&1 | tail -30 || true
           echo
           echo "== binary =="; ls -la build/AliceIncremental 2>/dev/null || true
           echo
