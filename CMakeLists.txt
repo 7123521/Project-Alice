@@ -161,6 +161,7 @@ list(APPEND ALICE_INCREMENTAL_SOURCES_LIST_GUI_OTHER
 	"${PROJECT_SOURCE_DIR}/src/logistics/logistics.cpp"
 	"${PROJECT_SOURCE_DIR}/src/common_types/debug_string_convertions.cpp"
 	"${PROJECT_SOURCE_DIR}/src/nations/nations.cpp"
+	"${PROJECT_SOURCE_DIR}/src/logistics/logistics.cpp"
 	"${PROJECT_SOURCE_DIR}/src/network/SHA512.cpp"
 	"${PROJECT_SOURCE_DIR}/src/network/network.cpp"
 	"${PROJECT_SOURCE_DIR}/src/parsing/float_from_chars.cpp"
