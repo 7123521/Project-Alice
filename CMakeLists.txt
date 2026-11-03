@@ -139,6 +139,7 @@ list(APPEND ALICE_INCREMENTAL_SOURCES_LIST_GUI_OTHER
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_chat_window.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_combat.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_tooltips.cpp"
+	"${PROJECT_SOURCE_DIR}/src/gui/labour_details.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_units.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_unit_panel_subwindow.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_diplomacy_request.cpp"
@@ -305,6 +306,7 @@ list(APPEND ALICE_SIM_SOURCES_LIST
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_trigger_tooltips.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/immediate_mode.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_tooltips.cpp"
+	"${PROJECT_SOURCE_DIR}/src/gui/labour_details.cpp"
 	${ALICE_INCREMENTAL_SOURCES_LIST_RARELY_CHANGED}
 	${ALICE_INCREMENTAL_SOURCES_LIST_SCRIPTING}
 	${ALICE_INCREMENTAL_SOURCES_LIST_SVG}
