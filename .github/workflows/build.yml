@@ -32,7 +32,7 @@ jobs:
       run: |
         apt-get update
         DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-          git build-essential cmake ninja-build ccache clang lld \
+          ca-certificates git build-essential cmake ninja-build ccache clang lld \
           libgl1-mesa-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev \
           libicu-dev zlib1g-dev
         echo "=== toolchain ==="
