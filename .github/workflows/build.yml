@@ -61,32 +61,12 @@ jobs:
         restore-keys: |
           buildtree-
 
-    - name: Pin source timestamps to the cached build
+    - name: Mark the workspace a git safe directory
       shell: bash
       run: |
-        set -eu
         cd "${GITHUB_WORKSPACE:-$PWD}"
-        echo "cwd=$(pwd)"
         git config --global --add safe.directory "$(pwd)"
         mkdir -p build
-        if [ -f build/.cached_sha ]; then
-          BASE=$(cat build/.cached_sha)
-          if git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
-            echo "cached build is from ${BASE}"
-            # 1. everything looks old, so unchanged files are older than the cached objects
-            find src dependencies -type f -exec touch -d '2020-01-01 00:00:00' {} + 2>/dev/null || true
-            touch -d '2020-01-01 00:00:00' CMakeLists.txt 2>/dev/null || true
-            # 2. files actually changed since then look new, so ninja rebuilds exactly those
-            git diff --name-only "${BASE}" HEAD -- src dependencies CMakeLists.txt \
-              | tr '\n' '\0' | xargs -0 -r touch
-            echo "changed files: $(git diff --name-only "${BASE}" HEAD -- src dependencies CMakeLists.txt | wc -l)"
-          else
-            echo "cached revision ${BASE} not in history, doing a full build"
-          fi
-        else
-          echo "no cached build tree, doing a full build"
-        fi
-        git rev-parse HEAD > build/.cached_sha
 
     - name: ccache
       uses: hendrikmuhs/ccache-action@v1.2
@@ -105,6 +85,33 @@ jobs:
           -DCMAKE_C_COMPILER_LAUNCHER=ccache \
           -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
           2>&1 | tee build/configure.log
+
+    # Ninja rebuilds an output whose input is newer, so make the whole restored tree look older
+    # than a fixed instant and let only the files touched since the cached revision look new.
+    # This has to run after Configure: CMake regenerates build.ninja and cmake_pch.hxx, and a
+    # fresh PCH timestamp would invalidate every translation unit that consumes it.
+    - name: Pin timestamps for an incremental build
+      shell: bash
+      run: |
+        set -eu
+        cd "${GITHUB_WORKSPACE:-$PWD}"
+        OLD='2020-01-01 00:00:00'
+        if [ -f build/.cached_sha ]; then
+          BASE=$(cat build/.cached_sha)
+          if git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
+            find src dependencies build -type f -exec touch -d "$OLD" {} + 2>/dev/null || true
+            touch -d "$OLD" CMakeLists.txt 2>/dev/null || true
+            N=$(git diff --name-only "${BASE}" HEAD -- src dependencies CMakeLists.txt | wc -l)
+            echo "files changed since cached build ${BASE}: $N"
+            git diff --name-only "${BASE}" HEAD -- src dependencies CMakeLists.txt \
+              | tr '\n' '\0' | xargs -0 -r touch
+          else
+            echo "cached revision not in history, full build"
+          fi
+        else
+          echo "no cached build tree, full build"
+        fi
+        git rev-parse HEAD > build/.cached_sha
 
     - name: Build headless (AliceIncremental)
       run: |
