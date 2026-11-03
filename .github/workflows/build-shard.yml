@@ -78,7 +78,14 @@ jobs:
         ninja -C build -t targets all \
           | grep -oE '^CMakeFiles/AliceIncremental\.dir/[^:]*\.o' | sort -u > /tmp/all_objs.txt
         total=$(wc -l < /tmp/all_objs.txt)
-        awk -v s=${{ matrix.shard }} -v n=4 'NR % n == s' /tmp/all_objs.txt > /tmp/shard.txt
+        # distribute by source file size so the shards get similar compile work:
+        # a plain round robin left one shard with 400 s of work and another with 230 s.
+        while read -r obj; do
+          src="${obj#CMakeFiles/AliceIncremental.dir/}"
+          for c in "../$src" "$src"; do
+            if [ -f "$c" ]; then echo "$(stat -c %s "$c") $obj"; break; fi
+          done
+        done < /tmp/all_objs.txt | sort -rn | awk -v s=${{ matrix.shard }} -v n=4 'NR % n == s {print $2}' > /tmp/shard.txt
         echo "objects total=$total, this shard=$(wc -l < /tmp/shard.txt)"
         # the precompiled header has to exist before any unit can be compiled
         ninja -C build CMakeFiles/AliceIncremental.dir/cmake_pch.hxx.pch 2>/dev/null || true
@@ -150,15 +157,17 @@ jobs:
         path: build/CMakeFiles
         key: objs-${{ github.sha }}-3
 
-    - name: Link directly from the restored objects
+    - name: Build the remaining pieces and link
       shell: bash
       run: |
         set -o pipefail
-        missing=$(find build/CMakeFiles/AliceIncremental.dir -name '*.o' | wc -l)
-        echo "objects present: $missing"
-        LINK=$(ninja -C build -t commands AliceIncremental | tail -1)
-        echo "${LINK:0:200} ..."
-        cd build && eval "$LINK"
+        echo "objects restored: $(find build/CMakeFiles/AliceIncremental.dir -name '*.o' | wc -l)"
+        # Make every source look older than the restored objects so ninja keeps them, while
+        # still building whatever the shards did not produce (the fetched libraries such as
+        # TBB are built here, which is what the previous direct-link attempt was missing).
+        find src dependencies -type f -exec touch -d '2020-01-01 00:00:00' {} + 2>/dev/null || true
+        touch -d '2020-01-01 00:00:00' CMakeLists.txt 2>/dev/null || true
+        time ninja -C build AliceIncremental
 
     - name: Verify binary
       run: |
