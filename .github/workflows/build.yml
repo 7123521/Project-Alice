@@ -61,8 +61,20 @@ jobs:
         ls -la build/AliceIncremental
         ./build/AliceIncremental --headless -years 1 -dump /tmp/smoke -seed 1234 -threads 2 | tail -3
 
+    - name: Drop stale per-commit releases
+      if: github.event_name == 'workflow_dispatch'
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        gh release list --limit 200 --json tagName \
+          --jq '.[] | select(.tagName | startswith("build-")) | .tagName' \
+          | while read -r tag; do
+              echo "deleting stale release $tag"
+              gh release delete "$tag" --yes --cleanup-tag || true
+            done
+
     - name: Publish dev build (anonymous download)
-      if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
+      if: github.event_name == 'workflow_dispatch'
       uses: softprops/action-gh-release@v2
       with:
         # one rolling pre-release, overwritten on every build, so tags do not accumulate
@@ -79,6 +91,7 @@ jobs:
         fail_on_unmatched_files: true
 
     - name: Upload Linux binaries
+      if: github.event_name == 'workflow_dispatch'
       uses: actions/upload-artifact@v4
       with:
         name: alice-linux-${{ github.sha }}
