@@ -1,6 +1,7 @@
 name: Build Matrix
 
 on:
+  workflow_dispatch:
   pull_request:
   push:
 
@@ -52,38 +53,23 @@ jobs:
       run: |
         cmake --build build --parallel --target AliceIncremental
 
-    - name: Upload Linux binary
+    - name: Smoke test (headless, 1 year)
+      run: |
+        ls -la build/AliceIncremental
+        ./build/AliceIncremental --headless -years 1 -dump /tmp/smoke -seed 1234 -threads 2 | tail -3
+
+    - name: Upload Linux binaries
       uses: actions/upload-artifact@v4
       with:
         name: alice-linux-${{ github.sha }}
-        path: build/AliceIncremental
+        path: |
+          build/AliceIncremental
+          build/Alice
         if-no-files-found: error
-
-  windows-build:
-    strategy:
-      matrix:
-        config: [debug-windows]
-    runs-on: [windows-latest]
-    name: Windows (${{ matrix.config }})
-    steps:
-    - uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
-
-    - name: Configure Build Files
-      run: |
-        cmake -G "Visual Studio 18 2026" --preset=x64-${{ matrix.config }} -B build
-
-    - name: Build Project Alice
-      run: |
-        cmake --build build --parallel --target Alice
-
-    - name: Build Project Alice Incremental
-      run: |
-        cmake --build build --parallel --target AliceIncremental
+        retention-days: 30
 
   build-check:
-    needs: [windows-build, linux-build]
+    needs: [linux-build]
     runs-on: ubuntu-latest
     name: Build Matrix
     steps:

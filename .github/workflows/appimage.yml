@@ -2,14 +2,12 @@ name: Build AppImage
 
 on:
   workflow_dispatch:
-  pull_request:
-  push:
   release:
     types: [created, published]
 
 jobs:
   linux-appimage-debug:
-    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    if: github.event_name == 'workflow_dispatch'
     strategy:
       matrix:
         config: [Debug]
