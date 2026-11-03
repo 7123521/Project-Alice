@@ -32,12 +32,18 @@ jobs:
       with:
         fetch-depth: 0
 
-    - name: Report runner specs
+    - name: Start CI report
       run: |
-        echo "=== cpu ==="; nproc; lscpu | grep -E 'Model name|^CPU\(s\)|Thread|Core|Socket' || true
-        echo "=== memory ==="; free -h
-        echo "=== disk ==="; df -h / | tail -2
-        echo "=== compiler ==="; update-alternatives --list clang++ 2>/dev/null || ls /usr/lib/llvm-*/bin/clang++ 2>/dev/null || true
+        mkdir -p build
+        {
+          echo "commit: ${{ github.sha }}"
+          echo "event: ${{ github.event_name }}"
+          echo "started: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo
+          echo "== cpu =="; nproc; lscpu | grep -E 'Model name|^CPU\(s\):|Thread|^Core|Socket' || true
+          echo "== memory =="; free -h
+          echo "== disk =="; df -h / | tail -2
+        } > build/ci-report.txt
 
     - name: Apt LLVM
       run: |
@@ -76,8 +82,16 @@ jobs:
       run: |
         cmake --build build --parallel --target AliceIncremental
 
-    - name: ccache stats
-      run: ccache --show-stats || true
+    - name: Finish CI report
+      run: |
+        {
+          echo
+          echo "== ccache =="; ccache --show-stats || true
+          echo
+          echo "== binaries =="; ls -la build/AliceIncremental build/Alice 2>/dev/null || true
+          echo "finished: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        } >> build/ci-report.txt
+        cat build/ci-report.txt
 
     - name: Smoke test (headless, 1 year)
       run: |
@@ -122,6 +136,7 @@ jobs:
           build/AliceIncremental.zst
           build/Alice
           build/Alice.zst
+          build/ci-report.txt
         fail_on_unmatched_files: true
 
     - name: Upload Linux binaries
