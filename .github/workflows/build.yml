@@ -25,7 +25,8 @@ jobs:
 
     env:
       CCACHE_LOGFILE: /tmp/ccache.log
-      CCACHE_DEBUG: ""
+      CCACHE_SLOPPINESS: pch_defines,time_macros,include_file_mtime,include_file_ctime
+      CCACHE_MAXSIZE: 2G""
 
     steps:
     - uses: actions/checkout@v4
@@ -38,7 +39,7 @@ jobs:
         DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
           ca-certificates git build-essential cmake ninja-build ccache clang lld \
           libgl1-mesa-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev \
-          libicu-dev zlib1g-dev libluajit-5.1-dev file
+          libicu-dev zlib1g-dev libluajit-5.1-dev file zstd
         echo "=== toolchain ==="
         clang++ --version | head -2
         cmake --version | head -1
@@ -94,7 +95,12 @@ jobs:
           echo
           echo "== ccache =="; ccache --show-stats || true
           echo
-          echo "== ccache uncacheable reasons =="; ccache --show-log-stats 2>&1 | tail -30 || true
+          echo "== ccache uncacheable reasons =="
+          CCACHE_LOGFILE=/tmp/ccache.log ccache --show-log-stats 2>&1 | tail -25 || true
+          echo
+          echo "== ccache raw log sample =="
+          ls -la /tmp/ccache.log 2>/dev/null || echo "(no log file)"
+          grep -o "Result: .*" /tmp/ccache.log 2>/dev/null | sort | uniq -c | sort -rn | head -12 || true
           echo
           echo "== binary =="; ls -la build/AliceIncremental 2>/dev/null || true
           echo
