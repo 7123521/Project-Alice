@@ -62,7 +62,8 @@ list(APPEND ALICE_CORE_SOURCES_LIST
 	"${PROJECT_SOURCE_DIR}/src/gui/province_factories.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/factory_details.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui.cpp"
-	"${PROJECT_SOURCE_DIR}/src/economy/terms.cpp"
+	"${PROJECT_SOURCE_DIR}/src/economy/terms.cpp"	"${PROJECT_SOURCE_DIR}/src/gui/gui_common_elements.cpp"
+
 )
 set_source_files_properties(src/lunasvg/plutovg-blend.c PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
 set_source_files_properties(src/lunasvg/plutovg-canvas.c PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
@@ -139,6 +140,7 @@ list(APPEND ALICE_INCREMENTAL_SOURCES_LIST_GUI_OTHER
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_chat_window.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_combat.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_tooltips.cpp"
+	"${PROJECT_SOURCE_DIR}/src/gui/gui_common_elements.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/labour_details.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_units.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_unit_panel_subwindow.cpp"
