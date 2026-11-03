@@ -263,6 +263,30 @@ set_source_files_properties(
 	PROPERTIES UNITY_GROUP "bucket-RARELY_CHANGED"
 )
 
+# Headless simulation build: the same sources as the incremental client minus the user
+# interface. GUI_OTHER and GUI_TOPBAR are 69 of the 137 translation units and none of them is
+# reachable from a headless run, so leaving them out cuts the cloud build roughly in half.
+# The full client targets above are untouched.
+list(APPEND ALICE_SIM_SOURCES_LIST
+	${ALICE_CORE_SOURCES_LIST}
+	${ALICE_INCREMENTAL_SOURCES_LIST_AI}
+	"${PROJECT_SOURCE_DIR}/src/culture/culture.cpp"
+	"${PROJECT_SOURCE_DIR}/src/culture/politics.cpp"
+	"${PROJECT_SOURCE_DIR}/src/culture/rebels.cpp"
+	"${PROJECT_SOURCE_DIR}/src/economy/demographics.cpp"
+	${ALICE_INCREMENTAL_SOURCES_LIST_ECONOMY}
+	"${PROJECT_SOURCE_DIR}/src/graphics/opengl_wrapper.cpp"
+	"${PROJECT_SOURCE_DIR}/src/graphics/texture.cpp"
+	${ALICE_INCREMENTAL_SOURCES_LIST_GAMESTATE}
+	"${PROJECT_SOURCE_DIR}/src/map/map_modes.cpp"
+	"${PROJECT_SOURCE_DIR}/src/military/military.cpp"
+	"${PROJECT_SOURCE_DIR}/src/nations/nations.cpp"
+	"${PROJECT_SOURCE_DIR}/src/provinces/province.cpp"
+	${ALICE_INCREMENTAL_SOURCES_LIST_RARELY_CHANGED}
+	${ALICE_INCREMENTAL_SOURCES_LIST_SCRIPTING}
+	${ALICE_INCREMENTAL_SOURCES_LIST_SVG}
+)
+
 list(APPEND ALICE_INCREMENTAL_SOURCES_LIST
 	${ALICE_CORE_SOURCES_LIST}
 	${ALICE_INCREMENTAL_SOURCES_LIST_AI}
@@ -310,10 +334,14 @@ add_executable(AliceIncremental WIN32 EXCLUDE_FROM_ALL
 	${ALICE_SOURCE_BLOB}
 	${ALICE_INCREMENTAL_SOURCES_LIST}
 	${ASSET_FILES})
+add_executable(AliceSim WIN32 EXCLUDE_FROM_ALL
+	${ALICE_SOURCE_BLOB}
+	${ALICE_SIM_SOURCES_LIST}
+	${ASSET_FILES})
 endif()
 
 set_target_properties(
-	AliceIncremental
+	AliceIncremental AliceSim
 	PROPERTIES
 	UNITY_BUILD_MODE GROUP
 )
@@ -331,8 +359,10 @@ target_compile_definitions(AliceExtra PRIVATE DO_NOT_USE_LLVM=1)
 endif()
 
 target_compile_definitions(AliceIncremental PRIVATE INCREMENTAL=1)
+target_compile_definitions(AliceSim PRIVATE INCREMENTAL=1)
 target_compile_definitions(Alice PRIVATE GLM_ENABLE_EXPERIMENTAL)
 target_compile_definitions(AliceIncremental PRIVATE GLM_ENABLE_EXPERIMENTAL)
+target_compile_definitions(AliceSim PRIVATE GLM_ENABLE_EXPERIMENTAL)
 if(NOT WIN32)
 	add_compile_definitions(PREFER_ONE_TBB)
 endif()
@@ -440,6 +470,7 @@ if(WIN32)
 else() # GCC or CLANG
 	target_link_options(Alice INTERFACE -rdynamic -Wl,-E)
 	target_link_options(AliceIncremental INTERFACE -rdynamic -Wl,-E)
+	target_link_options(AliceSim INTERFACE -rdynamic -Wl,-E)
 	target_link_options(AliceCommon INTERFACE -rdynamic -Wl,-E)
 	# common flags for all linux builds
 	set(CommonLinuxFlags -Wall -Wextra -Wpedantic -fstrict-aliasing -Wno-unused-parameter -Wno-unused-variable -Wno-switch -Wdangling-else -Wno-unused-private-field -Wno-invalid-offsetof -Wno-unused-but-set-variable -Wno-microsoft-cast -Wno-declaration-after-statement)
@@ -527,6 +558,7 @@ target_include_directories(AliceCommon INTERFACE
 
 target_link_libraries(Alice PRIVATE AliceCommon)
 target_link_libraries(AliceIncremental PRIVATE AliceCommon)
+target_link_libraries(AliceSim PRIVATE AliceCommon)
 
 if (WIN32)
 	target_link_libraries(AliceExtra PRIVATE AliceCommon)
@@ -536,13 +568,14 @@ if (WIN32)
 else()
 	target_link_libraries(Alice PRIVATE fmt::fmt)
 	target_link_libraries(AliceIncremental PRIVATE fmt::fmt)
+target_link_libraries(AliceSim PRIVATE fmt::fmt)
 endif()
 
 
 if (WIN32)
-set(AllAliceTargets Alice AliceIncremental AliceExtra)
+set(AllAliceTargets Alice AliceIncremental AliceExtra AliceSim)
 else()
-set(AllAliceTargets Alice AliceIncremental)
+set(AllAliceTargets Alice AliceIncremental AliceSim)
 endif()
 
 foreach( AliceTarget ${AllAliceTargets} )
@@ -732,6 +765,7 @@ add_custom_target(GENERATE_PARSERS DEPENDS
 
 add_dependencies(Alice GENERATE_PARSERS)
 add_dependencies(AliceIncremental GENERATE_PARSERS)
+add_dependencies(AliceSim GENERATE_PARSERS)
 if(WIN32)
 	add_dependencies(AliceExtra GENERATE_PARSERS)
 endif()
