@@ -277,6 +277,9 @@ list(APPEND ALICE_SIM_SOURCES_LIST
 	${ALICE_INCREMENTAL_SOURCES_LIST_ECONOMY}
 	"${PROJECT_SOURCE_DIR}/src/graphics/opengl_wrapper.cpp"
 	"${PROJECT_SOURCE_DIR}/src/graphics/texture.cpp"
+	# the headless Lua API exposes ui::element_base, whose three virtual-method
+	# definitions live in this file even though the rest of the GUI is not needed
+	"${PROJECT_SOURCE_DIR}/src/gui/gui_element_types.cpp"
 	${ALICE_INCREMENTAL_SOURCES_LIST_GAMESTATE}
 	"${PROJECT_SOURCE_DIR}/src/map/map_modes.cpp"
 	"${PROJECT_SOURCE_DIR}/src/military/military.cpp"
