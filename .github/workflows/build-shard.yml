@@ -72,6 +72,7 @@ jobs:
           -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
     - name: Compile this shard
+      shell: bash
       run: |
         set -o pipefail
         ninja -C build -t targets all \
@@ -150,6 +151,7 @@ jobs:
         key: objs-${{ github.sha }}-3
 
     - name: Link directly from the restored objects
+      shell: bash
       run: |
         set -o pipefail
         missing=$(find build/CMakeFiles/AliceIncremental.dir -name '*.o' | wc -l)
