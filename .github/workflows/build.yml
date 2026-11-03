@@ -32,6 +32,13 @@ jobs:
       with:
         fetch-depth: 0
 
+    - name: Report runner specs
+      run: |
+        echo "=== cpu ==="; nproc; lscpu | grep -E 'Model name|^CPU\(s\)|Thread|Core|Socket' || true
+        echo "=== memory ==="; free -h
+        echo "=== disk ==="; df -h / | tail -2
+        echo "=== compiler ==="; update-alternatives --list clang++ 2>/dev/null || ls /usr/lib/llvm-*/bin/clang++ 2>/dev/null || true
+
     - name: Apt LLVM
       run: |
           wget https://apt.llvm.org/llvm.sh
