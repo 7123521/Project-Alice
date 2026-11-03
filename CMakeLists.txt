@@ -133,6 +133,7 @@ list(APPEND ALICE_INCREMENTAL_SOURCES_LIST_GUI_OTHER
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_main_menu.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_console.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_event.cpp"
+	"${PROJECT_SOURCE_DIR}/src/gui/ui_state.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_message_settings_window.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_message_window.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_chat_window.cpp"
