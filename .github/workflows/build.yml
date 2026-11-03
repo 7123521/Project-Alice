@@ -23,6 +23,9 @@ jobs:
     name: Debian trixie (Release)
 
     env:
+      CCACHE_DIR: /root/.cache/ccache
+      CCACHE_COMPRESS: "true"
+      CCACHE_MAXSIZE: 3G
       CCACHE_LOGFILE: /tmp/ccache.log
       CCACHE_SLOPPINESS: pch_defines,time_macros,include_file_mtime,include_file_ctime
 
@@ -34,7 +37,7 @@ jobs:
 
     - uses: actions/checkout@v4
       with:
-        fetch-depth: 0
+        fetch-depth: 1
 
     - name: Install toolchain
       run: |
@@ -67,12 +70,20 @@ jobs:
         git config --global --add safe.directory "$(pwd)"
         mkdir -p build
 
-    - name: ccache
-      uses: hendrikmuhs/ccache-action@v1.2
+    # GitHub's documented pattern: one rolling cache key that every run overwrites, with
+    # restore-keys picking the newest previous entry. The third-party ccache action saved a
+    # new timestamped entry per run instead, and the restore then frequently selected an
+    # entry that did not match the current object set, which is why warm builds missed.
+    - name: Restore ccache
+      uses: actions/cache@v4
       with:
-        variant: ccache
-        key: trixie-clang-release
-        max-size: 2G
+        path: /root/.cache/ccache
+        key: ccache-${{ github.sha }}
+        restore-keys: |
+          ccache-
+
+    - name: Show ccache before the build
+      run: ccache --show-stats || true
 
     - name: Configure
       run: |
