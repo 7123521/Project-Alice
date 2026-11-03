@@ -8,6 +8,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   linux-build:
     strategy:
@@ -41,12 +45,21 @@ jobs:
     - name: "Install"
       uses: awalsh128/cache-apt-pkgs-action@latest
       with:
-        packages: git build-essential cmake libgl1-mesa-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libicu-dev
+        packages: git build-essential cmake ccache libgl1-mesa-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libicu-dev
         version: 1.0
+
+    - name: ccache
+      uses: hendrikmuhs/ccache-action@v1.2
+      with:
+        variant: ccache
+        key: ${{ matrix.compiler }}-${{ matrix.llvm-version }}-${{ matrix.config }}
+        max-size: 2G
 
     - name: Configure Build Files
       run: |
-        cmake -DCMAKE_BUILD_TYPE=${{ matrix.config }} -B build
+        cmake -DCMAKE_BUILD_TYPE=${{ matrix.config }} -B build \
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
     - name: Build Project Alice
       run: |
@@ -55,6 +68,9 @@ jobs:
     - name: Build Project Alice Incremental
       run: |
         cmake --build build --parallel --target AliceIncremental
+
+    - name: ccache stats
+      run: ccache --show-stats || true
 
     - name: Smoke test (headless, 1 year)
       run: |
@@ -73,6 +89,14 @@ jobs:
               gh release delete "$tag" --yes --cleanup-tag || true
             done
 
+    - name: Strip and compress binaries (smaller download)
+      run: |
+        for b in AliceIncremental Alice; do
+          strip --strip-unneeded "build/$b" || true
+          zstd -19 -T0 -q -f "build/$b" -o "build/$b.zst"
+        done
+        ls -la build/AliceIncremental build/AliceIncremental.zst build/Alice build/Alice.zst
+
     - name: Publish dev build (anonymous download)
       if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
       uses: softprops/action-gh-release@v2
@@ -84,10 +108,13 @@ jobs:
         body: |
           Rolling Linux build of branch main @ ${{ github.sha }}
           Alice = full client, AliceIncremental = headless (for -dump experiments)
+          .zst variants are ~10 MB instead of ~45 MB; decompress with: zstd -d file.zst
           This is a fork-local development build, not an upstream release.
         files: |
           build/AliceIncremental
+          build/AliceIncremental.zst
           build/Alice
+          build/Alice.zst
         fail_on_unmatched_files: true
 
     - name: Upload Linux binaries
