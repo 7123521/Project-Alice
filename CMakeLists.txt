@@ -66,6 +66,7 @@ list(APPEND ALICE_CORE_SOURCES_LIST
 	"${PROJECT_SOURCE_DIR}/src/gui/topbar_subwindows/military_subwindows/gui_units_window.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_units.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_lookup.cpp"
+	"${PROJECT_SOURCE_DIR}/src/gui/gui_chat_window.cpp"
 
 )
 set_source_files_properties(src/lunasvg/plutovg-blend.c PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
