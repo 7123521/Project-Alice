@@ -74,7 +74,8 @@ jobs:
           -DCMAKE_C_COMPILER_LAUNCHER=ccache \
           -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
-    - name: Build Project Alice
+    - name: Build Project Alice (GUI, manual dispatch only)
+      if: github.event_name == 'workflow_dispatch'
       run: |
         cmake --build build --parallel --target Alice
 
@@ -113,10 +114,11 @@ jobs:
     - name: Strip and compress binaries (smaller download)
       run: |
         for b in AliceIncremental Alice; do
+          [ -f "build/$b" ] || continue
           strip --strip-unneeded "build/$b" || true
           zstd -19 -T0 -q -f "build/$b" -o "build/$b.zst"
         done
-        ls -la build/AliceIncremental build/AliceIncremental.zst build/Alice build/Alice.zst
+        ls -la build/Alice* || true
 
     - name: Publish dev build (anonymous download)
       if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
@@ -137,7 +139,7 @@ jobs:
           build/Alice
           build/Alice.zst
           build/ci-report.txt
-        fail_on_unmatched_files: true
+        fail_on_unmatched_files: false
 
     - name: Upload Linux binaries
       if: github.event_name == 'workflow_dispatch'
