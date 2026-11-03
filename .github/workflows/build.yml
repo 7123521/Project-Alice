@@ -2,7 +2,6 @@ name: Build
 
 on:
   workflow_dispatch:
-  pull_request:
   push:
 
 permissions:
@@ -14,9 +13,9 @@ concurrency:
 
 jobs:
   linux-build:
-    # Build inside the same distro/ABI as the target machine (Debian 13 trixie), so the produced
-    # binary actually runs there: ICU ships soname-versioned libraries (libicuuc.so.76), and a
-    # binary linked against Ubuntu 24.04's ICU 74 fails to start with "cannot open shared object".
+    # Build inside the target distro so the artifact actually runs on a Debian 13 host:
+    # ICU and friends are soname-versioned, and a binary linked against Ubuntu's ICU 74
+    # dies with "libicuuc.so.74: cannot open shared object file" on a trixie machine.
     runs-on: ubuntu-latest
     container:
       image: debian:trixie
@@ -26,7 +25,6 @@ jobs:
     env:
       CCACHE_LOGFILE: /tmp/ccache.log
       CCACHE_SLOPPINESS: pch_defines,time_macros,include_file_mtime,include_file_ctime
-      CCACHE_MAXSIZE: 2G""
 
     steps:
     - uses: actions/checkout@v4
@@ -40,11 +38,46 @@ jobs:
           ca-certificates git build-essential cmake ninja-build ccache clang lld \
           libgl1-mesa-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev \
           libicu-dev zlib1g-dev libluajit-5.1-dev file zstd
-        echo "=== toolchain ==="
-        clang++ --version | head -2
+        clang++ --version | head -1
         cmake --version | head -1
         ninja --version
-        ccache --version | head -1
+
+    # Cache the whole build tree, not just ccache: the precompiled header makes roughly
+    # half of the translation units uncacheable for ccache, so a ccache-only strategy
+    # rebuilt 134 of 261 units on every run. Restoring the object files and then pinning
+    # source timestamps to before the cached objects makes ninja rebuild only what the
+    # commits since the cached revision actually touched, which is what a local
+    # incremental build does.
+    - name: Restore build tree
+      uses: actions/cache@v4
+      with:
+        path: build
+        key: buildtree-${{ github.run_id }}
+        restore-keys: |
+          buildtree-
+
+    - name: Pin source timestamps to the cached build
+      run: |
+        set -eu
+        mkdir -p build
+        if [ -f build/.cached_sha ]; then
+          BASE=$(cat build/.cached_sha)
+          if git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
+            echo "cached build is from ${BASE}"
+            # 1. everything looks old, so unchanged files are older than the cached objects
+            find src dependencies -type f -exec touch -d '2020-01-01 00:00:00' {} + 2>/dev/null || true
+            touch -d '2020-01-01 00:00:00' CMakeLists.txt 2>/dev/null || true
+            # 2. files actually changed since then look new, so ninja rebuilds exactly those
+            git diff --name-only "${BASE}" HEAD -- src dependencies CMakeLists.txt \
+              | tr '\n' '\0' | xargs -0 -r touch
+            echo "changed files: $(git diff --name-only "${BASE}" HEAD -- src dependencies CMakeLists.txt | wc -l)"
+          else
+            echo "cached revision ${BASE} not in history, doing a full build"
+          fi
+        else
+          echo "no cached build tree, doing a full build"
+        fi
+        git rev-parse HEAD > build/.cached_sha
 
     - name: ccache
       uses: hendrikmuhs/ccache-action@v1.2
@@ -56,7 +89,6 @@ jobs:
     - name: Configure
       run: |
         set -o pipefail
-        mkdir -p build
         cmake -G Ninja -B build \
           -DCMAKE_BUILD_TYPE=Release \
           -DCMAKE_C_COMPILER=clang \
@@ -66,7 +98,9 @@ jobs:
           2>&1 | tee build/configure.log
 
     - name: Build headless (AliceIncremental)
-      run: cmake --build build --parallel --target AliceIncremental
+      run: |
+        set -o pipefail
+        cmake --build build --parallel --target AliceIncremental 2>&1 | tee build/build.log | tail -5
 
     - name: Build GUI client (manual dispatch only)
       if: github.event_name == 'workflow_dispatch'
@@ -88,26 +122,22 @@ jobs:
         {
           echo "commit: ${{ github.sha }}"
           echo "event: ${{ github.event_name }}"
-          echo "base image: debian:trixie"
+          echo "cached build base: $(cat build/.cached_sha 2>/dev/null || echo none)"
           echo
-          echo "== cpu =="; nproc; lscpu | grep -E 'Model name|^CPU\(s\):|Thread|^Core' || true
-          echo "== memory =="; free -h
+          echo "== cpu =="; nproc
+          echo "== memory =="; free -h | head -2
           echo
           echo "== ccache =="; ccache --show-stats || true
           echo
-          echo "== ccache uncacheable reasons =="
-          CCACHE_LOGFILE=/tmp/ccache.log ccache --show-log-stats 2>&1 | tail -25 || true
+          echo "== ccache decisions =="
+          CCACHE_LOGFILE=/tmp/ccache.log ccache --show-log-stats 2>&1 | tail -20 || true
           echo
-          echo "== ccache raw log sample =="
-          ls -la /tmp/ccache.log 2>/dev/null || echo "(no log file)"
-          grep -o "Result: .*" /tmp/ccache.log 2>/dev/null | sort | uniq -c | sort -rn | head -12 || true
+          echo "== rebuild count (how many objects ninja rebuilt) =="
+          grep -c 'Building CXX' build/build.log 2>/dev/null || echo 0
           echo
           echo "== binary =="; ls -la build/AliceIncremental 2>/dev/null || true
           echo
-          echo "== configure log tail =="; tail -60 build/configure.log 2>/dev/null || echo "(no configure log)"
-          echo
-          echo "== cmake configure log =="; tail -60 build/CMakeFiles/CMakeConfigureLog.yaml 2>/dev/null || echo "(none)" 
-          echo "== ldd =="; ldd build/AliceIncremental || true
+          echo "== configure tail =="; tail -15 build/configure.log 2>/dev/null || true
         } > build/ci-report.txt
         cat build/ci-report.txt
 
@@ -129,9 +159,9 @@ jobs:
         name: dev build (debian trixie)
         prerelease: true
         body: |
-          Rolling Linux build @ ${{ github.sha }}, compiled inside debian:trixie so the binary
-          matches a Debian 13 host (ICU 76). Alice = GUI client, AliceIncremental = headless.
-          .zst variants are ~10 MB instead of ~50 MB; decompress with: zstd -d file.zst
+          Rolling Linux build @ ${{ github.sha }}, compiled inside debian:trixie so it matches
+          a Debian 13 host. Alice = GUI client, AliceIncremental = headless.
+          .zst variants are ~10 MB; decompress with: zstd -d file.zst
         files: |
           build/AliceIncremental
           build/AliceIncremental.zst
