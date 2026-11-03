@@ -304,6 +304,7 @@ list(APPEND ALICE_SIM_SOURCES_LIST
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_modifier_tooltips.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_trigger_tooltips.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/immediate_mode.cpp"
+	"${PROJECT_SOURCE_DIR}/src/gui/gui_tooltips.cpp"
 	${ALICE_INCREMENTAL_SOURCES_LIST_RARELY_CHANGED}
 	${ALICE_INCREMENTAL_SOURCES_LIST_SCRIPTING}
 	${ALICE_INCREMENTAL_SOURCES_LIST_SVG}
