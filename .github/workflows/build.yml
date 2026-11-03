@@ -47,19 +47,18 @@ jobs:
         cmake --version | head -1
         ninja --version
 
-    # Cache the whole build tree, not just ccache: the precompiled header makes roughly
-    # half of the translation units uncacheable for ccache, so a ccache-only strategy
-    # rebuilt 134 of 261 units on every run. Restoring the object files and then pinning
-    # source timestamps to before the cached objects makes ninja rebuild only what the
-    # commits since the cached revision actually touched, which is what a local
-    # incremental build does.
-    - name: Restore build tree
+    # Cache only the fetched dependency trees. Configure refetches and rebuilds tbb, glm,
+    # harfbuzz, freetype and friends otherwise, which costs about 50 s per run. Compiled
+    # objects are NOT cached here: the build directory carries CMake metadata whose
+    # timestamps ninja trusts, and restoring it made ninja rebuild everything anyway.
+    # ccache handles object reuse, now that pch sloppiness makes all 137 units cacheable.
+    - name: Restore fetched dependencies
       uses: actions/cache@v4
       with:
-        path: build
-        key: buildtree-${{ github.run_id }}
+        path: build/_deps
+        key: deps-${{ hashFiles('CMakeLists.txt', 'dependencies/**') }}
         restore-keys: |
-          buildtree-
+          deps-
 
     - name: Mark the workspace a git safe directory
       shell: bash
@@ -85,33 +84,6 @@ jobs:
           -DCMAKE_C_COMPILER_LAUNCHER=ccache \
           -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
           2>&1 | tee build/configure.log
-
-    # Ninja rebuilds an output whose input is newer, so make the whole restored tree look older
-    # than a fixed instant and let only the files touched since the cached revision look new.
-    # This has to run after Configure: CMake regenerates build.ninja and cmake_pch.hxx, and a
-    # fresh PCH timestamp would invalidate every translation unit that consumes it.
-    - name: Pin timestamps for an incremental build
-      shell: bash
-      run: |
-        set -eu
-        cd "${GITHUB_WORKSPACE:-$PWD}"
-        OLD='2020-01-01 00:00:00'
-        if [ -f build/.cached_sha ]; then
-          BASE=$(cat build/.cached_sha)
-          if git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
-            find src dependencies build -type f -exec touch -d "$OLD" {} + 2>/dev/null || true
-            touch -d "$OLD" CMakeLists.txt 2>/dev/null || true
-            N=$(git diff --name-only "${BASE}" HEAD -- src dependencies CMakeLists.txt | wc -l)
-            echo "files changed since cached build ${BASE}: $N"
-            git diff --name-only "${BASE}" HEAD -- src dependencies CMakeLists.txt \
-              | tr '\n' '\0' | xargs -0 -r touch
-          else
-            echo "cached revision not in history, full build"
-          fi
-        else
-          echo "no cached build tree, full build"
-        fi
-        git rev-parse HEAD > build/.cached_sha
 
     - name: Build headless (AliceIncremental)
       run: |
