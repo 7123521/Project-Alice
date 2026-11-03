@@ -73,6 +73,8 @@ list(APPEND ALICE_CORE_SOURCES_LIST
 	"${PROJECT_SOURCE_DIR}/src/gui/topbar_subwindows/military_subwindows/gui_stats_window.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/topbar_subwindows/military_subwindows/gui_build_unit_large_window.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/topbar_subwindows/politics_subwindows/gui_unciv_reforms_window.cpp"
+	"${PROJECT_SOURCE_DIR}/src/gui/topbar_subwindows/politics_subwindows/gui_movements_window.cpp"
+	"${PROJECT_SOURCE_DIR}/src/gui/topbar_subwindows/politics_subwindows/gui_release_nation_window.cpp"
 
 )
 set_source_files_properties(src/lunasvg/plutovg-blend.c PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
