@@ -180,6 +180,11 @@ list(APPEND ALICE_INCREMENTAL_SOURCES_LIST_GUI_OTHER
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_common_elements.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_effect_tooltips.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/widgets/table.cpp"
+# The headless Lua API exposes ui::element_base and the ui::text rendering helpers.
+# Their definitions live in three small GUI infrastructure files (together ~200 KB
+# of source against ~1.2 MB of excluded window code), far cheaper than stubbing.
+	"${PROJECT_SOURCE_DIR}/src/gui/gui_element_base.cpp"
+	"${PROJECT_SOURCE_DIR}/src/gui/gui_element_types.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_graphics.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_leaders.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/ui_state.cpp"
@@ -277,8 +282,11 @@ list(APPEND ALICE_SIM_SOURCES_LIST
 	${ALICE_INCREMENTAL_SOURCES_LIST_ECONOMY}
 	"${PROJECT_SOURCE_DIR}/src/graphics/opengl_wrapper.cpp"
 	"${PROJECT_SOURCE_DIR}/src/graphics/texture.cpp"
-	# the headless Lua API exposes ui::element_base, whose three virtual-method
-	# definitions live in gui_graphics.cpp even though the rest of the GUI is not needed
+	# The headless Lua API exposes ui::element_base and the ui::text helpers; their
+	# definitions live in three small GUI infrastructure files, far cheaper to compile
+	# than the excluded window code.
+	"${PROJECT_SOURCE_DIR}/src/gui/gui_element_base.cpp"
+	"${PROJECT_SOURCE_DIR}/src/gui/gui_element_types.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_graphics.cpp"
 	${ALICE_INCREMENTAL_SOURCES_LIST_GAMESTATE}
 	"${PROJECT_SOURCE_DIR}/src/map/map_modes.cpp"
