@@ -297,6 +297,7 @@ list(APPEND ALICE_SIM_SOURCES_LIST
 	"${PROJECT_SOURCE_DIR}/src/map/map_modes.cpp"
 	"${PROJECT_SOURCE_DIR}/src/military/military.cpp"
 	"${PROJECT_SOURCE_DIR}/src/nations/nations.cpp"
+	"${PROJECT_SOURCE_DIR}/src/logistics/logistics.cpp"
 	"${PROJECT_SOURCE_DIR}/src/provinces/province.cpp"
 	${ALICE_INCREMENTAL_SOURCES_LIST_RARELY_CHANGED}
 	${ALICE_INCREMENTAL_SOURCES_LIST_SCRIPTING}
