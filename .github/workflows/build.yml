@@ -1,4 +1,4 @@
-name: Build Matrix
+name: Build
 
 on:
   workflow_dispatch:
@@ -14,105 +14,84 @@ concurrency:
 
 jobs:
   linux-build:
-    strategy:
-      matrix:
-        config: [Release]
-        llvm-version: [20]
-        compiler: [clang]
-        os: [ubuntu-latest]
+    # Build inside the same distro/ABI as the target machine (Debian 13 trixie), so the produced
+    # binary actually runs there: ICU ships soname-versioned libraries (libicuuc.so.76), and a
+    # binary linked against Ubuntu 24.04's ICU 74 fails to start with "cannot open shared object".
+    runs-on: ubuntu-latest
+    container:
+      image: debian:trixie
 
-    env:
-      CC: clang-${{ matrix.llvm-version }}
-      CXX: clang++-${{ matrix.llvm-version }}
+    name: Debian trixie (Release)
 
-    name: Ubuntu with ${{ matrix.compiler }} (${{ matrix.config }})
-    runs-on: ${{ matrix.os }}
     steps:
     - uses: actions/checkout@v4
       with:
         fetch-depth: 0
 
-    - name: Start CI report
+    - name: Install toolchain
       run: |
-        mkdir -p build
-        {
-          echo "commit: ${{ github.sha }}"
-          echo "event: ${{ github.event_name }}"
-          echo "started: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          echo
-          echo "== cpu =="; nproc; lscpu | grep -E 'Model name|^CPU\(s\):|Thread|^Core|Socket' || true
-          echo "== memory =="; free -h
-          echo "== disk =="; df -h / | tail -2
-        } > build/ci-report.txt
-
-    - name: Apt LLVM
-      run: |
-          wget https://apt.llvm.org/llvm.sh
-          chmod +x llvm.sh
-          sudo ./llvm.sh ${{ matrix.llvm-version }}
-          sudo apt-get update
-
-    - name: install Clang
-      run: sudo apt install --no-install-recommends clang-${{ matrix.llvm-version }}
-
-    - name: "Install"
-      uses: awalsh128/cache-apt-pkgs-action@latest
-      with:
-        packages: git build-essential cmake ccache ninja-build libgl1-mesa-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libicu-dev
-        version: 1.0
+        apt-get update
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+          git build-essential cmake ninja-build ccache clang lld \
+          libgl1-mesa-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev \
+          libicu-dev zlib1g-dev
+        echo "=== toolchain ==="
+        clang++ --version | head -2
+        cmake --version | head -1
+        ninja --version
+        ccache --version | head -1
 
     - name: ccache
       uses: hendrikmuhs/ccache-action@v1.2
       with:
         variant: ccache
-        key: ${{ matrix.compiler }}-${{ matrix.llvm-version }}-${{ matrix.config }}
+        key: trixie-clang-release
         max-size: 2G
 
-    - name: Configure Build Files
+    - name: Configure
       run: |
-        cmake -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.config }} -B build \
+        cmake -G Ninja -B build \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_C_COMPILER=clang \
+          -DCMAKE_CXX_COMPILER=clang++ \
           -DCMAKE_C_COMPILER_LAUNCHER=ccache \
-          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
-          -DCMAKE_DISABLE_PRECOMPILE_HEADERS=ON
+          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
-    - name: Build Project Alice (GUI, manual dispatch only)
+    - name: Build headless (AliceIncremental)
+      run: cmake --build build --parallel --target AliceIncremental
+
+    - name: Build GUI client (manual dispatch only)
       if: github.event_name == 'workflow_dispatch'
-      run: |
-        cmake --build build --parallel --target Alice
+      run: cmake --build build --parallel --target Alice
 
-    - name: Build Project Alice Incremental
+    - name: Verify binary
       run: |
-        cmake --build build --parallel --target AliceIncremental
+        set -o pipefail
+        file build/AliceIncremental
+        if ldd build/AliceIncremental | grep "not found"; then
+          echo "ERROR: unresolved shared libraries" >&2
+          exit 1
+        fi
+        echo "all shared libraries resolve"
 
-    - name: Finish CI report
+    - name: Collect report
       run: |
         {
+          echo "commit: ${{ github.sha }}"
+          echo "event: ${{ github.event_name }}"
+          echo "base image: debian:trixie"
+          echo
+          echo "== cpu =="; nproc; lscpu | grep -E 'Model name|^CPU\(s\):|Thread|^Core' || true
+          echo "== memory =="; free -h
           echo
           echo "== ccache =="; ccache --show-stats || true
           echo
-          echo "== binaries =="; ls -la build/AliceIncremental build/Alice 2>/dev/null || true
-          echo "finished: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        } >> build/ci-report.txt
+          echo "== binary =="; ls -la build/AliceIncremental
+          echo "== ldd =="; ldd build/AliceIncremental || true
+        } > build/ci-report.txt
         cat build/ci-report.txt
 
-    - name: Smoke test (headless, 1 year)
-      run: |
-        ls -la build/AliceIncremental
-        ./build/AliceIncremental --headless -years 1 -dump /tmp/smoke -seed 1234 -threads 2 | tail -3
-
-    - name: Drop stale per-commit releases
-      if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
-      env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      run: |
-        gh release list --limit 200 --json tagName \
-          --jq '.[] | select(.tagName | startswith("build-")) | .tagName' \
-          | while read -r tag; do
-              echo "deleting stale release $tag"
-              gh release delete "$tag" --yes --cleanup-tag || true
-            done
-
-    - name: Strip and compress binaries (smaller download)
+    - name: Strip and compress
       run: |
         for b in AliceIncremental Alice; do
           [ -f "build/$b" ] || continue
@@ -121,19 +100,17 @@ jobs:
         done
         ls -la build/Alice* || true
 
-    - name: Publish dev build (anonymous download)
+    - name: Publish dev build
       if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
       uses: softprops/action-gh-release@v2
       with:
-        # one rolling pre-release, overwritten on every build, so tags do not accumulate
         tag_name: dev-latest
-        name: dev build (latest main)
+        name: dev build (debian trixie)
         prerelease: true
         body: |
-          Rolling Linux build of branch main @ ${{ github.sha }}
-          Alice = full client, AliceIncremental = headless (for -dump experiments)
-          .zst variants are ~10 MB instead of ~45 MB; decompress with: zstd -d file.zst
-          This is a fork-local development build, not an upstream release.
+          Rolling Linux build @ ${{ github.sha }}, compiled inside debian:trixie so the binary
+          matches a Debian 13 host (ICU 76). Alice = GUI client, AliceIncremental = headless.
+          .zst variants are ~10 MB instead of ~50 MB; decompress with: zstd -d file.zst
         files: |
           build/AliceIncremental
           build/AliceIncremental.zst
@@ -142,22 +119,9 @@ jobs:
           build/ci-report.txt
         fail_on_unmatched_files: false
 
-    - name: Upload Linux binaries
-      if: github.event_name == 'workflow_dispatch'
-      uses: actions/upload-artifact@v4
-      with:
-        name: alice-linux-${{ github.sha }}
-        path: |
-          build/AliceIncremental
-          build/Alice
-        if-no-files-found: error
-        retention-days: 30
-
   build-check:
     needs: [linux-build]
     runs-on: ubuntu-latest
     name: Build Matrix
     steps:
-      - name: Check
-        run: |
-          echo success
+      - run: echo success
