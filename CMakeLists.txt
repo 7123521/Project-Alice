@@ -182,6 +182,7 @@ list(APPEND ALICE_INCREMENTAL_SOURCES_LIST_GUI_OTHER
 	"${PROJECT_SOURCE_DIR}/src/gamestate/game_scene.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gamerule/gamerule.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_common_elements.cpp"
+	"${PROJECT_SOURCE_DIR}/src/gui/gui_common_elements.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/widgets/table.cpp"
 # The headless Lua API exposes ui::element_base and the ui::text rendering helpers.
 # Their definitions live in three small GUI infrastructure files (together ~200 KB
