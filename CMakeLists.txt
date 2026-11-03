@@ -152,15 +152,12 @@ list(APPEND ALICE_INCREMENTAL_SOURCES_LIST_GUI_OTHER
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_error_window.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/map_tooltip.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/immediate_mode.cpp"
-	"${PROJECT_SOURCE_DIR}/src/gui/economy_viewer.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/unit_tooltip.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_context_window.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/labour_details.cpp"
 	"${PROJECT_SOURCE_DIR}/src/map/map_modes.cpp"
 	"${PROJECT_SOURCE_DIR}/src/military/military.cpp"
 	"${PROJECT_SOURCE_DIR}/src/logistics/logistics.cpp"
-	"${PROJECT_SOURCE_DIR}/src/gui/economy_viewer.cpp"
-	"${PROJECT_SOURCE_DIR}/src/gui/gui_effect_tooltips.cpp"
 	"${PROJECT_SOURCE_DIR}/src/common_types/debug_string_convertions.cpp"
 	"${PROJECT_SOURCE_DIR}/src/nations/nations.cpp"
 	"${PROJECT_SOURCE_DIR}/src/logistics/logistics.cpp"
@@ -170,8 +167,6 @@ list(APPEND ALICE_INCREMENTAL_SOURCES_LIST_GUI_OTHER
 	"${PROJECT_SOURCE_DIR}/src/parsing/parsers.cpp"
 	"${PROJECT_SOURCE_DIR}/src/platform_specific.cpp"
 	"${PROJECT_SOURCE_DIR}/src/provinces/province.cpp"
-	"${PROJECT_SOURCE_DIR}/src/gui/economy_viewer.cpp"
-	"${PROJECT_SOURCE_DIR}/src/gui/gui_effect_tooltips.cpp"
 	"${PROJECT_SOURCE_DIR}/src/scripting/effects.cpp"
 	"${PROJECT_SOURCE_DIR}/src/scripting/events.cpp"
 	"${PROJECT_SOURCE_DIR}/src/scripting/triggers.cpp"
@@ -184,7 +179,6 @@ list(APPEND ALICE_INCREMENTAL_SOURCES_LIST_GUI_OTHER
 	"${PROJECT_SOURCE_DIR}/src/gamestate/game_scene.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gamerule/gamerule.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_common_elements.cpp"
-	"${PROJECT_SOURCE_DIR}/src/gui/gui_effect_tooltips.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/widgets/table.cpp"
 # The headless Lua API exposes ui::element_base and the ui::text rendering helpers.
 # Their definitions live in three small GUI infrastructure files (together ~200 KB
@@ -303,6 +297,8 @@ list(APPEND ALICE_SIM_SOURCES_LIST
 	"${PROJECT_SOURCE_DIR}/src/nations/nations.cpp"
 	"${PROJECT_SOURCE_DIR}/src/logistics/logistics.cpp"
 	"${PROJECT_SOURCE_DIR}/src/provinces/province.cpp"
+	"${PROJECT_SOURCE_DIR}/src/gui/economy_viewer.cpp"
+	"${PROJECT_SOURCE_DIR}/src/gui/gui_effect_tooltips.cpp"
 	${ALICE_INCREMENTAL_SOURCES_LIST_RARELY_CHANGED}
 	${ALICE_INCREMENTAL_SOURCES_LIST_SCRIPTING}
 	${ALICE_INCREMENTAL_SOURCES_LIST_SVG}
@@ -325,8 +321,6 @@ list(APPEND ALICE_INCREMENTAL_SOURCES_LIST
 	"${PROJECT_SOURCE_DIR}/src/military/military.cpp"
 	"${PROJECT_SOURCE_DIR}/src/nations/nations.cpp"
 	"${PROJECT_SOURCE_DIR}/src/provinces/province.cpp"
-	"${PROJECT_SOURCE_DIR}/src/gui/economy_viewer.cpp"
-	"${PROJECT_SOURCE_DIR}/src/gui/gui_effect_tooltips.cpp"
 	${ALICE_INCREMENTAL_SOURCES_LIST_RARELY_CHANGED}
 	${ALICE_INCREMENTAL_SOURCES_LIST_SCRIPTING}
 	${ALICE_INCREMENTAL_SOURCES_LIST_SVG}
