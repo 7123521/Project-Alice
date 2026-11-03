@@ -61,15 +61,18 @@ jobs:
         ls -la build/AliceIncremental
         ./build/AliceIncremental --headless -years 1 -dump /tmp/smoke -seed 1234 -threads 2 | tail -3
 
-    - name: Publish release assets (anonymous download)
+    - name: Publish dev build (anonymous download)
       if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
       uses: softprops/action-gh-release@v2
       with:
-        tag_name: build-${{ github.sha }}
-        name: build ${{ github.sha }}
+        # one rolling pre-release, overwritten on every build, so tags do not accumulate
+        tag_name: dev-latest
+        name: dev build (latest main)
+        prerelease: true
         body: |
-          Automated Linux build of ${{ github.sha }}
-          binaries: Alice (full) and AliceIncremental (headless)
+          Rolling Linux build of branch main @ ${{ github.sha }}
+          Alice = full client, AliceIncremental = headless (for -dump experiments)
+          This is a fork-local development build, not an upstream release.
         files: |
           build/AliceIncremental
           build/Alice
