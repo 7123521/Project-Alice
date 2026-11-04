@@ -194,6 +194,12 @@ void update_consumption_administration(sys::state& state, dcon::nation_id n, flo
 			// division then yields a huge demand (measured 1.019e14 across all provinces), which drives
 			// satisfaction to 0 and freezes the entire labour market. The assert that would have caught
 			// this is compiled out of Release builds. Clamp the divisor, leaving the formula alone.
+			// A capital may have no population of this education tier, making the labour price zero or
+			// arbitrarily small; the division then yields a huge demand (measured 1.019e14 across all
+			// provinces), which drives satisfaction = min(1, supply/demand) to 0 and freezes the entire
+			// labour market, because the employment gradient is multiplied by satisfaction. The assert
+			// that would have caught it is compiled out of Release builds. Clamping the divisor keeps
+			// the formula identical at any sane wage and bounds the pathological case.
 			auto wage = state.world.province_get_labor_price(capital_of_capital_state, economy::labor::high_education_and_accepted);
 			auto demand = budget_per_administration / std::max(wage, 1e-6f);
 			assert(std::isfinite(demand) && demand >= 0.f);
@@ -215,7 +221,7 @@ void update_consumption_administration(sys::state& state, dcon::nation_id n, flo
 		auto capital_state = state.world.province_get_state_membership(capital);
 		auto capital_of_capital_state = state.world.state_instance_get_capital(capital_state);
 
-		// Same zero-wage division as above, for the secondary administrations.
+		// Same pathological division as above, for the secondary administrations.
 		auto wage = state.world.province_get_labor_price(capital_of_capital_state, economy::labor::high_education_and_accepted);
 		auto demand = budget_per_administration / std::max(wage, 1e-6f);
 		assert(std::isfinite(demand) && demand >= 0.f);

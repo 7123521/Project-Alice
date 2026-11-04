@@ -74,6 +74,7 @@ inline void dump_month(sys::state& state, FILE* nations_csv, FILE* prices_csv, F
 		double trade_volume = 0, naval_price = 0, naval_price_n = 0, naval_demand = 0, land_demand = 0;
 		double rgo_emp = 0, fac_emp = 0, labor_sup = 0, labor_dem = 0;
 		int32_t labor_sup_nan = 0, labor_dem_nan = 0;
+		double labor_dem_by_type[5] = {0,0,0,0,0};
 		double fac_budget = 0, fac_output_value = 0, fac_input_cost = 0, fac_wage = 0;
 		state.world.for_each_commodity([&](dcon::commodity_id c) {
 			if(c == economy::money) return;
@@ -106,6 +107,8 @@ inline void dump_month(sys::state& state, FILE* nations_csv, FILE* prices_csv, F
 			rent_bank += double(state.world.province_get_advanced_province_building_private_savings(p, advanced_province_buildings::list::local_cities_and_towns));
 			if(land) {
 				for(int32_t l = 0; l < economy::labor::total; ++l) {
+					auto dv2 = double(state.world.province_get_labor_demand(p, l));
+					if(std::isfinite(dv2) && l < 5) labor_dem_by_type[l] += dv2;
 					// province_get_labor_supply is already a head count (economy.cpp sets it to
 					// population times the labour distribution). Multiplying by demographics::total
 					// again, as this used to, produced ~3x the population and made the workforce look
@@ -197,6 +200,12 @@ inline void dump_month(sys::state& state, FILE* nations_csv, FILE* prices_csv, F
 			if(!std::isfinite(labor_dem)) bad("labor_demand_not_finite", labor_dem);
 			if(labor_dem > labor_sup * 10.0 && labor_sup > 0.0)
 				bad("labor_demand_over_10x_supply", labor_dem);
+			// when the labour market blows up, say which education tier did it
+			if(labor_sup > 0.0 && labor_dem > labor_sup * 10.0) {
+				fprintf(stderr, "SANITY %s warn=labor_demand_split noedu=%.4g basic=%.4g high=%.4g guild=%.4g high_acc=%.4g\n",
+					date.c_str(), labor_dem_by_type[0], labor_dem_by_type[1], labor_dem_by_type[2],
+					labor_dem_by_type[3], labor_dem_by_type[4]);
+			}
 			if(demand_total > 0.0 && supply_total > 0.0 && supply_total / demand_total > 1000.0)
 				bad("supply_over_demand_gt_1000x", supply_total / demand_total);
 			if(demand_total > 0.0 && supply_total > 0.0 && demand_total / supply_total > 1000.0)
