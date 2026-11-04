@@ -1106,7 +1106,16 @@ void reset_all_state_capitals(sys::state& state) {
 			}
 		}
 
-		state.world.state_instance_set_capital(s, p);
+		// A state can arrive here owning none of its constituent provinces (just conquered, or in the
+		// middle of a transfer), so the loop never assigns p and the default-constructed, invalid id
+		// is written straight into the capital. The market centre then points at an invalid province
+		// that holds no economic data, so its supply and demand read NaN -- and because world supply
+		// is a sum over markets, one such market NaNs every commodity price in the world. Measured at
+		// 1873-04: market 170 was re-centred onto province 3308 and all 54 goods went NaN from that
+		// month on, invalidating the rest of a 50-year run. Only overwrite when a province was found.
+		if(p) {
+			state.world.state_instance_set_capital(s, p);
+		}
 	});
 }
 
@@ -1170,7 +1179,34 @@ void change_province_owner(sys::state& state, dcon::province_id id, dcon::nation
 			state.world.try_create_state_ownership(new_si, new_owner);
 			state.world.try_create_state_control(new_si, new_owner);
 
-			state.world.state_instance_set_capital(new_si, id);
+			// Only a land province may serve as a market centre: a sea province carries no economic
+			// data, so its market's supply and demand read NaN, and since world supply is a sum over
+			// markets one such market NaNs every commodity price in the world. Measured at 1873-04,
+			// where market 170 ended up centred on province 3308 and the remaining 154 months of a
+			// 50-year run had no usable prices or GDP. If this province is not land, take the previous
+			// capital when there is one, otherwise search the state for any land province.
+			{
+				auto land_limit = state.province_definitions.first_sea_province.index();
+				dcon::province_id chosen{};
+				if(id.index() < land_limit) {
+					chosen = id;
+				} else if(old_si) {
+					chosen = state.world.state_instance_get_capital(old_si);
+				}
+				if(!chosen || chosen.index() >= land_limit) {
+					chosen = dcon::province_id{};
+					for(auto prv : state.world.state_definition_get_abstract_state_membership(state_def)) {
+						auto pid = prv.get_province().id;
+						if(pid.index() < land_limit && state.world.province_get_nation_from_province_ownership(pid) == new_owner) {
+							chosen = pid;
+							break;
+						}
+					}
+				}
+				if(chosen) {
+					state.world.state_instance_set_capital(new_si, chosen);
+				}
+			}
 			state.world.province_set_is_colonial(id, will_be_colonial);
 			state.world.province_set_is_slave(id, false);
 			if(will_be_colonial)
