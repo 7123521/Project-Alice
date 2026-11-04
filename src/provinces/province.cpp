@@ -1098,7 +1098,23 @@ void reset_all_state_capitals(sys::state& state) {
 
 		int16_t min_priority = (int16_t)state.world.abstract_state_membership_size();
 
+		// A market centre must be a land province: a sea province carries no economic data, so the
+		// market's supply/demand read NaN and, because world supply is a sum over markets, every
+		// commodity price in the world goes NaN. State membership lists are claimed to hold land
+		// provinces only, but nothing in this loop enforces it, so filter explicitly and report the
+		// first few times a sea province would otherwise have been chosen.
+		auto const land_limit = state.province_definitions.first_sea_province.index();
 		for(auto prv : state.world.state_definition_get_abstract_state_membership(state.world.state_instance_get_definition(s))) {
+			if(prv.get_province().id.index() >= land_limit) {
+				static int sea_reports = 0;
+				if(sea_reports < 6) {
+					++sea_reports;
+					fprintf(stderr, "SEAMEMBER state_inst=%d def=%d prov=%d idx=%d owner=%d\n",
+						s.value, state.world.state_instance_get_definition(s).id.value,
+						prv.get_province().id.value, prv.get_province().id.index(), owner.value);
+				}
+				continue;
+			}
 			auto priority = state.world.abstract_state_membership_get_priority(prv);
 			if(priority < min_priority && state.world.province_get_nation_from_province_ownership(prv.get_province()) == owner) {
 				p = prv.get_province().id;
@@ -1121,6 +1137,22 @@ void reset_all_state_capitals(sys::state& state) {
 
 void change_province_owner(sys::state& state, dcon::province_id id, dcon::nation_id new_owner) {
 	assert(id);
+	// A sea province has no owner in the data model: it holds no state membership, no population and
+	// no economic data. Transferring one creates a state with no land centre, and the market that
+	// state receives then reads NaN supply/demand -- and because world supply is a sum over markets,
+	// that one market NaNs every commodity price in the world for the rest of the run. Measured on a
+	// 40-year DoD run: nation 537 gained sea provinces 2978/3307/3308/3434 at 1873-04 and GDP went
+	// non-finite from that exact month. Refuse the transfer rather than let the market be poisoned.
+	if(id.index() >= state.province_definitions.first_sea_province.index()) {
+		static int refusals = 0;
+		if(refusals < 8) {
+			++refusals;
+			fprintf(stderr, "SEAOWNER rejected prov=%d idx=%d new_owner=%d old_owner=%d\n",
+				id.value, id.index(), new_owner.value,
+				state.world.province_get_nation_from_province_ownership(id).value);
+		}
+		return;
+	}
 	auto state_def = state.world.province_get_state_from_abstract_state_membership(id);
 	auto old_si = state.world.province_get_state_membership(id);
 	auto old_market = state.world.state_instance_get_market_from_local_market(old_si);
@@ -1205,6 +1237,23 @@ void change_province_owner(sys::state& state, dcon::province_id id, dcon::nation
 				}
 				if(chosen) {
 					state.world.state_instance_set_capital(new_si, chosen);
+				} else {
+					// Diagnostic: a state that has no land province owned by its new owner will never get a
+					// usable market centre. Print the first few occurrences with enough detail to show how
+					// the state ended up empty (which provinces it has, who owns them, land or sea).
+					static int reports = 0;
+					if(reports < 6) {
+						++reports;
+						fprintf(stderr, "EMPTYSTATE def=%d new_owner=%d moved_prov=%d moved_is_sea=%d\n",
+							state_def.value, new_owner.value, id.value,
+							(id.index() >= state.province_definitions.first_sea_province.index()) ? 1 : 0);
+						for(auto prv : state.world.state_definition_get_abstract_state_membership(state_def)) {
+							auto pid = prv.get_province().id;
+							auto powner = state.world.province_get_nation_from_province_ownership(pid);
+							fprintf(stderr, "    prov=%d idx=%d owner=%d land=%d\n", pid.value, pid.index(),
+								powner.value, (pid.index() < state.province_definitions.first_sea_province.index()) ? 1 : 0);
+						}
+					}
 				}
 			}
 			state.world.province_set_is_colonial(id, will_be_colonial);
