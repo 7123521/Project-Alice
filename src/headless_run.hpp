@@ -339,6 +339,26 @@ inline void dump_month(sys::state& state, FILE* nations_csv, FILE* prices_csv, F
 			fprintf(stderr, "PROBE %s total=%d with_supply=%d zero_with_producer_route=%d zero_without=%d\n",
 				date.c_str(), total, with_supply, zero_with_route, zero_without_route);
 
+			// Cross-Pacific connectivity: routes whose two ends sit in Asia and the Americas. The
+			// per-market route counts cannot answer this because they do not record where a route goes.
+			{
+				int pacific = 0, transpacific_sea = 0;
+				state.world.for_each_trade_route([&](dcon::trade_route_id tr) {
+					auto tgt = state.world.trade_route_get_target(tr);
+					if(!tgt) return;
+					auto org = state.world.trade_route_get_origin(tr);
+					auto oc = state.world.province_get_continent(state.world.state_instance_get_capital(state.world.market_get_zone_from_local_market(org)));
+					auto tc = state.world.province_get_continent(state.world.state_instance_get_capital(state.world.market_get_zone_from_local_market(tgt)));
+					auto is_asia = [&](dcon::modifier_id c) { return c == state.province_definitions.asia; };
+					auto is_am = [&](dcon::modifier_id c) { return c == state.province_definitions.north_america || c == state.province_definitions.south_america; };
+					if((is_asia(oc) && is_am(tc)) || (is_am(oc) && is_asia(tc))) {
+						++pacific;
+						if(state.world.trade_route_get_is_sea_route(tr)) ++transpacific_sea;
+					}
+				});
+				fprintf(stderr, "PACIFIC %s asia_america_routes=%d of_which_sea=%d\n", date.c_str(), pacific, transpacific_sea);
+			}
+
 			// Is a market's price the ratio of the money held there to the goods available there?
 			// Fit log(price * supply) = a + b * log(money) over markets that have both.
 			double sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0;
