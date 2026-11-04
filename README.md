@@ -48,3 +48,4 @@ Join us on [discord](https://discord.gg/QUJExr4mRn) or visit our [documentation 
 - [Versão em português](./docs/pt/about.md)
 # ci
 // trigger 1793753653
+// trigger 1793753724
