@@ -2097,6 +2097,12 @@ void update_employment(sys::state& state, bool ignore_reality, float presim_empl
 			
 			auto supply = state.world.market_get_aggregated_supply_history(m, c);
 			auto demand = state.world.market_get_aggregated_demand_history(m, c);
+			// NOTE: money RGOs (gold) never trade on a market -- economy.cpp skips them in the price
+			// update, so market price stays 0 while their income is produced * gold_to_cash_rate *
+			// base_cost. Substituting that income price here was tried and measured: over 20 years
+			// mining employment moved by -4% (2095547 -> 2007144) and the aggregate emp/size ratio
+			// stayed at 0.73, so the market price is not what limits gold-mine hiring. Kept as
+			// upstream, with the measurement recorded here so it is not retried blindly.
 			auto current_price = ve_price(state, m, c) + subsidy;
 
 			auto sales_expected_rate = state.world.market_get_expected_probability_to_sell(m, c);

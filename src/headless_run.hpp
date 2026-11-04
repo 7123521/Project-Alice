@@ -395,13 +395,43 @@ inline void dump_month(sys::state& state, FILE* nations_csv, FILE* prices_csv, F
 				date.c_str(), n, slope, r, price_med, med_ratio, share_below);
 		}
 	}
-	// province index is Alice's own (land provinces first), not the Vic2 definition.csv number
+	// province index is Alice's own (land provinces first), not the Vic2 definition.csv number.
+	// The per-province detail columns exist because questions like "this gold mine has no workers"
+	// cannot be answered from a global total: they need each province's labour supply against what
+	// the RGO and its factories actually employ, broken down by education tier, plus the province's
+	// dominant RGO commodity.
 	for(int32_t i = 0; i < state.province_definitions.first_sea_province.index(); ++i) {
 		dcon::province_id p{dcon::province_id::value_base_t(i)};
-		fprintf(provinces_csv, "%s,%d,%s,%s,%.6g\n", date.c_str(), i,
-				tag_of(state, state.world.province_get_nation_from_province_ownership(p)).c_str(),
-				tag_of(state, state.world.province_get_nation_from_province_control(p)).c_str(),
-				state.world.province_get_demographics(p, demographics::total));
+		// dominant RGO commodity for this province (largest rgo size, 0 if none)
+		dcon::commodity_id best_c{};
+		float best_size = 0.f;
+		state.world.for_each_commodity([&](dcon::commodity_id c) {
+			auto s = state.world.province_get_rgo_size(p, c);
+			if(s > best_size) { best_size = s; best_c = c; }
+		});
+		float fac_emp = 0.f;
+		float fac_cap = 0.f;
+		for(auto f : state.world.province_get_factory_location(p)) {
+			auto fac = f.get_factory();
+			fac_emp += state.world.factory_get_unqualified_employment(fac)
+				+ state.world.factory_get_primary_employment(fac)
+				+ state.world.factory_get_secondary_employment(fac);
+			fac_cap += state.world.factory_get_size(fac);
+		}
+		fprintf(provinces_csv, "%s,%d,%s,%s,%.6g,%s,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g\n",
+			date.c_str(), i,
+			tag_of(state, state.world.province_get_nation_from_province_ownership(p)).c_str(),
+			tag_of(state, state.world.province_get_nation_from_province_control(p)).c_str(),
+			state.world.province_get_demographics(p, demographics::total),
+			best_c ? text::produce_simple_string(state, state.world.commodity_get_name(best_c)).c_str() : "",
+			double(best_size),
+			double(state.world.province_get_rgo_target_employment(p, best_c)),
+			double(fac_emp), double(fac_cap),
+			double(state.world.province_get_labor_supply(p, economy::labor::no_education)),
+			double(state.world.province_get_labor_supply(p, economy::labor::basic_education)),
+			double(state.world.province_get_labor_supply(p, economy::labor::high_education)),
+			double(state.world.province_get_labor_demand(p, economy::labor::no_education)),
+			double(state.world.province_get_labor_demand(p, economy::labor::basic_education)));
 	}
 	// routes touching each market, so the dump shows where goods can actually move
 	static std::vector<int32_t> route_count;
@@ -579,7 +609,7 @@ inline void run(sys::state& state, int years, std::string const& dump_dir) {
 				"treasury,private_investment,army_demand,gov_construction_demand,builds_clothes,builds_fabric,pop_savings,market_pop_investments,market_pop_dividends,rgo_bank,factory_bank,rent_bank,government_bank,total_loans,subsidy_spending,trade_volume,naval_transport_price,land_transport_price,naval_transport_demand,land_transport_demand,rgo_employment,factory_employment,labor_supply,labor_demand,factory_hiring_budget,factory_output_value,factory_input_cost,factory_wage_bill\n");
 		if(welfare_csv)
 			fprintf(welfare_csv, "date,pop_type,population,mean_satisfaction,savings_per_capita,basket_cost_per_capita,spent_per_capita,mean_is_rich\n");
-		fprintf(provinces_csv, "date,province,owner,controller,population\n");
+		fprintf(provinces_csv, "date,province,owner,controller,population,rgo_good,rgo_size,rgo_target_employment,factory_employment,factory_capacity,labor_supply_no_edu,labor_supply_basic,labor_supply_high,labor_demand_no_edu,labor_demand_basic\n");
 		fprintf(nations_csv, "date,tag,prestige,industrial_score,military_score,rank,is_gp,is_civilized,treasury,population,provinces,infamy,war_exhaustion,unlocked_commodities\n");
 		fprintf(prices_csv, "date,good,price,median_price,world_supply,world_demand,world_stockpile,merchant_sales,artisan_score,artisan_production,markets_with_supply,markets_total,artisan_producers,artisan_max,rgo_output,factory_output,factory_count,army_demand\n");
 	}
