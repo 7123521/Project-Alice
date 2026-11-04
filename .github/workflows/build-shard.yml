@@ -46,11 +46,13 @@ jobs:
         set -o pipefail
         cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
           -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ 2>&1 | tail -3
-        ninja -C build -t targets all | grep -E '\.a:' | cut -d: -f1 | sort -u > /tmp/deplibs.txt
+        ninja -C build -t targets all | grep -E '\.a:' | cut -d: -f1 | grep -v '^/' | sort -u > /tmp/deplibs.txt
         echo "archives: $(wc -l < /tmp/deplibs.txt)"
         cd build && ninja $(cat /tmp/deplibs.txt | tr '\n' ' ') 2>&1 | tail -3
         cd ..
-        tar -C build -cf /tmp/deps.tar $(cat /tmp/deplibs.txt | tr '\n' ' ')
+        # only archive what was actually produced: some .a targets exist in the graph but
+        # are not needed by the headless target, so they are never built
+        (cd build && tar -cf /tmp/deps.tar $(while read f; do [ -f "$f" ] && echo "$f"; done < /tmp/deplibs.txt))
         zstd -19 -q -f /tmp/deps.tar -o /tmp/deps.tar.zst
         ls -la /tmp/deps.tar.zst
     - uses: actions/upload-artifact@v4
@@ -89,7 +91,7 @@ jobs:
     - name: Build my quarter
       run: |
         set -o pipefail
-        ninja -C build -t targets all | grep -E 'AliceIncremental.*\.o:' | cut -d: -f1 | sort > /tmp/all.txt
+        ninja -C build -t targets all | grep -E 'AliceIncremental.*\.o:' | cut -d: -f1 | grep -v '^/' | sort -u > /tmp/all.txt
         echo "total objects: $(wc -l < /tmp/all.txt)"
         awk -v shard=${{ matrix.shard }} 'NR % 4 == shard' /tmp/all.txt > /tmp/mine.txt
         echo "this shard: $(wc -l < /tmp/mine.txt)"
