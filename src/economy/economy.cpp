@@ -5223,10 +5223,15 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 
 				auto total_score = market_is_unbalanced + stockpile_is_running_out + stockpile_is_too_big;
 
+				// market_is_unbalanced = (1.1 - confidence * buy * sell) * 10 can reach zero when the
+				// product hits 1.1, and the other two terms are max(0, ...), so this denominator can be
+				// zero. Flooring it is correct in itself, but note it was NOT what produced the 1873 NaN:
+				// with this guard in place the same month still goes non-finite, because the real cause is
+				// market 170 being re-centred onto a sea province (3308), which carries no economic data.
 				auto target = (
 					get_rid_of_stockpiles * stockpile_is_too_big
 					+ preserve_stockpiles_for_future * stockpile_is_running_out
-				) / total_score;
+				) / ve::max(total_score, ve::fp_vector{ 1e-6f });
 
 				auto next_merchants_supply = current_merchants_supply * 0.5f + historical_balance * 0.4f + target * 0.10f; //+ desired_sales * 0.000002f ;
 
