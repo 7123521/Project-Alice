@@ -62,22 +62,7 @@ list(APPEND ALICE_CORE_SOURCES_LIST
 	"${PROJECT_SOURCE_DIR}/src/gui/province_factories.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/factory_details.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui.cpp"
-	"${PROJECT_SOURCE_DIR}/src/economy/terms.cpp"	"${PROJECT_SOURCE_DIR}/src/gui/gui_common_elements.cpp"
-	"${PROJECT_SOURCE_DIR}/src/gui/topbar_subwindows/military_subwindows/gui_units_window.cpp"
-	"${PROJECT_SOURCE_DIR}/src/gui/gui_units.cpp"
-	"${PROJECT_SOURCE_DIR}/src/gui/gui_lookup.cpp"
-	"${PROJECT_SOURCE_DIR}/src/gui/gui_chat_window.cpp"
-	"${PROJECT_SOURCE_DIR}/src/gui/topbar_subwindows/politics_subwindows/gui_decision_window.cpp"
-	"${PROJECT_SOURCE_DIR}/src/gui/gui_province_window.cpp"
-	"${PROJECT_SOURCE_DIR}/src/gui/topbar_subwindows/military_subwindows/gui_leaders_window.cpp"
-	"${PROJECT_SOURCE_DIR}/src/gui/topbar_subwindows/military_subwindows/gui_stats_window.cpp"
-	"${PROJECT_SOURCE_DIR}/src/gui/topbar_subwindows/military_subwindows/gui_build_unit_large_window.cpp"
-	"${PROJECT_SOURCE_DIR}/src/gui/topbar_subwindows/politics_subwindows/gui_unciv_reforms_window.cpp"
-	"${PROJECT_SOURCE_DIR}/src/gui/topbar_subwindows/politics_subwindows/gui_movements_window.cpp"
-	"${PROJECT_SOURCE_DIR}/src/gui/topbar_subwindows/politics_subwindows/gui_release_nation_window.cpp"
-	"${PROJECT_SOURCE_DIR}/src/gui/topbar_subwindows/politics_subwindows/gui_reforms_window.cpp"
-	"${PROJECT_SOURCE_DIR}/src/gui/topbar_subwindows/gui_technology_window.cpp"
-
+	"${PROJECT_SOURCE_DIR}/src/economy/terms.cpp"
 )
 set_source_files_properties(src/lunasvg/plutovg-blend.c PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
 set_source_files_properties(src/lunasvg/plutovg-canvas.c PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
@@ -148,14 +133,11 @@ list(APPEND ALICE_INCREMENTAL_SOURCES_LIST_GUI_OTHER
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_main_menu.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_console.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_event.cpp"
-	"${PROJECT_SOURCE_DIR}/src/gui/ui_state.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_message_settings_window.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_message_window.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_chat_window.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_combat.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_tooltips.cpp"
-	"${PROJECT_SOURCE_DIR}/src/gui/gui_common_elements.cpp"
-	"${PROJECT_SOURCE_DIR}/src/gui/labour_details.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_units.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_unit_panel_subwindow.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_diplomacy_request.cpp"
@@ -163,14 +145,13 @@ list(APPEND ALICE_INCREMENTAL_SOURCES_LIST_GUI_OTHER
 	"${PROJECT_SOURCE_DIR}/src/gui/topbar_subwindows/gui_trade_window.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_leader_tooltip.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_modifier_tooltips.cpp"
-	"${PROJECT_SOURCE_DIR}/src/gui/gui_trigger_tooltips.cpp"
-	"${PROJECT_SOURCE_DIR}/src/gui/immediate_mode.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/province_tiles/province_tiles.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_province_window.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_trigger_tooltips.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_error_window.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/map_tooltip.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/immediate_mode.cpp"
+	"${PROJECT_SOURCE_DIR}/src/gui/economy_viewer.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/unit_tooltip.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_context_window.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/labour_details.cpp"
@@ -179,7 +160,6 @@ list(APPEND ALICE_INCREMENTAL_SOURCES_LIST_GUI_OTHER
 	"${PROJECT_SOURCE_DIR}/src/logistics/logistics.cpp"
 	"${PROJECT_SOURCE_DIR}/src/common_types/debug_string_convertions.cpp"
 	"${PROJECT_SOURCE_DIR}/src/nations/nations.cpp"
-	"${PROJECT_SOURCE_DIR}/src/logistics/logistics.cpp"
 	"${PROJECT_SOURCE_DIR}/src/network/SHA512.cpp"
 	"${PROJECT_SOURCE_DIR}/src/network/network.cpp"
 	"${PROJECT_SOURCE_DIR}/src/parsing/float_from_chars.cpp"
@@ -198,14 +178,9 @@ list(APPEND ALICE_INCREMENTAL_SOURCES_LIST_GUI_OTHER
 	"${PROJECT_SOURCE_DIR}/src/gamestate/game_scene.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gamerule/gamerule.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_common_elements.cpp"
+	"${PROJECT_SOURCE_DIR}/src/gui/gui_effect_tooltips.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/widgets/table.cpp"
-# The headless Lua API exposes ui::element_base and the ui::text rendering helpers.
-# Their definitions live in three small GUI infrastructure files (together ~200 KB
-# of source against ~1.2 MB of excluded window code), far cheaper than stubbing.
-	"${PROJECT_SOURCE_DIR}/src/gui/gui_element_base.cpp"
-	"${PROJECT_SOURCE_DIR}/src/gui/gui_element_types.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_graphics.cpp"
-	"${PROJECT_SOURCE_DIR}/src/gui/gui_event.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_leaders.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/ui_state.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/gui_element_base.cpp"
@@ -288,46 +263,6 @@ set_source_files_properties(
 	PROPERTIES UNITY_GROUP "bucket-RARELY_CHANGED"
 )
 
-# Headless simulation build: the same sources as the incremental client minus the user
-# interface. GUI_OTHER and GUI_TOPBAR are 69 of the 137 translation units and none of them is
-# reachable from a headless run, so leaving them out cuts the cloud build roughly in half.
-# The full client targets above are untouched.
-list(APPEND ALICE_SIM_SOURCES_LIST
-	${ALICE_CORE_SOURCES_LIST}
-	${ALICE_INCREMENTAL_SOURCES_LIST_AI}
-	"${PROJECT_SOURCE_DIR}/src/culture/culture.cpp"
-	"${PROJECT_SOURCE_DIR}/src/culture/politics.cpp"
-	"${PROJECT_SOURCE_DIR}/src/culture/rebels.cpp"
-	"${PROJECT_SOURCE_DIR}/src/economy/demographics.cpp"
-	${ALICE_INCREMENTAL_SOURCES_LIST_ECONOMY}
-	"${PROJECT_SOURCE_DIR}/src/graphics/opengl_wrapper.cpp"
-	"${PROJECT_SOURCE_DIR}/src/graphics/texture.cpp"
-	# The headless Lua API exposes ui::element_base and the ui::text helpers; their
-	# definitions live in three small GUI infrastructure files, far cheaper to compile
-	# than the excluded window code.
-	"${PROJECT_SOURCE_DIR}/src/gui/gui_element_base.cpp"
-	"${PROJECT_SOURCE_DIR}/src/gui/gui_element_types.cpp"
-	"${PROJECT_SOURCE_DIR}/src/gui/gui_graphics.cpp"
-	"${PROJECT_SOURCE_DIR}/src/gui/gui_event.cpp"
-	"${PROJECT_SOURCE_DIR}/src/gui/ui_state.cpp"
-	${ALICE_INCREMENTAL_SOURCES_LIST_GAMESTATE}
-	"${PROJECT_SOURCE_DIR}/src/map/map_modes.cpp"
-	"${PROJECT_SOURCE_DIR}/src/military/military.cpp"
-	"${PROJECT_SOURCE_DIR}/src/nations/nations.cpp"
-	"${PROJECT_SOURCE_DIR}/src/logistics/logistics.cpp"
-	"${PROJECT_SOURCE_DIR}/src/provinces/province.cpp"
-	"${PROJECT_SOURCE_DIR}/src/gui/economy_viewer.cpp"
-	"${PROJECT_SOURCE_DIR}/src/gui/gui_effect_tooltips.cpp"
-	"${PROJECT_SOURCE_DIR}/src/gui/gui_modifier_tooltips.cpp"
-	"${PROJECT_SOURCE_DIR}/src/gui/gui_trigger_tooltips.cpp"
-	"${PROJECT_SOURCE_DIR}/src/gui/immediate_mode.cpp"
-	"${PROJECT_SOURCE_DIR}/src/gui/gui_tooltips.cpp"
-	"${PROJECT_SOURCE_DIR}/src/gui/labour_details.cpp"
-	${ALICE_INCREMENTAL_SOURCES_LIST_RARELY_CHANGED}
-	${ALICE_INCREMENTAL_SOURCES_LIST_SCRIPTING}
-	${ALICE_INCREMENTAL_SOURCES_LIST_SVG}
-)
-
 list(APPEND ALICE_INCREMENTAL_SOURCES_LIST
 	${ALICE_CORE_SOURCES_LIST}
 	${ALICE_INCREMENTAL_SOURCES_LIST_AI}
@@ -375,14 +310,10 @@ add_executable(AliceIncremental WIN32 EXCLUDE_FROM_ALL
 	${ALICE_SOURCE_BLOB}
 	${ALICE_INCREMENTAL_SOURCES_LIST}
 	${ASSET_FILES})
-add_executable(AliceSim WIN32 EXCLUDE_FROM_ALL
-	${ALICE_SOURCE_BLOB}
-	${ALICE_SIM_SOURCES_LIST}
-	${ASSET_FILES})
 endif()
 
 set_target_properties(
-	AliceIncremental AliceSim
+	AliceIncremental
 	PROPERTIES
 	UNITY_BUILD_MODE GROUP
 )
@@ -400,10 +331,8 @@ target_compile_definitions(AliceExtra PRIVATE DO_NOT_USE_LLVM=1)
 endif()
 
 target_compile_definitions(AliceIncremental PRIVATE INCREMENTAL=1)
-target_compile_definitions(AliceSim PRIVATE INCREMENTAL=1)
 target_compile_definitions(Alice PRIVATE GLM_ENABLE_EXPERIMENTAL)
 target_compile_definitions(AliceIncremental PRIVATE GLM_ENABLE_EXPERIMENTAL)
-target_compile_definitions(AliceSim PRIVATE GLM_ENABLE_EXPERIMENTAL)
 if(NOT WIN32)
 	add_compile_definitions(PREFER_ONE_TBB)
 endif()
@@ -511,7 +440,6 @@ if(WIN32)
 else() # GCC or CLANG
 	target_link_options(Alice INTERFACE -rdynamic -Wl,-E)
 	target_link_options(AliceIncremental INTERFACE -rdynamic -Wl,-E)
-	target_link_options(AliceSim INTERFACE -rdynamic -Wl,-E)
 	target_link_options(AliceCommon INTERFACE -rdynamic -Wl,-E)
 	# common flags for all linux builds
 	set(CommonLinuxFlags -Wall -Wextra -Wpedantic -fstrict-aliasing -Wno-unused-parameter -Wno-unused-variable -Wno-switch -Wdangling-else -Wno-unused-private-field -Wno-invalid-offsetof -Wno-unused-but-set-variable -Wno-microsoft-cast -Wno-declaration-after-statement)
@@ -599,7 +527,6 @@ target_include_directories(AliceCommon INTERFACE
 
 target_link_libraries(Alice PRIVATE AliceCommon)
 target_link_libraries(AliceIncremental PRIVATE AliceCommon)
-target_link_libraries(AliceSim PRIVATE AliceCommon)
 
 if (WIN32)
 	target_link_libraries(AliceExtra PRIVATE AliceCommon)
@@ -609,14 +536,13 @@ if (WIN32)
 else()
 	target_link_libraries(Alice PRIVATE fmt::fmt)
 	target_link_libraries(AliceIncremental PRIVATE fmt::fmt)
-target_link_libraries(AliceSim PRIVATE fmt::fmt)
 endif()
 
 
 if (WIN32)
-set(AllAliceTargets Alice AliceIncremental AliceExtra AliceSim)
+set(AllAliceTargets Alice AliceIncremental AliceExtra)
 else()
-set(AllAliceTargets Alice AliceIncremental AliceSim)
+set(AllAliceTargets Alice AliceIncremental)
 endif()
 
 foreach( AliceTarget ${AllAliceTargets} )
@@ -806,7 +732,6 @@ add_custom_target(GENERATE_PARSERS DEPENDS
 
 add_dependencies(Alice GENERATE_PARSERS)
 add_dependencies(AliceIncremental GENERATE_PARSERS)
-add_dependencies(AliceSim GENERATE_PARSERS)
 if(WIN32)
 	add_dependencies(AliceExtra GENERATE_PARSERS)
 endif()

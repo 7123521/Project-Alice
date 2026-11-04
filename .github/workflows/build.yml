@@ -96,15 +96,10 @@ jobs:
           -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
           2>&1 | tee build/configure.log
 
-    # AliceSim is the same client minus the user interface (69 of the 137 translation units
-    # are GUI code that a headless run never reaches), so this is the build the experiment
-    # loop pays for. The release asset keeps the name AliceIncremental so the local deploy
-    # script and existing dumps stay valid.
-    - name: Build headless (AliceSim)
+    - name: Build headless (AliceIncremental)
       run: |
         set -o pipefail
-        cmake --build build --parallel --target AliceSim 2>&1 | tee build/build.log | tail -5
-        cp build/AliceSim build/AliceIncremental
+        cmake --build build --parallel --target AliceIncremental 2>&1 | tee build/build.log | tail -5
 
     - name: Build GUI client (manual dispatch only)
       if: github.event_name == 'workflow_dispatch'
@@ -141,9 +136,6 @@ jobs:
           echo
           echo "== rebuild count (how many objects ninja rebuilt) =="
           grep -c 'Building CXX' build/build.log 2>/dev/null || echo 0
-          echo
-          echo "== objects in this build =="
-          find build/CMakeFiles/AliceSim.dir -name '*.o' 2>/dev/null | wc -l
           echo
           echo "== binary =="; ls -la build/AliceIncremental 2>/dev/null || true
           echo
