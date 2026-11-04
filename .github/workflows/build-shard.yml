@@ -1,0 +1,170 @@
+name: Build (sharded)
+
+on:
+  workflow_dispatch:
+  push:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: shard-${{ github.ref }}
+  cancel-in-progress: true
+
+# The build is 147 Alice objects (31.8 min CPU) plus 116 dependency objects (6.1 min CPU).
+# On a 4-core runner that is ~570 CPU-seconds; a single job cannot go much below 9 minutes.
+# Two facts, both verified locally before writing this:
+#   1. an Alice object compiles without the dependency archives existing (ninja -n on a single
+#      .o lists only that one step), so a shard need not build deps;
+#   2. ninja reuses objects produced elsewhere - restoring 145 objects into a freshly configured
+#      tree gave "rebuilt = 0, wall = 1s".
+# So one job builds the archives, four shards build disjoint quarters of the Alice objects, and
+# a final job links. Each shard is ~36 objects instead of 147.
+
+jobs:
+  deps:
+    runs-on: ubuntu-latest
+    container:
+      image: debian:trixie
+    name: dependencies
+    steps:
+    - name: Bootstrap git
+      run: |
+        apt-get update
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git ca-certificates
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 1
+    - name: Install toolchain
+      run: |
+        apt-get update
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+          cmake ninja-build clang lld libgl1-mesa-dev libxrandr-dev libxinerama-dev \
+          libxcursor-dev libxi-dev libicu-dev zlib1g-dev libluajit-5.1-dev file zstd
+    - name: Build dependency archives
+      run: |
+        set -o pipefail
+        cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ 2>&1 | tail -3
+        ninja -C build -t targets all | grep -E '\.a:' | cut -d: -f1 | sort -u > /tmp/deplibs.txt
+        echo "archives: $(wc -l < /tmp/deplibs.txt)"
+        cd build && ninja $(cat /tmp/deplibs.txt | tr '\n' ' ') 2>&1 | tail -3
+        cd ..
+        tar -C build -cf /tmp/deps.tar $(cat /tmp/deplibs.txt | tr '\n' ' ')
+        zstd -19 -q -f /tmp/deps.tar -o /tmp/deps.tar.zst
+        ls -la /tmp/deps.tar.zst
+    - uses: actions/upload-artifact@v4
+      with:
+        name: deps-archives
+        path: /tmp/deps.tar.zst
+        retention-days: 1
+
+  shard:
+    runs-on: ubuntu-latest
+    container:
+      image: debian:trixie
+    name: objects ${{ matrix.shard }}/4
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    steps:
+    - name: Bootstrap git
+      run: |
+        apt-get update
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git ca-certificates
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 1
+    - name: Install toolchain
+      run: |
+        apt-get update
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+          cmake ninja-build clang lld libgl1-mesa-dev libxrandr-dev libxinerama-dev \
+          libxcursor-dev libxi-dev libicu-dev zlib1g-dev libluajit-5.1-dev file zstd
+    - name: Configure
+      run: |
+        cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ 2>&1 | tail -3
+    - name: Build my quarter
+      run: |
+        set -o pipefail
+        ninja -C build -t targets all | grep -E 'AliceIncremental.*\.o:' | cut -d: -f1 | sort > /tmp/all.txt
+        echo "total objects: $(wc -l < /tmp/all.txt)"
+        awk -v shard=${{ matrix.shard }} 'NR % 4 == shard' /tmp/all.txt > /tmp/mine.txt
+        echo "this shard: $(wc -l < /tmp/mine.txt)"
+        cd build && ninja $(cat /tmp/mine.txt | tr '\n' ' ') 2>&1 | tail -5
+    - name: Package my objects
+      run: |
+        cd build
+        tar -cf /tmp/objs.tar $(cat /tmp/mine.txt | tr '\n' ' ')
+        zstd -10 -q -f /tmp/objs.tar -o /tmp/objs-${{ matrix.shard }}.tar.zst
+        ls -la /tmp/objs-${{ matrix.shard }}.tar.zst
+    - uses: actions/upload-artifact@v4
+      with:
+        name: objects-${{ matrix.shard }}
+        path: /tmp/objs-${{ matrix.shard }}.tar.zst
+        retention-days: 1
+
+  link:
+    needs: [deps, shard]
+    runs-on: ubuntu-latest
+    container:
+      image: debian:trixie
+    name: link and publish
+    steps:
+    - name: Bootstrap git
+      run: |
+        apt-get update
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git ca-certificates
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 1
+    - name: Install toolchain
+      run: |
+        apt-get update
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+          cmake ninja-build clang lld libgl1-mesa-dev libxrandr-dev libxinerama-dev \
+          libxcursor-dev libxi-dev libicu-dev zlib1g-dev libluajit-5.1-dev file zstd
+    - name: Configure
+      run: |
+        cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ 2>&1 | tail -3
+    - uses: actions/download-artifact@v4
+      with:
+        path: /tmp/artifacts
+    - name: Restore archives and objects
+      run: |
+        set -e
+        ls /tmp/artifacts
+        zstd -d -q -f /tmp/artifacts/deps-archives/deps.tar.zst -o /tmp/deps.tar
+        tar -C build -xf /tmp/deps.tar
+        for i in 0 1 2 3; do
+          f=/tmp/artifacts/objects-$i/objs-$i.tar.zst
+          [ -f "$f" ] || { echo "missing shard $i"; exit 1; }
+          zstd -d -q -f "$f" -o /tmp/objs-$i.tar
+          tar -C build -xf /tmp/objs-$i.tar
+        done
+        # objects must look newer than the just-checked-out sources or ninja rebuilds them;
+        # this is exactly what made the earlier sharded attempt useless
+        find build/CMakeFiles/AliceIncremental.dir -name '*.o' -exec touch {} +
+        echo "objects: $(find build/CMakeFiles/AliceIncremental.dir -name '*.o' | wc -l)"
+    - name: Link
+      run: |
+        set -o pipefail
+        S=$(date +%s)
+        cd build && ninja AliceIncremental 2>&1 | tail -6
+        echo "link wall: $(( $(date +%s) - S ))s"
+    - name: Verify
+      run: |
+        ls -la build/AliceIncremental
+        ldd build/AliceIncremental | grep 'not found' && exit 1 || true
+        strip -s build/AliceIncremental
+        zstd -19 -q -f build/AliceIncremental -o AliceIncremental.zst
+        mkdir -p out && cp AliceIncremental.zst out/
+        ls -la out/
+    - uses: actions/upload-artifact@v4
+      with:
+        name: alice-incremental-sharded
+        path: out/AliceIncremental.zst
+        retention-days: 14
