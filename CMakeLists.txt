@@ -76,6 +76,7 @@ list(APPEND ALICE_CORE_SOURCES_LIST
 	"${PROJECT_SOURCE_DIR}/src/gui/topbar_subwindows/politics_subwindows/gui_movements_window.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/topbar_subwindows/politics_subwindows/gui_release_nation_window.cpp"
 	"${PROJECT_SOURCE_DIR}/src/gui/topbar_subwindows/politics_subwindows/gui_reforms_window.cpp"
+	"${PROJECT_SOURCE_DIR}/src/gui/topbar_subwindows/gui_technology_window.cpp"
 
 )
 set_source_files_properties(src/lunasvg/plutovg-blend.c PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
