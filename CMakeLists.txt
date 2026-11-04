@@ -256,7 +256,10 @@ list(APPEND ALICE_INCREMENTAL_SOURCES_LIST_RARELY_CHANGED
 	"${PROJECT_SOURCE_DIR}/src/common_types/date_interface.cpp"
 	"${PROJECT_SOURCE_DIR}/src/common_types/prng.cpp"
 	"${PROJECT_SOURCE_DIR}/src/common_types/debug_string_convertions.cpp"
-	"${PROJECT_SOURCE_DIR}/src/gamestate/dcon_oos_reporter_generated.cpp"
+	# The generated out-of-sync reporter is multiplayer-only (see the stub for why the
+	# headless targets do not need it). Compiling it costs ~528 s on its own, which is the
+	# single largest item in the build, so the headless targets link the stub instead.
+	"${PROJECT_SOURCE_DIR}/src/gamestate/oos_reporter_stub.cpp"
 )
 set_source_files_properties(
 	${ALICE_INCREMENTAL_SOURCES_LIST_RARELY_CHANGED}
