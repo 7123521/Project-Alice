@@ -4233,7 +4233,19 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 
 		auto refund = state.world.market_get_shipbuilding_refund(market);
 
-		state.world.market_set_stockpile(market, economy::money, budget + refund + earn - spend);
+		// Accumulator: last month's value feeds this one, so a single non-finite term poisons the
+		// market's money for ever. Measured: one market out of 758 went non-finite at 1873-04 and
+		// every commodity price in the world turned NaN from that month onward, because world supply
+		// and demand are sums over markets. Refuse to carry a non-finite value forward.
+		auto next_market_money = budget + refund + earn - spend;
+		// Vectorised here, so NaN/inf are filtered element-wise: NaN compares false against itself,
+		// and runaway magnitudes are caught by the squared test.
+		{
+			auto nan_mask = ve::select(next_market_money != next_market_money, ve::fp_vector{ 1.f }, ve::fp_vector{ 0.f });
+			auto inf_mask = ve::select(next_market_money * next_market_money > ve::fp_vector{ 1e20f }, ve::fp_vector{ 1.f }, ve::fp_vector{ 0.f });
+			next_market_money = ve::select((nan_mask + inf_mask) > ve::fp_vector{ 0.f }, ve::fp_vector{ 0.f }, next_market_money);
+		}
+		state.world.market_set_stockpile(market, economy::money, next_market_money);
 
 		state.world.market_set_total_earn(market, earn);
 		state.world.market_set_total_paid(market, spend);
