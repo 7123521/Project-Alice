@@ -2227,6 +2227,13 @@ void update_employment(sys::state& state, bool ignore_reality, float presim_empl
 		//auto unstable_market_conditions_indicator = ve::min(ve::fp_vector{1.f}, (sales_optimism + sold_expectation) * (purchase_optimism + min_expected_input));
 		auto input_cost_per_worker = state.world.factory_get_input_expected_cost_per_worker(facids);
 		auto unstable_market_conditions_indicator = sold_expectation * min_expected_input;
+		// NOTE: upstream commit 153481ba5 (2026-10-29) commented out the min(1.f, ...) clamp that
+		// used to bound this indicator. With the clamp gone, decay = max(0.9999, indicator) can
+		// exceed 1 and scaler then grows factory employment instead of limiting it: on a 20-year
+		// DoD run total labour demand jumps from 1.2e8 to 1.1e14 in month two and decays back over
+		// ~20 months. Clamping the indicator again did NOT stop the spike in a measured A/B run, so
+		// the real driver is elsewhere (goods with demand but no supply push the employment gradient
+		// up). Left as upstream has it; asserts that would catch it live in #ifndef NDEBUG only.
 
 		auto secondary_power = ve::apply([&](dcon::nation_id local_nation, dcon::commodity_id output_commodity) {
 			return high_education_power(state, local_nation, output_commodity);

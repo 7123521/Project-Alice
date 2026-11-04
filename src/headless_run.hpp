@@ -12,6 +12,7 @@
 #include "economy/economy_production.hpp"
 #include "economy/economy_constants.hpp"
 #include "economy/advanced_province_buildings.hpp"
+#include "provinces/province.hpp"
 #include "gamestate/commands.hpp"
 
 namespace headless {
@@ -72,6 +73,7 @@ inline void dump_month(sys::state& state, FILE* nations_csv, FILE* prices_csv, F
 		double gdp_real = 0, treasury = 0, private_inv = 0, army_dem = 0, gov_dem = 0;
 		double trade_volume = 0, naval_price = 0, naval_price_n = 0, naval_demand = 0, land_demand = 0;
 		double rgo_emp = 0, fac_emp = 0, labor_sup = 0, labor_dem = 0;
+		int32_t labor_sup_nan = 0, labor_dem_nan = 0;
 		double fac_budget = 0, fac_output_value = 0, fac_input_cost = 0, fac_wage = 0;
 		state.world.for_each_commodity([&](dcon::commodity_id c) {
 			if(c == economy::money) return;
@@ -95,12 +97,26 @@ inline void dump_month(sys::state& state, FILE* nations_csv, FILE* prices_csv, F
 			pop_savings_total += double(state.world.pop_get_savings(p));
 		});
 		state.world.for_each_province([&](dcon::province_id p) {
+			// Only land provinces carry labour data: the engine initialises and updates labour supply
+			// through ve_for_each_land_province, so a sea province holds an uninitialised (NaN) value
+			// and used to poison every per-province sum here.
+			bool const land = province::is_land(state, p);
 			rgo_bank += double(state.world.province_get_rgo_bank(p));
 			factory_bank += double(state.world.province_get_factory_bank(p));
 			rent_bank += double(state.world.province_get_advanced_province_building_private_savings(p, advanced_province_buildings::list::local_cities_and_towns));
-			for(int32_t l = 0; l < economy::labor::total; ++l) {
-				labor_sup += double(state.world.province_get_labor_supply_sold(p, l)) * double(state.world.province_get_demographics(p, demographics::total));
-				labor_dem += double(state.world.province_get_labor_demand(p, l));
+			if(land) {
+				for(int32_t l = 0; l < economy::labor::total; ++l) {
+					// province_get_labor_supply is already a head count (economy.cpp sets it to
+					// population times the labour distribution). Multiplying by demographics::total
+					// again, as this used to, produced ~3x the population and made the workforce look
+					// 90% unemployed.
+					auto sv = double(state.world.province_get_labor_supply(p, l));
+					auto dv = double(state.world.province_get_labor_demand(p, l));
+					if(!std::isfinite(sv)) { ++labor_sup_nan; }
+					else { labor_sup += sv; }
+					if(!std::isfinite(dv)) { ++labor_dem_nan; }
+					else { labor_dem += dv; }
+				}
 			}
 			state.world.for_each_commodity([&](dcon::commodity_id c) {
 				rgo_emp += double(state.world.province_get_rgo_target_employment(p, c));
@@ -161,6 +177,34 @@ inline void dump_month(sys::state& state, FILE* nations_csv, FILE* prices_csv, F
 			for(size_t i = 0; i < pb.size(); ++i) builds += pb[i];
 			if(cl) builds_clothes = pb[cl.index()];
 			if(fb) builds_fabric = pb[fb.index()];
+		}
+		// Observation sanity check. A model this complex is only as trustworthy as its
+		// instrumentation, and two of these series were silently mis-scaled once already:
+		// fill_ratio is factories/capacity (a build-out ratio), not an activity level, and
+		// labour_supply used to be a 0..1 sold ratio multiplied by population. Each violation
+		// prints once per month with the metric name, so a dimensionally impossible number
+		// announces itself instead of being read as a finding.
+		{
+			auto bad = [&](char const* what, double v) {
+				fprintf(stderr, "SANITY %s warn=%s value=%.6g\n", date.c_str(), what, v);
+			};
+			if(!(pop_total > 0.0)) bad("population_nonpositive", pop_total);
+			if(labor_sup > pop_total * 1.01) bad("labor_supply_exceeds_population", labor_sup);
+			if(rgo_emp + fac_emp > labor_sup * 1.01 && labor_sup > 0.0)
+				bad("employment_exceeds_labor_supply", rgo_emp + fac_emp);
+			if(!std::isfinite(gdp_real)) bad("gdp_not_finite", gdp_real);
+			if(!std::isfinite(labor_sup)) bad("labor_supply_not_finite", labor_sup);
+			if(!std::isfinite(labor_dem)) bad("labor_demand_not_finite", labor_dem);
+			if(labor_dem > labor_sup * 10.0 && labor_sup > 0.0)
+				bad("labor_demand_over_10x_supply", labor_dem);
+			if(demand_total > 0.0 && supply_total > 0.0 && supply_total / demand_total > 1000.0)
+				bad("supply_over_demand_gt_1000x", supply_total / demand_total);
+			if(demand_total > 0.0 && supply_total > 0.0 && demand_total / supply_total > 1000.0)
+				bad("demand_over_supply_gt_1000x", demand_total / supply_total);
+			if(labor_sup_nan > 0)
+				bad("labor_supply_nan_slots", double(labor_sup_nan));
+			if(labor_dem_nan > 0)
+				bad("labor_demand_nan_slots", double(labor_dem_nan));
 		}
 		fprintf(summary_csv,
 			"%s,%.6g,%.4g,%.4g,%.4g,%.4g,%.6g,%.6g,%.4g,%.6g,%.6g,%.6g,%.6g,%.4g,%.6g,%d,%d,%d,%.6g,%.6g,%.6g,%.6g,%.0f,%.0f,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g\n",
