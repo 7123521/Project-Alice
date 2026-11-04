@@ -207,7 +207,7 @@ inline void dump_month(sys::state& state, FILE* nations_csv, FILE* prices_csv, F
 				bad("labor_demand_nan_slots", double(labor_dem_nan));
 		}
 		fprintf(summary_csv,
-			"%s,%.6g,%.4g,%.4g,%.4g,%.4g,%.6g,%.6g,%.4g,%.6g,%.6g,%.6g,%.6g,%.4g,%.6g,%d,%d,%d,%.6g,%.6g,%.6g,%.6g,%.0f,%.0f,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g\n",
+			"%s,%.6g,%.4g,%.4g,%.4g,%.4g,%.6g,%.6g,%.4g,%.6g,%.6g,%.6g,%.6g,%.4g,%.6g,%d,%d,%d,%.6g,%.6g,%.6g,%.6g,%.0f,%.0f,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g\n",
 			date.c_str(), pop_total, pop_total > 0 ? sat_weighted / pop_total : 0.0,
 			pop_sum[0] > 0 ? sat_sum[0] / pop_sum[0] : 0.0,
 			pop_sum[1] > 0 ? sat_sum[1] / pop_sum[1] : 0.0,
@@ -418,7 +418,7 @@ inline void dump_month(sys::state& state, FILE* nations_csv, FILE* prices_csv, F
 				+ state.world.factory_get_secondary_employment(fac);
 			fac_cap += state.world.factory_get_size(fac);
 		}
-		fprintf(provinces_csv, "%s,%d,%s,%s,%.6g,%s,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g\n",
+		fprintf(provinces_csv, "%s,%d,%s,%s,%.6g,%s,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g\n",
 			date.c_str(), i,
 			tag_of(state, state.world.province_get_nation_from_province_ownership(p)).c_str(),
 			tag_of(state, state.world.province_get_nation_from_province_control(p)).c_str(),
@@ -431,7 +431,12 @@ inline void dump_month(sys::state& state, FILE* nations_csv, FILE* prices_csv, F
 			double(state.world.province_get_labor_supply(p, economy::labor::basic_education)),
 			double(state.world.province_get_labor_supply(p, economy::labor::high_education)),
 			double(state.world.province_get_labor_demand(p, economy::labor::no_education)),
-			double(state.world.province_get_labor_demand(p, economy::labor::basic_education)));
+			double(state.world.province_get_labor_demand(p, economy::labor::basic_education)),
+			// Measured, not inferred: factory capacity is derived from this number, so it is the
+			// quantity that decides how much industry a province can ever hold.
+			double(state.world.province_get_advanced_province_building_private_size(
+				p, advanced_province_buildings::list::local_cities_and_towns)),
+			double(state.world.province_get_labor_demand(p, economy::labor::no_education) <= 0.f ? 1.0 : 0.0));
 	}
 	// routes touching each market, so the dump shows where goods can actually move
 	static std::vector<int32_t> route_count;
@@ -609,7 +614,7 @@ inline void run(sys::state& state, int years, std::string const& dump_dir) {
 				"treasury,private_investment,army_demand,gov_construction_demand,builds_clothes,builds_fabric,pop_savings,market_pop_investments,market_pop_dividends,rgo_bank,factory_bank,rent_bank,government_bank,total_loans,subsidy_spending,trade_volume,naval_transport_price,land_transport_price,naval_transport_demand,land_transport_demand,rgo_employment,factory_employment,labor_supply,labor_demand,factory_hiring_budget,factory_output_value,factory_input_cost,factory_wage_bill\n");
 		if(welfare_csv)
 			fprintf(welfare_csv, "date,pop_type,population,mean_satisfaction,savings_per_capita,basket_cost_per_capita,spent_per_capita,mean_is_rich\n");
-		fprintf(provinces_csv, "date,province,owner,controller,population,rgo_good,rgo_size,rgo_target_employment,factory_employment,factory_capacity,labor_supply_no_edu,labor_supply_basic,labor_supply_high,labor_demand_no_edu,labor_demand_basic\n");
+		fprintf(provinces_csv, "date,province,owner,controller,population,rgo_good,rgo_size,rgo_target_employment,factory_employment,factory_capacity,labor_supply_no_edu,labor_supply_basic,labor_supply_high,labor_demand_no_edu,labor_demand_basic,city_size,zero_demand\n");
 		fprintf(nations_csv, "date,tag,prestige,industrial_score,military_score,rank,is_gp,is_civilized,treasury,population,provinces,infamy,war_exhaustion,unlocked_commodities\n");
 		fprintf(prices_csv, "date,good,price,median_price,world_supply,world_demand,world_stockpile,merchant_sales,artisan_score,artisan_production,markets_with_supply,markets_total,artisan_producers,artisan_max,rgo_output,factory_output,factory_count,army_demand\n");
 	}
