@@ -2496,7 +2496,7 @@ std::vector<full_construction_factory> estimate_private_investment_construct(sys
 		int32_t num_factories = province_factory_count(state, s);
 		auto urbanisation = state.world.province_get_advanced_province_building_max_private_size(s, advanced_province_buildings::list::local_cities_and_towns);
 
-		if(num_factories >= int32_t(state.defines.factories_per_state * urbanisation / economy::factories_per_state_required_city_size)) {
+		if(num_factories >= int32_t(state.defines.factories_per_state * urbanisation / economy::factories_per_state_required_city_size())) {
 			continue;
 		}
 

@@ -164,7 +164,7 @@ inline void dump_month(sys::state& state, FILE* nations_csv, FILE* prices_csv, F
 			dcon::province_id p{dcon::province_id::value_base_t(i)};
 			auto urban = state.world.province_get_advanced_province_building_max_private_size(
 				p, advanced_province_buildings::list::local_cities_and_towns);
-			capacity += int(state.defines.factories_per_state * urban / economy::factories_per_state_required_city_size);
+			capacity += int(state.defines.factories_per_state * urban / economy::factories_per_state_required_city_size());
 		}
 		double builds = 0, builds_clothes = 0, builds_fabric = 0;
 		{
@@ -256,7 +256,7 @@ inline void dump_month(sys::state& state, FILE* nations_csv, FILE* prices_csv, F
 				int n = economy::province_factory_count(state, p);
 				auto urban = state.world.province_get_advanced_province_building_max_private_size(
 					p, advanced_province_buildings::list::local_cities_and_towns);
-				int cap = int(state.defines.factories_per_state * urban / economy::factories_per_state_required_city_size);
+				int cap = int(state.defines.factories_per_state * urban / economy::factories_per_state_required_city_size());
 				++provinces;
 				sum_n += n;
 				sum_cap += cap;

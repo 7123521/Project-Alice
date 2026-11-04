@@ -270,7 +270,7 @@ void province_factory_count_text::on_update(sys::state& state) noexcept {
 	auto content = retrieve<dcon::province_id>(state, parent);
 	int32_t count = economy::province_factory_count(state, content);
 	auto urbanisation = state.world.province_get_advanced_province_building_max_private_size(content, advanced_province_buildings::list::local_cities_and_towns);
-	auto txt = std::to_string(count) + "/" + std::to_string(int32_t(state.defines.factories_per_state * urbanisation / economy::factories_per_state_required_city_size));
+	auto txt = std::to_string(count) + "/" + std::to_string(int32_t(state.defines.factories_per_state * urbanisation / economy::factories_per_state_required_city_size()));
 	set_text(state, txt);
 }
 

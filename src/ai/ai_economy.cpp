@@ -264,7 +264,7 @@ bool have_available_slots(sys::state& state, dcon::nation_id n, dcon::province_i
 	auto urbanisation = state.world.province_get_advanced_province_building_max_private_size(p, advanced_province_buildings::list::local_cities_and_towns);
 
 	return
-		num_factories < int32_t(state.defines.factories_per_state * urbanisation / economy::factories_per_state_required_city_size)
+		num_factories < int32_t(state.defines.factories_per_state * urbanisation / economy::factories_per_state_required_city_size())
 		&& economy::do_resource_potentials_allow_construction(state, n, p, ftid);
 }
 

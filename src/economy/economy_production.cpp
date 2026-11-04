@@ -1314,8 +1314,18 @@ inline float investment_expand_factory_priority(
 	const sys::state& state,
 	dcon::factory_id factory
 ) {
+	// A factory only expands when its employment exceeds this fraction of its size; below that the
+	// priority is 0 and all investment goes to building new factories instead (see the else branch in
+	// update_production_investement_consumption). Measured on a 50-year DoD run the aggregate ratio
+	// creeps from 0.474 to 0.735 and never reaches 0.80, so no factory ever expands: capital keeps
+	// spreading into new small factories that each stay under the same threshold. The threshold is
+	// exposed for measurement; the default stays at the author's 0.8 so behaviour is unchanged.
+	static float const threshold = []() {
+		auto s = std::getenv("ALICE_EXP_EXPAND_THRESHOLD");
+		return s ? float(std::atof(s)) : 0.8f;
+	}();
 	auto size = state.world.factory_get_size(factory);
-	return std::clamp((factory_total_desired_employment(state, factory) - 0.8f * size) * 5.f / (size + 1.f), 0.f, 1.f);
+	return std::clamp((factory_total_desired_employment(state, factory) - threshold * size) * 5.f / (size + 1.f), 0.f, 1.f);
 }
 
 void update_production_investement_consumption(

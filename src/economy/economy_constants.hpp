@@ -188,7 +188,20 @@ inline float experiment_artisan_optimism() {
 	return v;
 }
 
-constexpr inline float factories_per_state_required_city_size = 60'000.f;
+// City population needed per 8 factory slots: a state with N urban population can hold
+// 8 * N / this many factories. This constant carries no comment in the original source while its
+// neighbours all document their units, so treat the value as a default rather than a tuned design
+// target. Pulse it from the environment to measure what it actually gates before changing anything:
+// on a DoD run the median province has ~1500 urban population against a 7500-per-factory threshold,
+// so 81% of provinces contribute no factory capacity at all and the median province would need
+// ~540 years to cross it.
+inline float factories_per_state_required_city_size() {
+	static float const v = []() {
+		auto s = std::getenv("ALICE_EXP_CITY_PER_FACTORY");
+		return s ? float(std::atof(s)) : 60'000.f;
+	}();
+	return v;
+}
 
 constexpr float stockpile_targets_demand_mult = 0.05f; // Stockpile targets demand will be multplied with this amount
 constexpr float max_army_required_spend = 1.5f; // Max percentage of current required army supplies the army budget will attempt to buy (1.5 = 150% of current required army supplies)
