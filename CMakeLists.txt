@@ -312,6 +312,12 @@ add_executable(AliceIncremental WIN32 EXCLUDE_FROM_ALL
 	${ASSET_FILES})
 endif()
 
+# Unity build was measured and rejected: merging the buckets into 8 blobs makes the
+# optimiser work on one huge translation unit, and with dcon_generated.hpp at ~140k lines
+# the optimiser cost grows faster than the parsing cost it saves. One blob
+# (bucket-RARELY_CHANGED) needed >10 minutes on a 12-core box, against 575 s for the whole
+# of the unmerged 137-unit build on a 4-core runner. Keep UNITY_BUILD_MODE as a hook but
+# leave UNITY_BUILD off.
 set_target_properties(
 	AliceIncremental
 	PROPERTIES
@@ -465,8 +471,15 @@ else() # GCC or CLANG
 		target_compile_options(AliceCommon INTERFACE
 		-mavx2 -mfma )
 	else()
-		target_compile_options(AliceCommon INTERFACE
-		-march=nehalem -fno-fast-math -ffp-model=precise -ffp-contract=off )
+		# -ffp-model=precise is clang-only; gcc spells the same intent -ffp-contract=off
+		# (keep FP contraction off so the economy arithmetic stays bit-reproducible).
+		if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+			target_compile_options(AliceCommon INTERFACE
+			-march=nehalem -fno-fast-math -ffp-contract=off )
+		else()
+			target_compile_options(AliceCommon INTERFACE
+			-march=nehalem -fno-fast-math -ffp-model=precise -ffp-contract=off )
+		endif()
 	endif()
 
 
