@@ -190,9 +190,14 @@ void update_consumption_administration(sys::state& state, dcon::nation_id n, flo
 			auto capital_state = state.world.province_get_state_membership(capital);
 			auto capital_of_capital_state = state.world.state_instance_get_capital(capital_state);
 
+			// A capital may have no population of this education tier, making the labour price zero; the
+			// division then yields a huge demand (measured 1.019e14 across all provinces), which drives
+			// satisfaction to 0 and freezes the entire labour market. The assert that would have caught
+			// this is compiled out of Release builds. Clamp the divisor, leaving the formula alone.
 			auto wage = state.world.province_get_labor_price(capital_of_capital_state, economy::labor::high_education_and_accepted);
-			auto demand = budget_per_administration / wage;
+			auto demand = budget_per_administration / std::max(wage, 1e-6f);
 			assert(std::isfinite(demand) && demand >= 0.f);
+			if(!std::isfinite(demand)) demand = 0.f;
 			state.world.nation_set_administration_employment_target_in_capital(n, demand);
 			auto& cur_labor_demand = state.world.province_get_labor_demand(capital_of_capital_state, economy::labor::high_education_and_accepted);
 			state.world.province_set_labor_demand(capital_of_capital_state, economy::labor::high_education_and_accepted, cur_labor_demand + demand);
@@ -210,9 +215,11 @@ void update_consumption_administration(sys::state& state, dcon::nation_id n, flo
 		auto capital_state = state.world.province_get_state_membership(capital);
 		auto capital_of_capital_state = state.world.state_instance_get_capital(capital_state);
 
+		// Same zero-wage division as above, for the secondary administrations.
 		auto wage = state.world.province_get_labor_price(capital_of_capital_state, economy::labor::high_education_and_accepted);
-		auto demand = budget_per_administration / wage;
+		auto demand = budget_per_administration / std::max(wage, 1e-6f);
 		assert(std::isfinite(demand) && demand >= 0.f);
+		if(!std::isfinite(demand)) demand = 0.f;
 		state.world.province_set_administration_employment_target(capital_of_capital_state, demand);
 		auto& cur_labor_demand = state.world.province_get_labor_demand(capital_of_capital_state, economy::labor::high_education_and_accepted);
 		state.world.province_set_labor_demand(capital_of_capital_state, economy::labor::high_education_and_accepted, cur_labor_demand + demand);
