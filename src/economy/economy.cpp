@@ -751,6 +751,10 @@ static bool const trace_weight_decomp = []() {
 	auto s = std::getenv("ALICE_TRACE_WEIGHT_DECOMP");
 	return s && std::atoi(s) != 0;
 }();
+static bool const weight_fix = []() {
+	auto s = std::getenv("ALICE_EXP_WEIGHT_FIX");
+	return s && std::atoi(s) != 0;
+}();
 static FILE* weight_decomp_file = nullptr;
 static bool weight_decomp_file_init = false;
 static int last_weight_decomp_key = -1;
@@ -865,6 +869,28 @@ void rebalance_needs_weights(sys::state& state) {
 			ve::fp_vector dw_life = need_weight_change<ve::fp_vector, ve::fp_vector>(local_cost_reasonable, price, available, w_life, needed_life, local_cost_life, life_count);
 			ve::fp_vector dw_everyday = need_weight_change<ve::fp_vector, ve::fp_vector>(local_cost_reasonable, price, available, w_everyday, needed_everyday, local_cost_everyday, everyday_count);
 			ve::fp_vector dw_luxury = need_weight_change<ve::fp_vector, ve::fp_vector>(local_cost_reasonable, price, available, w_luxury, needed_luxury, local_cost_luxury, luxury_count);
+
+			if(weight_fix) {
+				auto const denom_life = local_cost_life + 0.000001f;
+				auto const denom_everyday = local_cost_everyday + 0.000001f;
+				auto const denom_luxury = local_cost_luxury + 0.000001f;
+				auto const cost_reasonable_safe = local_cost_reasonable + 0.000001f;
+				dw_life = dw_life
+					- (-1.5f * life_count * needed_life * price / denom_life)
+					+ (-1.5f * needed_life * price / denom_life)
+					- (-price * needed_life / (cost_reasonable_safe * 10'000.f))
+					+ (-price * needed_life / (denom_life * 10'000.f));
+				dw_everyday = dw_everyday
+					- (-1.5f * everyday_count * needed_everyday * price / denom_everyday)
+					+ (-1.5f * needed_everyday * price / denom_everyday)
+					- (-price * needed_everyday / (cost_reasonable_safe * 10'000.f))
+					+ (-price * needed_everyday / (denom_everyday * 10'000.f));
+				dw_luxury = dw_luxury
+					- (-1.5f * luxury_count * needed_luxury * price / denom_luxury)
+					+ (-1.5f * needed_luxury * price / denom_luxury)
+					- (-price * needed_luxury / (cost_reasonable_safe * 10'000.f))
+					+ (-price * needed_luxury / (denom_luxury * 10'000.f));
+			}
 
 			if(write_weight_today && c == grain_commodity && weight_decomp_file) {
 				auto const owners = state.world.state_instance_get_nation_from_state_ownership(local_zone);
