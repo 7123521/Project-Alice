@@ -16,9 +16,11 @@ namespace economy {
 // instead of using the economy-wide high-education wage. The wage is paid only to the hired
 // administrators; it does not set the market price for other high-education labour. Demand is
 // still budget / wage, so the quantity is priced, not capped. Default 0 keeps upstream behaviour.
+// LOCAL DEFAULT (candidate branch): segmented administration wage is ON by default.
+// Set ALICE_EXP_ADMIN_SEGMENTED_WAGE=0 to restore upstream behaviour.
 static bool const admin_segmented_wage = []() {
 	auto s = std::getenv("ALICE_EXP_ADMIN_SEGMENTED_WAGE");
-	return s && std::atoi(s) != 0;
+	return s ? std::atoi(s) != 0 : true;
 }();
 
 static std::vector<float> admin_wage_buffer;
