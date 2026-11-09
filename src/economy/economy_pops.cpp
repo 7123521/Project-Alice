@@ -20,6 +20,8 @@ namespace pops {
 
 static std::vector<float> market_life_spending;
 static std::vector<float> market_disposable;
+static std::vector<float> pop_income_before;
+static std::vector<float> market_income_flow;
 static bool const les_actual_budget = []() {
 	auto s = std::getenv("ALICE_EXP_DEMAND_LES_ACTUAL");
 	return s && std::atoi(s) != 0;
@@ -34,6 +36,30 @@ float market_life_needs_spending(dcon::market_id m) {
 }
 float market_disposable_income(dcon::market_id m) {
 	return m.index() < market_disposable.size() ? market_disposable[m.index()] : 0.f;
+}
+
+void snapshot_income_start(sys::state& state) {
+	pop_income_before.assign(state.world.pop_size(), 0.f);
+	state.world.for_each_pop([&](dcon::pop_id p) {
+		pop_income_before[p.index()] = state.world.pop_get_savings(p);
+	});
+}
+
+void finalize_income_flow(sys::state& state) {
+	market_income_flow.assign(state.world.market_size(), 0.f);
+	state.world.for_each_pop([&](dcon::pop_id p) {
+		auto const before = p.index() < pop_income_before.size() ? pop_income_before[p.index()] : 0.f;
+		auto const flow = std::max(0.f, state.world.pop_get_savings(p) - before);
+		auto const prov = state.world.pop_get_province_from_pop_location(p);
+		auto const sid = state.world.province_get_state_membership(prov);
+		auto const mid = state.world.state_instance_get_market_from_local_market(sid);
+		if(mid.index() < market_income_flow.size())
+			market_income_flow[mid.index()] += flow;
+	});
+}
+
+float market_daily_income(dcon::market_id m) {
+	return m.index() < market_income_flow.size() ? market_income_flow[m.index()] : 0.f;
 }
 
 // LOCAL TRACE (ALICE_TRACE_DEMAND_DECOMP): read-only grain demand decomposition by market and

@@ -783,6 +783,10 @@ static bool const demand_les_income = []() {
 	auto s = std::getenv("ALICE_EXP_DEMAND_LES_INCOME");
 	return s && std::atoi(s) != 0;
 }();
+static bool const demand_les_flow = []() {
+	auto s = std::getenv("ALICE_EXP_DEMAND_LES_FLOW");
+	return s && std::atoi(s) != 0;
+}();
 static float const demand_life_share = []() {
 	auto s = std::getenv("ALICE_DEMAND_LIFE_SHARE");
 	return s ? std::clamp(float(std::atof(s)), 0.01f, 1.f) : 0.5f;
@@ -1115,11 +1119,13 @@ void rebalance_needs_weights(sys::state& state) {
 			});
 			if(!(sum_gamma > 0.0) || !(subs > 0.0) || !std::isfinite(subs))
 				return;
-			double const budget = demand_les_income
-				? double(demand_life_share) * double(economy::pops::market_disposable_income(m))
-				: (demand_les_actual
-					? double(economy::pops::market_life_needs_spending(m))
-					: double(demand_les_budget) * subs);
+			double const budget = demand_les_flow
+				? double(demand_life_share) * double(economy::pops::market_daily_income(m))
+				: (demand_les_income
+					? double(demand_life_share) * double(economy::pops::market_disposable_income(m))
+					: (demand_les_actual
+						? double(economy::pops::market_life_needs_spending(m))
+						: double(demand_les_budget) * subs));
 			double sum_pq = 0.0;
 			double grain_weight = 0.0;
 			double grain_q = 0.0;
@@ -6455,6 +6461,7 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 
 	set_profile_point(state, "rgo/factory banks");
 
+	pops::snapshot_income_start(state);
 	pops::update_income_national_subsidy(state);
 
 
@@ -6494,6 +6501,7 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 	});
 
 	collect_taxes(state, income_buffer);
+	pops::finalize_income_flow(state);
 
 	/*
 	There is also a notion of "market tax"
