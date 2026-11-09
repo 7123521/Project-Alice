@@ -9,9 +9,46 @@
 #include "economy_templates_pure.hpp"
 #include "economy_pops_constants.hpp"
 #include "demographics_templates.hpp"
+#include "text/text.hpp"
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+#include <algorithm>
 
 namespace economy {
 namespace pops {
+
+// LOCAL TRACE (ALICE_TRACE_DEMAND_DECOMP): read-only grain demand decomposition by market and
+// pop type on a single probe date. No economic effect.
+static bool const demand_decomp_trace = []() {
+	auto s = std::getenv("ALICE_TRACE_DEMAND_DECOMP");
+	return s && std::atoi(s) != 0;
+}();
+static std::string const demand_decomp_date = []() {
+	auto s = std::getenv("ALICE_DEMAND_PROBE_DATE");
+	return s ? std::string(s) : std::string{};
+}();
+static FILE* demand_decomp_file = nullptr;
+static bool demand_decomp_file_init = false;
+static dcon::commodity_id demand_decomp_grain{};
+static bool demand_decomp_grain_init = false;
+static FILE* demand_category_file = nullptr;
+static bool demand_category_file_init = false;
+
+static void init_demand_decomp_grain(sys::state const& state) {
+	if(demand_decomp_grain_init)
+		return;
+	demand_decomp_grain_init = true;
+	state.world.for_each_commodity([&](dcon::commodity_id c) {
+		if(demand_decomp_grain || c == economy::money)
+			return;
+		auto const name = text::produce_simple_string(state, state.world.commodity_get_name(c));
+		std::string lower = name;
+		std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char ch) { return char(std::tolower(ch)); });
+		if(lower.find("grain") != std::string::npos)
+			demand_decomp_grain = c;
+	});
+}
 
 
 template<typename VALUE, typename POPS>
@@ -541,6 +578,9 @@ void update_consumption(
 ) {
 	uint32_t total_commodities = state.world.commodity_size();
 
+	if(demand_decomp_trace)
+		init_demand_decomp_grain(state);
+
 	state.ui_state.last_tick_investment_pool_change = 0;
 
 	// satisfaction buffers
@@ -776,6 +816,41 @@ void update_consumption(
 					* state.defines.alice_lx_needs_scale
 					* invention_factor;
 
+				if(demand_decomp_trace && cid == demand_decomp_grain) {
+					auto const ymd = state.current_date.to_ymd(state.start_date);
+					char datebuf[16];
+					std::snprintf(datebuf, sizeof(datebuf), "%04d-%02d-%02d", ymd.year, ymd.month, ymd.day);
+					if(demand_decomp_date == datebuf) {
+						if(!demand_decomp_file_init) {
+							demand_decomp_file_init = true;
+							auto const path = std::getenv("ALICE_DEMAND_PROBE_FILE");
+							if(path) {
+								demand_decomp_file = fopen(path, "w");
+								if(demand_decomp_file)
+									fprintf(demand_decomp_file, "date,market,owner_index,pop_type,strata,scale_life,base_life,life_weight,life_mul,demand_life,scale_everyday,base_everyday,everyday_weight,demand_everyday,scale_luxury,base_luxury,luxury_weight,demand_luxury,market_demand,market_consumption,price\n");
+							}
+						}
+						if(demand_decomp_file) {
+							auto const owners = state.world.state_instance_get_nation_from_state_ownership(states);
+							auto const market_demand = state.world.market_get_demand(ids, cid);
+							auto const market_consumption = state.world.market_get_consumption(ids, cid);
+							auto const price = state.world.market_get_price(ids, cid);
+							ve::apply([&](dcon::market_id m, dcon::nation_id n, float sl, float bl, float lw, float lm, float dl,
+								float se, float be, float ew, float de, float sx, float bx, float xw, float dx,
+								float md, float mc, float pr) {
+								fprintf(demand_decomp_file, "%s,%d,%d,%d,%d,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g\n",
+									datebuf, int(m.index()), int(n.index()), int(t.id.index()), int(strata),
+									double(sl), double(bl), double(lw), double(lm), double(dl),
+									double(se), double(be), double(ew), double(de),
+									double(sx), double(bx), double(xw), double(dx),
+									double(md), double(mc), double(pr));
+							}, ids, owners, scale_life, base_life, life_weight, life_mul[strata], demand_life,
+								scale_everyday, base_everyday, everyday_weight, demand_everyday,
+								scale_luxury, base_luxury, luxury_weight, demand_luxury,
+								market_demand, market_consumption, price);
+						}
+					}
+				}
 				register_demand(state, ids, cid, demand_life);
 				register_demand(state, ids, cid, demand_everyday);
 				register_demand(state, ids, cid, demand_luxury);
@@ -797,6 +872,30 @@ void update_consumption(
 				);
 #endif
 				total = total + scale * w * base_amount;
+				if(demand_decomp_trace && cid == demand_decomp_grain) {
+					auto const ymd = state.current_date.to_ymd(state.start_date);
+					char datebuf[16];
+					std::snprintf(datebuf, sizeof(datebuf), "%04d-%02d-%02d", ymd.year, ymd.month, ymd.day);
+					if(demand_decomp_date == datebuf) {
+						if(!demand_category_file_init) {
+							demand_category_file_init = true;
+							auto const path = std::getenv("ALICE_DEMAND_CATEGORY_FILE");
+							if(path) {
+								demand_category_file = fopen(path, "w");
+								if(demand_category_file)
+									fprintf(demand_category_file, "date,market,category,scale,local_weight,base_weight,demand\n");
+							}
+						}
+						if(demand_category_file) {
+							auto const demand = scale * w * base_amount;
+							ve::apply([&](dcon::market_id m, float sc, float lw, float dmd) {
+								fprintf(demand_category_file, "%s,%d,%d,%.6g,%.6g,%.6g,%.6g\n",
+									datebuf, int(m.index()), int(consumption.index()),
+									double(sc), double(lw), double(base_amount), double(dmd));
+							}, ids, scale, w, demand);
+						}
+					}
+				}
 #ifndef NDEBUG
 				ve::apply(
 					[](float amount) {
