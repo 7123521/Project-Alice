@@ -72,6 +72,17 @@ static bool const financed_wage = []() {
 	auto s = std::getenv("ALICE_EXP_FINANCED_WAGE");
 	return s && std::atoi(s) != 0;
 }();
+// LOCAL EXPERIMENT (ALICE_EXP_GOV_STOCKPILE_PURCHASE=1): the state buys market stock above a
+// target days-of-demand at the market price, financed from the national bank (cash-limited),
+// and holds it as a government stockpile. This is the final absorber for an unsold surplus.
+static bool const gov_stockpile_purchase = []() {
+	auto s = std::getenv("ALICE_EXP_GOV_STOCKPILE_PURCHASE");
+	return s && std::atoi(s) != 0;
+}();
+static float const gov_stockpile_target_days = []() {
+	auto s = std::getenv("ALICE_GOV_STOCKPILE_TARGET_DAYS");
+	return s ? std::max(30.f, std::min(3650.f, float(std::atof(s)))) : 365.f;
+}();
 static std::vector<float> factory_bank_start;
 static std::vector<float> financed_wage_bill;
 float get_factory_bank_start(sys::state const& state, dcon::province_id p) {
@@ -5435,6 +5446,62 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 				}
 			}, market, sales);
 		}
+		if(gov_stockpile_purchase) {
+			ve::apply([&](dcon::market_id m) {
+				if(size_t(m.index()) >= seller_share_cache.size())
+					return;
+				auto const& entry = seller_share_cache[size_t(m.index())];
+				if(!(entry.total > 0.f) || !std::isfinite(entry.total))
+					return;
+				auto const sid = state.world.market_get_zone_from_local_market(m);
+				auto const n = state.world.state_instance_get_nation_from_state_ownership(sid);
+				if(!n)
+					return;
+				auto const bank = state.world.nation_get_national_bank(n);
+				if(!std::isfinite(bank))
+					return;
+				float total_credit = 0.f;
+				for(uint32_t ci = 1; ci < state.world.commodity_size(); ++ci) {
+					dcon::commodity_id c{ dcon::commodity_id::value_base_t(ci) };
+					if(c == economy::money)
+						continue;
+					auto const stock = state.world.market_get_stockpile(m, c);
+					auto const current_demand = state.world.market_get_demand(m, c);
+					auto const target = current_demand * gov_stockpile_target_days;
+					auto const excess = std::max(0.f, stock - target);
+					if(!(excess > 0.f) || !std::isfinite(excess))
+						continue;
+					auto const price = state.world.market_get_price(m, c);
+					if(!(price > 0.f) || !std::isfinite(price))
+						continue;
+					auto const available = std::max(0.f, bank - total_credit);
+					auto const credit = std::min(excess * price, available);
+					if(!(credit > 0.f) || !std::isfinite(credit))
+						continue;
+					auto const qty = credit / price;
+					state.world.market_set_stockpile(m, c, stock - qty);
+					state.world.nation_set_total_stockpiles(n, c, state.world.nation_get_total_stockpiles(n, c) + qty);
+					total_credit += credit;
+				}
+				if(!(total_credit > 0.f) || !std::isfinite(total_credit))
+					return;
+				state.world.nation_set_national_bank(n, bank - total_credit);
+				for(auto const& ps : entry.provinces) {
+					auto const own = ps.rgo + ps.guild + ps.factory;
+					if(!(own > 0.f) || !std::isfinite(own))
+						continue;
+					auto const amount = total_credit * own / entry.total;
+					if(!std::isfinite(amount))
+						continue;
+					if(ps.rgo > 0.f)
+						state.world.province_set_rgo_bank(ps.province, state.world.province_get_rgo_bank(ps.province) + amount * ps.rgo / own);
+					if(ps.guild > 0.f)
+						state.world.province_set_artisan_bank(ps.province, state.world.province_get_artisan_bank(ps.province) + amount * ps.guild / own);
+					if(ps.factory > 0.f)
+						state.world.province_set_factory_bank(ps.province, state.world.province_get_factory_bank(ps.province) + amount * ps.factory / own);
+				}
+			}, market);
+		}
 		if(inventory_finance) {
 			ve::apply([&](dcon::market_id m, float sold) {
 				if(size_t(m.index()) >= seller_share_cache.size())
@@ -5559,6 +5626,9 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 			state.world.market_set_port_services_demand(market, old_port_demand + demanded_port_services);
 		}
 	});
+
+	if(gov_stockpile_purchase)
+		recreate_total_government_stockpiles(state);
 
 	if(closed_settlement) {
 		state.world.for_each_market([&](dcon::market_id m) {
