@@ -134,6 +134,19 @@ static FILE* grain_flow_file = nullptr;
 static bool grain_flow_file_init = false;
 static std::string last_grain_flow_date;
 static std::vector<float> prev_grain_stockpile;
+// LOCAL EXPERIMENT (ALICE_EXP_PRICE_RECOVERY=1): add an absolute price-adjustment term scaled by
+// the commodity base cost, so a near-zero price can still respond to demand/supply. The term is
+// symmetric (delta can be negative) and is zero when supply == demand; cost is a unit scale, not
+// a floor or anchor. Default 0 keeps upstream.
+static bool const price_recovery = []() {
+	auto s = std::getenv("ALICE_EXP_PRICE_RECOVERY");
+	return s && std::atoi(s) != 0;
+}();
+static float const price_recovery_speed = []() {
+	auto s = std::getenv("ALICE_PRICE_RECOVERY_SPEED");
+	return s ? std::clamp(float(std::atof(s)), 0.f, 0.1f) : 0.005f;
+}();
+
 static bool const trace_price_decomp = []() {
 	auto s = std::getenv("ALICE_TRACE_PRICE_DECOMP");
 	return s && std::atoi(s) != 0;
@@ -6966,6 +6979,13 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 				next_price = ve::select(demand <= supply, next_price * (demand + 0.000'001f) / (supply + 0.000'002f), next_price);
 			} else {
 				next_price = current_price + price_properties::commodity::change<ve::fp_vector>(current_price, supply, demand);
+				if(price_recovery) {
+					// delta from the same supply/demand ratio, recovered at unit price
+					auto const unit_change = price_properties::commodity::change<ve::fp_vector>(ve::fp_vector{1.f}, supply, demand);
+					auto const delta = unit_change / price_properties::commodity::speed_multiplier;
+					auto const cost_scale = state.world.commodity_get_cost(cid);
+					next_price = next_price + cost_scale * delta * price_recovery_speed;
+				}
 			}
 #ifndef NDEBUG
 			ve::apply([&](auto value) { assert(std::isfinite(value)); }, next_price);
