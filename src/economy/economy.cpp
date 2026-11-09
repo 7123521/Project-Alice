@@ -35,6 +35,14 @@
 
 namespace economy {
 
+// LOCAL EXPERIMENT (ALICE_EXP_PRESIM_STOCKPILE=1): normalize RGO market stockpiles during
+// presimulation to a band of days of demand. The upstream rule only enforces a floor, so a
+// persistent presim surplus accumulates into a multi-year overhang. Default 0 keeps upstream.
+static bool const presim_stockpile_band = []() {
+	auto s = std::getenv("ALICE_EXP_PRESIM_STOCKPILE");
+	return s && std::atoi(s) != 0;
+}();
+
 // LOCAL EXPERIMENT (ALICE_EXP_MARKET_CASH=1): record the cost of goods sold as market purchases.
 // Upstream never writes market purchases, so sales revenue accumulates in the market money pool.
 // This is the first cash-in-advance step: a sale is matched by a purchase of equal value.
@@ -5638,10 +5646,18 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 					&& state.world.commodity_get_actually_exists_in_nature(c)
 					&& state.world.commodity_get_rgo_amount(c) > 0.f
 				) {
-					state.world.market_set_stockpile(markets, c, ve::max(
-						ve::min(ve::fp_vector{365.f}, (2.f - confidence) * historical_demand / stockpile_to_supply),
-						state.world.market_get_stockpile(markets, c)
-					));
+					if(presim_stockpile_band) {
+						auto const demand = ve::max(historical_demand, state.world.market_get_demand(markets, c));
+						auto const target_min = demand * 7.f;
+						auto const target_max = demand * 30.f;
+						auto const current = state.world.market_get_stockpile(markets, c);
+						state.world.market_set_stockpile(markets, c, ve::min(ve::max(current, target_min), target_max));
+					} else {
+						state.world.market_set_stockpile(markets, c, ve::max(
+							ve::min(ve::fp_vector{365.f}, (2.f - confidence) * historical_demand / stockpile_to_supply),
+							state.world.market_get_stockpile(markets, c)
+						));
+					}
 				}
 			}
 		});
