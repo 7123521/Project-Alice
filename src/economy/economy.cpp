@@ -130,6 +130,13 @@ static FILE* grain_flow_file = nullptr;
 static bool grain_flow_file_init = false;
 static std::string last_grain_flow_date;
 static std::vector<float> prev_grain_stockpile;
+static bool const trace_rgo_subsistence = []() {
+	auto s = std::getenv("ALICE_TRACE_RGO_SUBSISTENCE");
+	return s && std::atoi(s) != 0;
+}();
+static FILE* rgo_subsistence_file = nullptr;
+static bool rgo_subsistence_file_init = false;
+static std::string last_rgo_subsistence_date;
 
 // LOCAL EXPERIMENT (ALICE_EXP_RESERVATION_WAGE=1): labor supply participation falls when the
 // local wage is below the cost of the worker's life + everyday needs. This is a supply curve,
@@ -385,6 +392,71 @@ static void dump_grain_flow_trace(sys::state& state, sys::year_month_day const& 
 			double(state.world.market_get_actual_probability_to_buy(m, grain)), double(state.world.market_get_actual_probability_to_sell(m, grain)));
 	});
 	fflush(grain_flow_file);
+}
+
+static void dump_rgo_subsistence_trace(sys::state& state, sys::year_month_day const& ymd) {
+	if(!trace_rgo_subsistence || ymd.day != 1)
+		return;
+	init_grain_commodity(state);
+	if(!grain_commodity)
+		return;
+	if(!rgo_subsistence_file_init) {
+		rgo_subsistence_file_init = true;
+		auto const path = std::getenv("ALICE_RGO_SUBSISTENCE_FILE");
+		if(path) {
+			rgo_subsistence_file = fopen(path, "w");
+			if(rgo_subsistence_file)
+				fprintf(rgo_subsistence_file, "date,province,market,owner_index,grain_rgo_output,grain_market_demand,rgo_workers,grain_total_need,grain_free_need,free_ratio_avg,subsistence_score,subsistence_employment\n");
+		}
+	}
+	if(!rgo_subsistence_file)
+		return;
+	char datebuf[16];
+	std::snprintf(datebuf, sizeof(datebuf), "%04d-%02d-%02d", ymd.year, ymd.month, ymd.day);
+	if(last_rgo_subsistence_date == datebuf)
+		return;
+	last_rgo_subsistence_date = datebuf;
+	auto const grain = grain_commodity;
+	province::for_each_land_province(state, [&](dcon::province_id pid) {
+		auto const sid = state.world.province_get_state_membership(pid);
+		if(!sid)
+			return;
+		auto const mid = state.world.state_instance_get_market_from_local_market(sid);
+		auto const owner = state.world.province_get_nation_from_province_ownership(pid);
+		auto const rgo_output = state.world.province_get_rgo_output(pid, grain);
+		auto const market_demand = state.world.market_get_demand(mid, grain);
+		auto const total_pop = state.world.province_get_demographics(pid, demographics::total);
+		auto const subsistence = state.world.province_get_subsistence_score(pid)
+			* state.world.province_get_subsistence_employment(pid) / (total_pop + 1.f);
+		auto const available = std::min(30.f, subsistence);
+		auto const qol = available / 30.f;
+		double workers = 0.0;
+		double total_need = 0.0;
+		double free_need = 0.0;
+		double ratio_sum = 0.0;
+		double ratio_weight = 0.0;
+		state.world.province_for_each_pop_location(pid, [&](auto pl) {
+			auto const pop = state.world.pop_location_get_pop(pl);
+			auto const pt = state.world.pop_get_poptype(pop);
+			if(!state.world.pop_type_get_is_paid_rgo_worker(pt))
+				return;
+			auto const size = state.world.pop_get_size(pop);
+			auto const need = double(state.world.pop_type_get_life_needs(pt, grain)) * double(size)
+				/ double(state.defines.alice_needs_scaling_factor);
+			auto const demand_scale = double(state.world.pop_get_satisfaction(pop));
+			auto const free_ratio = double(qol) / (1.0 + demand_scale);
+			workers += double(size);
+			total_need += need;
+			free_need += need * free_ratio;
+			ratio_sum += free_ratio * need;
+			ratio_weight += need;
+		});
+		fprintf(rgo_subsistence_file, "%s,%d,%d,%d,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g\n",
+			datebuf, pid.index(), mid.index(), owner.index(), double(rgo_output), double(market_demand),
+			workers, total_need, free_need, ratio_weight > 0.0 ? ratio_sum / ratio_weight : 0.0,
+			double(state.world.province_get_subsistence_score(pid)), double(state.world.province_get_subsistence_employment(pid)));
+	});
+	fflush(rgo_subsistence_file);
 }
 
 // LOCAL EXPERIMENT (ALICE_EXP_SELLER_PAYOUT): value-weighted producer shares per market and
@@ -4458,6 +4530,7 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 	dump_market_flow_trace(state, trace_ymd);
 	dump_grain_trace(state, trace_ymd);
 	dump_grain_flow_trace(state, trace_ymd);
+	dump_rgo_subsistence_trace(state, trace_ymd);
 	dump_labor_reservation_trace(state, trace_ymd);
 
 	if(seller_payout) {
