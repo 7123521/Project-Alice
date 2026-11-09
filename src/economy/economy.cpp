@@ -115,6 +115,95 @@ static bool grain_trace_file_init = false;
 static dcon::commodity_id grain_commodity{};
 static bool grain_commodity_init = false;
 
+// LOCAL EXPERIMENT (ALICE_EXP_RESERVATION_WAGE=1): labor supply participation falls when the
+// local wage is below the cost of the worker's life + everyday needs. This is a supply curve,
+// not a wage floor: the wage itself is still set by the labor market.
+static bool const reservation_wage = []() {
+	auto s = std::getenv("ALICE_EXP_RESERVATION_WAGE");
+	return s && std::atoi(s) != 0;
+}();
+static bool const trace_labor_reservation = []() {
+	auto s = std::getenv("ALICE_TRACE_LABOR_RESERVATION");
+	return s && std::atoi(s) != 0;
+}();
+static FILE* labor_reservation_file = nullptr;
+static bool labor_reservation_file_init = false;
+static std::string last_labor_trace_date;
+
+static dcon::pop_type_id reservation_pop_type(sys::state const& state, int32_t lt) {
+	switch(lt) {
+	case labor::basic_education:
+		return state.culture_definitions.secondary_factory_worker;
+	case labor::high_education:
+		return state.culture_definitions.bureaucrat;
+	case labor::guild_education:
+		return state.culture_definitions.artisans;
+	case labor::high_education_and_accepted:
+		return state.culture_definitions.bureaucrat;
+	default:
+		return state.culture_definitions.laborers;
+	}
+}
+
+static float labor_reservation(sys::state const& state, dcon::province_id pid, int32_t lt) {
+	auto const sid = state.world.province_get_state_membership(pid);
+	auto const mid = state.world.state_instance_get_market_from_local_market(sid);
+	auto const pt = reservation_pop_type(state, lt);
+	auto const costs = state.world.market_get_life_needs_costs(mid, pt)
+		+ state.world.market_get_everyday_needs_costs(mid, pt);
+	// labor price is quoted per 1/S worker (see the base-wage conversion in economy.cpp),
+	// so the reservation has to be converted twice to be comparable with the price.
+	auto const scaling = state.defines.alice_needs_scaling_factor;
+	auto const reservation = scaling > 0.f ? costs / scaling / scaling : 0.f;
+	return std::isfinite(reservation) ? reservation : 0.f;
+}
+
+static float labor_participation(sys::state const& state, dcon::province_id pid, int32_t lt) {
+	auto const reservation = labor_reservation(state, pid, lt);
+	auto const wage = state.world.province_get_labor_price(pid, lt);
+	if(!(reservation > 0.f) || !std::isfinite(wage))
+		return 1.f;
+	return std::clamp(wage / reservation, 0.f, 1.f);
+}
+
+static void dump_labor_reservation_trace(sys::state& state, sys::year_month_day const& ymd) {
+	if(!trace_labor_reservation || ymd.day != 1)
+		return;
+	if(!labor_reservation_file_init) {
+		labor_reservation_file_init = true;
+		auto const path = std::getenv("ALICE_LABOR_TRACE_FILE");
+		if(path) {
+			labor_reservation_file = fopen(path, "w");
+			if(labor_reservation_file)
+				fprintf(labor_reservation_file, "date,province,labor_type,wage,reservation,participation,supply,effective_supply,demand,satisfaction,sold,needs_scaling\n");
+		}
+	}
+	if(!labor_reservation_file)
+		return;
+	char datebuf[16];
+	std::snprintf(datebuf, sizeof(datebuf), "%04d-%02d-%02d", ymd.year, ymd.month, ymd.day);
+	if(last_labor_trace_date == datebuf)
+		return;
+	last_labor_trace_date = datebuf;
+	province::for_each_land_province(state, [&](dcon::province_id pid) {
+		for(int32_t lt = 0; lt < labor::total; ++lt) {
+			auto const wage = state.world.province_get_labor_price(pid, lt);
+			auto const reservation = labor_reservation(state, pid, lt);
+			auto const participation = labor_participation(state, pid, lt);
+			auto const supply = state.world.province_get_labor_supply(pid, lt);
+			auto const effective_supply = supply * (reservation_wage ? participation : 1.f);
+			auto const demand = state.world.province_get_labor_demand(pid, lt);
+			auto const satisfaction = demand > 0.f ? std::min(1.f, effective_supply / demand) : 1.f;
+			auto const sold = effective_supply > 0.f ? std::min(1.f, demand / effective_supply) * (reservation_wage ? participation : 1.f) : 1.f;
+			fprintf(labor_reservation_file, "%s,%d,%d,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g\n",
+				datebuf, pid.index(), lt, double(wage), double(reservation), double(participation),
+				double(supply), double(effective_supply), double(demand), double(satisfaction), double(sold),
+				double(state.defines.alice_needs_scaling_factor));
+		}
+	});
+	fflush(labor_reservation_file);
+}
+
 static void init_grain_commodity(sys::state& state) {
 	if(grain_commodity_init)
 		return;
@@ -4279,6 +4368,7 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 		market_flow_snap.assign(size_t(state.world.market_size()), market_flow_snapshot{});
 	dump_market_flow_trace(state, trace_ymd);
 	dump_grain_trace(state, trace_ymd);
+	dump_labor_reservation_trace(state, trace_ymd);
 
 	if(seller_payout) {
 		auto const today = state.current_date.to_ymd(state.start_date);
@@ -4639,8 +4729,13 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 			auto supply_labor = state.world.province_get_labor_supply(ids, j);
 			auto demand_labor = state.world.province_get_labor_demand(ids, j);
 
-			auto satisfaction = ve::select(demand_labor > 0.f, ve::min(1.f, supply_labor / demand_labor), 1.f);
-			auto sold = ve::select(supply_labor > 0.f, ve::min(1.f, demand_labor / supply_labor), 1.f);
+			auto participation = ve::fp_vector{ 1.f };
+			if(reservation_wage)
+				participation = ve::apply([&](dcon::province_id pid) { return labor_participation(state, pid, j); }, ids);
+			auto effective_supply = supply_labor * participation;
+
+			auto satisfaction = ve::select(demand_labor > 0.f, ve::min(1.f, effective_supply / demand_labor), 1.f);
+			auto sold = ve::select(effective_supply > 0.f, ve::min(1.f, demand_labor / effective_supply) * participation, 1.f);
 
 #ifndef NDEBUG
 			ve::apply([&](auto value) { assert(std::isfinite(value) && value >= 0.f); }, sold);
@@ -6095,6 +6190,10 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 		province::ve_for_each_land_province(state, [&](auto ids) {
 			ve::fp_vector supply = state.world.province_get_labor_supply(ids, i);
 			ve::fp_vector demand = state.world.province_get_labor_demand(ids, i);
+			if(reservation_wage) {
+				auto participation = ve::apply([&](dcon::province_id pid) { return labor_participation(state, pid, i); }, ids);
+				supply = supply * participation;
+			}
 			auto current_price = state.world.province_get_labor_price(ids, i);
 			auto old_price = current_price;
 
