@@ -746,7 +746,39 @@ There is base growth to avoid being stuck at 0
 It's modified by local availability and price
 */
 
+// LOCAL TRACE (ALICE_TRACE_WEIGHT_DECOMP): read-only grain need-weight decomposition per market.
+static bool const trace_weight_decomp = []() {
+	auto s = std::getenv("ALICE_TRACE_WEIGHT_DECOMP");
+	return s && std::atoi(s) != 0;
+}();
+static FILE* weight_decomp_file = nullptr;
+static bool weight_decomp_file_init = false;
+static int last_weight_decomp_key = -1;
+static std::string weight_probe_datebuf;
+
 void rebalance_needs_weights(sys::state& state) {
+	bool write_weight_today = false;
+	if(trace_weight_decomp) {
+		init_grain_commodity(state);
+		auto const ymd = state.current_date.to_ymd(state.start_date);
+		char datebuf[16];
+		std::snprintf(datebuf, sizeof(datebuf), "%04d-%02d-%02d", ymd.year, ymd.month, ymd.day);
+		int const key = int(ymd.year) * 10000 + int(ymd.month) * 100 + int(ymd.day);
+		if(ymd.day == 1 && key != last_weight_decomp_key) {
+			last_weight_decomp_key = key;
+			write_weight_today = true;
+			weight_probe_datebuf = datebuf;
+			if(!weight_decomp_file_init) {
+				weight_decomp_file_init = true;
+				auto const path = std::getenv("ALICE_WEIGHT_PROBE_FILE");
+				if(path) {
+					weight_decomp_file = fopen(path, "w");
+					if(weight_decomp_file)
+						fprintf(weight_decomp_file, "date,market,owner_index,price,availability,weight,base_amount,cost_reasonable,cost_life,life_count,term_avail,term_cost,term_price,term_count,dw,next_weight\n");
+				}
+			}
+		}
+	}
 	static ve::vectorizable_buffer<float, dcon::commodity_id> average_life_need = ve::vectorizable_buffer<float, dcon::commodity_id>(uint32_t(1));
 	static ve::vectorizable_buffer<float, dcon::commodity_id> average_everyday_need = ve::vectorizable_buffer<float, dcon::commodity_id>(uint32_t(1));
 	static ve::vectorizable_buffer<float, dcon::commodity_id> average_luxury_need = ve::vectorizable_buffer<float, dcon::commodity_id>(uint32_t(1));
@@ -833,6 +865,22 @@ void rebalance_needs_weights(sys::state& state) {
 			ve::fp_vector dw_life = need_weight_change<ve::fp_vector, ve::fp_vector>(local_cost_reasonable, price, available, w_life, needed_life, local_cost_life, life_count);
 			ve::fp_vector dw_everyday = need_weight_change<ve::fp_vector, ve::fp_vector>(local_cost_reasonable, price, available, w_everyday, needed_everyday, local_cost_everyday, everyday_count);
 			ve::fp_vector dw_luxury = need_weight_change<ve::fp_vector, ve::fp_vector>(local_cost_reasonable, price, available, w_luxury, needed_luxury, local_cost_luxury, luxury_count);
+
+			if(write_weight_today && c == grain_commodity && weight_decomp_file) {
+				auto const owners = state.world.state_instance_get_nation_from_state_ownership(local_zone);
+				ve::apply([&](dcon::market_id m, dcon::nation_id n, float pr, float av, float w, float base, float cr, float cl, float lc, float t1, float t2, float t3, float t4, float dwv, float nw) {
+					fprintf(weight_decomp_file, "%s,%d,%d,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g\n",
+						weight_probe_datebuf.c_str(), int(m.index()), int(n.index()), double(pr), double(av), double(w), double(base), double(cr), double(cl), double(lc),
+						double(t1), double(t2), double(t3), double(t4), double(dwv), double(nw));
+				}, market, owners, price, available, w_life, needed_life,
+					local_cost_reasonable, local_cost_life, life_count,
+					10.f * ve::max(ve::fp_vector{0.f}, 2.f * available * available - 1.f),
+					local_cost_reasonable / local_cost_life,
+					-(price * needed_life) / (local_cost_life * 10'000.f),
+					-(1.5f * life_count * needed_life * price) / local_cost_life,
+					dw_life,
+					ve::max(ve::fp_vector{0.f}, ve::min(ve::fp_vector{1.f}, w_life + dw_life * 10.f * state.defines.alice_need_drift_speed)));
+			}
 
 			w_life = ve::max(ve::fp_vector{0.f}, ve::min(ve::fp_vector{1.f}, w_life + dw_life * 10.f * state.defines.alice_need_drift_speed));
 			w_everyday = ve::max(ve::fp_vector{ 0.f }, ve::min(ve::fp_vector{ 1.f }, w_everyday + dw_everyday * 10.f * state.defines.alice_need_drift_speed));
