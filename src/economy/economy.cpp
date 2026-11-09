@@ -122,6 +122,14 @@ static FILE* grain_trace_file = nullptr;
 static bool grain_trace_file_init = false;
 static dcon::commodity_id grain_commodity{};
 static bool grain_commodity_init = false;
+static bool const trace_grain_flow = []() {
+	auto s = std::getenv("ALICE_TRACE_GRAIN_FLOW");
+	return s && std::atoi(s) != 0;
+}();
+static FILE* grain_flow_file = nullptr;
+static bool grain_flow_file_init = false;
+static std::string last_grain_flow_date;
+static std::vector<float> prev_grain_stockpile;
 
 // LOCAL EXPERIMENT (ALICE_EXP_RESERVATION_WAGE=1): labor supply participation falls when the
 // local wage is below the cost of the worker's life + everyday needs. This is a supply curve,
@@ -304,6 +312,79 @@ static void dump_grain_trace(sys::state& state, sys::year_month_day const& ymd) 
 			double(price_change));
 	});
 	fflush(grain_trace_file);
+}
+
+static void dump_grain_flow_trace(sys::state& state, sys::year_month_day const& ymd) {
+	if(!trace_grain_flow || ymd.day != 1)
+		return;
+	init_grain_commodity(state);
+	if(!grain_commodity)
+		return;
+	if(!grain_flow_file_init) {
+		grain_flow_file_init = true;
+		auto const path = std::getenv("ALICE_GRAIN_FLOW_FILE");
+		if(path) {
+			grain_flow_file = fopen(path, "w");
+			if(grain_flow_file)
+				fprintf(grain_flow_file, "date,market,owner_index,price,rgo,guild,factory,supply,stockpile,stockpile_sales,demand,consumption,exports,imports,stockpile_target_demand,factory_grain_qty,pop_demand_residual,stockpile_change,expected_buy,expected_sell,actual_buy,actual_sell\n");
+		}
+	}
+	if(!grain_flow_file)
+		return;
+	char datebuf[16];
+	std::snprintf(datebuf, sizeof(datebuf), "%04d-%02d-%02d", ymd.year, ymd.month, ymd.day);
+	if(last_grain_flow_date == datebuf)
+		return;
+	last_grain_flow_date = datebuf;
+	auto const grain = grain_commodity;
+	state.world.for_each_market([&](dcon::market_id m) {
+		auto const sid = state.world.market_get_zone_from_local_market(m);
+		if(!sid)
+			return;
+		auto const owner = state.world.state_instance_get_nation_from_state_ownership(sid);
+		auto const b = explain_output(state, grain, sid);
+		auto const price = state.world.market_get_price(m, grain);
+		auto const stockpile = state.world.market_get_stockpile(m, grain);
+		auto const demand = state.world.market_get_demand(m, grain);
+		auto const stockpile_target = owner
+			? government_stockpile_desired_commodity_amount(state, owner, grain) * stockpile_targets_demand_mult
+			: 0.f;
+		double factory_qty = 0.0;
+		province::for_each_province_in_state_instance(state, sid, [&](dcon::province_id pid) {
+			for(auto fl : state.world.province_get_factory_location(pid)) {
+				auto const fac = fl.get_factory();
+				auto const ftid = state.world.factory_get_building_type(fac);
+				auto const& inputs = state.world.factory_type_get_inputs(ftid);
+				double total_value = 0.0;
+				double grain_value = 0.0;
+				for(uint32_t j = 0; j < economy::commodity_set::set_size; ++j) {
+					auto const cid = inputs.commodity_type[j];
+					if(!cid)
+						break;
+					auto const value = double(inputs.commodity_amounts[j]) * double(state.world.market_get_price(m, cid));
+					total_value += value;
+					if(cid == grain)
+						grain_value += value;
+				}
+				if(grain_value > 0.0 && total_value > 0.0)
+					factory_qty += double(state.world.factory_get_input_cost(fac)) * grain_value / total_value / std::max(1e-12, double(price));
+			}
+		});
+		auto const pop_residual = std::max(0.f, demand - float(factory_qty) - stockpile_target);
+		auto const i = size_t(m.index());
+		if(prev_grain_stockpile.size() < size_t(state.world.market_size()))
+			prev_grain_stockpile.resize(size_t(state.world.market_size()), stockpile);
+		auto const change = stockpile - prev_grain_stockpile[i];
+		prev_grain_stockpile[i] = stockpile;
+		fprintf(grain_flow_file, "%s,%d,%d,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g\n",
+			datebuf, m.index(), owner.index(), double(price), double(b.rgo), double(b.guild), double(b.factories),
+			double(state.world.market_get_supply(m, grain)), double(stockpile), double(state.world.market_get_stockpile_sales(m, grain)),
+			double(demand), double(state.world.market_get_consumption(m, grain)), double(state.world.market_get_export(m, grain)),
+			double(state.world.market_get_import(m, grain)), double(stockpile_target), factory_qty, double(pop_residual), double(change),
+			double(state.world.market_get_expected_probability_to_buy(m, grain)), double(state.world.market_get_expected_probability_to_sell(m, grain)),
+			double(state.world.market_get_actual_probability_to_buy(m, grain)), double(state.world.market_get_actual_probability_to_sell(m, grain)));
+	});
+	fflush(grain_flow_file);
 }
 
 // LOCAL EXPERIMENT (ALICE_EXP_SELLER_PAYOUT): value-weighted producer shares per market and
@@ -4376,6 +4457,7 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 		market_flow_snap.assign(size_t(state.world.market_size()), market_flow_snapshot{});
 	dump_market_flow_trace(state, trace_ymd);
 	dump_grain_trace(state, trace_ymd);
+	dump_grain_flow_trace(state, trace_ymd);
 	dump_labor_reservation_trace(state, trace_ymd);
 
 	if(seller_payout) {
