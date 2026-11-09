@@ -7,9 +7,44 @@
 #include "economy_stats.hpp"
 #include "province_templates.hpp"
 #include "money.hpp"
+#include "price.hpp"
 
 namespace economy {
 
+// LOCAL EXPERIMENT (ALICE_EXP_ADMIN_SEGMENTED_WAGE=1): the state pays the administration's own
+// market-clearing wage (budget_per_administration / available high-education-and-accepted labour)
+// instead of using the economy-wide high-education wage. The wage is paid only to the hired
+// administrators; it does not set the market price for other high-education labour. Demand is
+// still budget / wage, so the quantity is priced, not capped. Default 0 keeps upstream behaviour.
+static bool const admin_segmented_wage = []() {
+	auto s = std::getenv("ALICE_EXP_ADMIN_SEGMENTED_WAGE");
+	return s && std::atoi(s) != 0;
+}();
+
+static std::vector<float> admin_wage_buffer;
+
+void reset_admin_wage_buffer(sys::state& state) {
+	admin_wage_buffer.assign(state.world.province_size(), 0.f);
+}
+
+static float administration_wage(sys::state const& state, dcon::province_id capital, float budget_per_administration) {
+	auto const market_wage = state.world.province_get_labor_price(capital, labor::high_education_and_accepted);
+	auto const safe_market_wage = std::isfinite(market_wage) ? market_wage : price_properties::labor::min;
+	if(!admin_segmented_wage)
+		return safe_market_wage;
+	auto const supply = state.world.province_get_labor_supply(capital, labor::high_education_and_accepted);
+	if(!std::isfinite(supply) || !(supply > 0.f) || !std::isfinite(budget_per_administration) || !(budget_per_administration > 0.f))
+		return safe_market_wage;
+	auto const clearing_wage = budget_per_administration / supply;
+	if(!std::isfinite(clearing_wage) || !(clearing_wage > 0.f))
+		return safe_market_wage;
+	return std::max(safe_market_wage, clearing_wage);
+}
+
+static bool administration_has_supply(sys::state const& state, dcon::province_id capital) {
+	auto const supply = state.world.province_get_labor_supply(capital, labor::high_education_and_accepted);
+	return std::isfinite(supply) && supply > 0.f;
+}
 
 // imperial administration generates demand on accepted high educated labor in capital market
 //
@@ -95,7 +130,9 @@ float estimate_spendings_administration_capital_after_refund(sys::state const& s
 	}
 	auto capital_state = state.world.province_get_state_membership(capital);
 	auto capital_of_capital_state = state.world.state_instance_get_capital(capital_state);
-	auto wage = state.world.province_get_labor_price(capital_of_capital_state, economy::labor::high_education_and_accepted);
+	if(admin_segmented_wage && !administration_has_supply(state, capital_of_capital_state))
+		return 0.f;
+	auto wage = administration_wage(state, capital_of_capital_state, budget);
 	auto demand = budget / wage;
 	return demand * wage * state.world.province_get_labor_demand_satisfaction(capital_of_capital_state, economy::labor::high_education_and_accepted);
 }
@@ -106,7 +143,9 @@ float estimate_spendings_administration_capital_before_refund(sys::state const& 
 	}
 	auto capital_state = state.world.province_get_state_membership(capital);
 	auto capital_of_capital_state = state.world.state_instance_get_capital(capital_state);
-	auto wage = state.world.province_get_labor_price(capital_of_capital_state, economy::labor::high_education_and_accepted);
+	if(admin_segmented_wage && !administration_has_supply(state, capital_of_capital_state))
+		return 0.f;
+	auto wage = administration_wage(state, capital_of_capital_state, budget);
 	auto demand = budget / wage;
 	return demand * wage;
 }
@@ -118,7 +157,9 @@ float estimate_spendings_administration_local_after_refund(sys::state const& sta
 	}
 	auto capital_state = state.world.province_get_state_membership(capital);
 	auto capital_of_capital_state = state.world.state_instance_get_capital(capital_state);
-	auto wage = state.world.province_get_labor_price(capital_of_capital_state, economy::labor::high_education_and_accepted);
+	if(admin_segmented_wage && !administration_has_supply(state, capital_of_capital_state))
+		return 0.f;
+	auto wage = administration_wage(state, capital_of_capital_state, budget);
 	auto demand = budget / wage;
 	return demand * wage * state.world.province_get_labor_demand_satisfaction(capital_of_capital_state, economy::labor::high_education_and_accepted);
 }
@@ -129,7 +170,9 @@ float estimate_spendings_administration_local_before_refund(sys::state const& st
 	}
 	auto capital_state = state.world.province_get_state_membership(capital);
 	auto capital_of_capital_state = state.world.state_instance_get_capital(capital_state);
-	auto wage = state.world.province_get_labor_price(capital_of_capital_state, economy::labor::high_education_and_accepted);
+	if(admin_segmented_wage && !administration_has_supply(state, capital_of_capital_state))
+		return 0.f;
+	auto wage = administration_wage(state, capital_of_capital_state, budget);
 	auto demand = budget / wage;
 	return demand * wage;
 }
@@ -190,8 +233,12 @@ void update_consumption_administration(sys::state& state, dcon::nation_id n, flo
 			auto capital_state = state.world.province_get_state_membership(capital);
 			auto capital_of_capital_state = state.world.state_instance_get_capital(capital_state);
 
-			auto wage = state.world.province_get_labor_price(capital_of_capital_state, economy::labor::high_education_and_accepted);
-			auto demand = budget_per_administration / wage;
+			auto wage = administration_wage(state, capital_of_capital_state, budget_per_administration);
+			if(capital_of_capital_state.id.index() >= admin_wage_buffer.size())
+				admin_wage_buffer.resize(state.world.province_size(), 0.f);
+			admin_wage_buffer[capital_of_capital_state.id.index()] = wage;
+			auto demand = (admin_segmented_wage && !administration_has_supply(state, capital_of_capital_state))
+				? 0.f : budget_per_administration / wage;
 			assert(std::isfinite(demand) && demand >= 0.f);
 			state.world.nation_set_administration_employment_target_in_capital(n, demand);
 			auto& cur_labor_demand = state.world.province_get_labor_demand(capital_of_capital_state, economy::labor::high_education_and_accepted);
@@ -210,8 +257,12 @@ void update_consumption_administration(sys::state& state, dcon::nation_id n, flo
 		auto capital_state = state.world.province_get_state_membership(capital);
 		auto capital_of_capital_state = state.world.state_instance_get_capital(capital_state);
 
-		auto wage = state.world.province_get_labor_price(capital_of_capital_state, economy::labor::high_education_and_accepted);
-		auto demand = budget_per_administration / wage;
+		auto wage = administration_wage(state, capital_of_capital_state, budget_per_administration);
+		if(capital_of_capital_state.id.index() >= admin_wage_buffer.size())
+			admin_wage_buffer.resize(state.world.province_size(), 0.f);
+		admin_wage_buffer[capital_of_capital_state.id.index()] = wage;
+		auto demand = (admin_segmented_wage && !administration_has_supply(state, capital_of_capital_state))
+			? 0.f : budget_per_administration / wage;
 		assert(std::isfinite(demand) && demand >= 0.f);
 		state.world.province_set_administration_employment_target(capital_of_capital_state, demand);
 		auto& cur_labor_demand = state.world.province_get_labor_demand(capital_of_capital_state, economy::labor::high_education_and_accepted);
@@ -225,7 +276,9 @@ void refund_demand_administration(sys::state& state, dcon::nation_id n) {
 		if(state.world.province_get_nation_from_province_control(capital) == n) {
 			auto capital_state = state.world.province_get_state_membership(capital);
 			auto capital_of_capital_state = state.world.state_instance_get_capital(capital_state);
-			auto wage = state.world.province_get_labor_price(capital_of_capital_state, economy::labor::high_education_and_accepted);
+			auto wage = (capital_of_capital_state.id.index() < admin_wage_buffer.size() && admin_wage_buffer[capital_of_capital_state.id.index()] > 0.f)
+				? admin_wage_buffer[capital_of_capital_state.id.index()]
+				: state.world.province_get_labor_price(capital_of_capital_state, economy::labor::high_education_and_accepted);
 			auto demand = state.world.nation_get_administration_employment_target_in_capital(n);
 			auto bought = state.world.province_get_labor_demand_satisfaction(capital_of_capital_state, economy::labor::high_education_and_accepted);
 			auto current = state.world.nation_get_treasury(n);
@@ -242,7 +295,9 @@ void refund_demand_administration(sys::state& state, dcon::nation_id n) {
 		}
 		auto capital_state = state.world.province_get_state_membership(capital);
 		auto capital_of_capital_state = state.world.state_instance_get_capital(capital_state);
-		auto wage = state.world.province_get_labor_price(capital_of_capital_state, economy::labor::high_education_and_accepted);
+		auto wage = (capital_of_capital_state.id.index() < admin_wage_buffer.size() && admin_wage_buffer[capital_of_capital_state.id.index()] > 0.f)
+			? admin_wage_buffer[capital_of_capital_state.id.index()]
+			: state.world.province_get_labor_price(capital_of_capital_state, economy::labor::high_education_and_accepted);
 		auto demand = state.world.province_get_administration_employment_target(capital_of_capital_state);
 		auto bought = state.world.province_get_labor_demand_satisfaction(capital_of_capital_state, economy::labor::high_education_and_accepted);
 		auto current = state.world.nation_get_treasury(n);

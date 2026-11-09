@@ -2669,6 +2669,7 @@ void update_yesterday_govt_stockpiles_cache(sys::state& state) {
 
 void initialize(sys::state& state) {
 	reset_foreign_settlement(state);
+	reset_admin_wage_buffer(state);
 	initialize_artisan_distribution(state);
 
 	state.world.for_each_commodity([&](dcon::commodity_id c) {
