@@ -122,6 +122,8 @@ struct profit_explanation {
 
 profit_explanation explain_last_factory_profit(sys::state const& state, dcon::factory_id f);
 float get_total_wage(const sys::state& state, dcon::factory_id f);
+float get_factory_bank_start(sys::state const& state, dcon::province_id p);
+float get_financed_wage_bill(sys::state const& state, dcon::province_id p);
 
 float factory_type_output_cost(
 	sys::state& state,

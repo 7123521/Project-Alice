@@ -24,6 +24,10 @@ static bool const direct_factory_wage = []() {
 	auto s = std::getenv("ALICE_EXP_DIRECT_FACTORY_WAGE");
 	return s && std::atoi(s) != 0;
 }();
+static bool const financed_wage = []() {
+	auto s = std::getenv("ALICE_EXP_FINANCED_WAGE");
+	return s && std::atoi(s) != 0;
+}();
 
 static std::vector<float> market_life_spending;
 static std::vector<float> market_disposable;
@@ -1943,8 +1947,12 @@ void update_income_wages(sys::state& state){
 		}
 		state.world.for_each_province([&](dcon::province_id p) {
 			double total = 0.0;
-			for(auto fl : state.world.province_get_factory_location(p)) {
-				total += double(get_total_wage(state, fl.get_factory()));
+			if(financed_wage) {
+				total = double(economy::get_financed_wage_bill(state, p));
+			} else {
+				for(auto fl : state.world.province_get_factory_location(p)) {
+					total += double(get_total_wage(state, fl.get_factory()));
+				}
 			}
 			direct_factory_wage_bill.set(p, std::isfinite(total) ? float(total) : 0.f);
 		});

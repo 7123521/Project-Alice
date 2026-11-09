@@ -10,6 +10,12 @@
 
 namespace economy {
 
+// LOCAL EXPERIMENT: previous-day factory bank balance, used by the financed wage.
+float get_factory_bank_start(sys::state const& state, dcon::province_id p);
+// LOCAL EXPERIMENT: day's financed factory wage bill per province (set by the producer block).
+float get_financed_wage_bill(sys::state const& state, dcon::province_id p);
+
+
 void initialize_needs_weights(sys::state& state, dcon::market_id n);
 
 template<typename T>

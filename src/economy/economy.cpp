@@ -59,6 +59,31 @@ static bool const seller_payout = []() {
 	auto s = std::getenv("ALICE_EXP_SELLER_PAYOUT");
 	return s && std::atoi(s) != 0;
 }();
+// LOCAL EXPERIMENT (ALICE_EXP_INVENTORY_FINANCE=1): credit producers with the value of unsold
+// output (inventory investment) from the national bank, so factor income is paid on output value
+// (realised sales + inventory change) rather than realised sales only. Default 0 = upstream.
+static bool const inventory_finance = []() {
+	auto s = std::getenv("ALICE_EXP_INVENTORY_FINANCE");
+	return s && std::atoi(s) != 0;
+}();
+// LOCAL EXPERIMENT (ALICE_EXP_FINANCED_WAGE=1): pay factory wages from the day's actual inflow
+// (realised sales + cash-limited inventory credit), so the bank can never pay out its stock.
+static bool const financed_wage = []() {
+	auto s = std::getenv("ALICE_EXP_FINANCED_WAGE");
+	return s && std::atoi(s) != 0;
+}();
+static std::vector<float> factory_bank_start;
+static std::vector<float> financed_wage_bill;
+float get_factory_bank_start(sys::state const& state, dcon::province_id p) {
+	if(size_t(p.index()) >= factory_bank_start.size())
+		return 0.f;
+	return factory_bank_start[size_t(p.index())];
+}
+float get_financed_wage_bill(sys::state const& state, dcon::province_id p) {
+	if(size_t(p.index()) >= financed_wage_bill.size())
+		return 0.f;
+	return financed_wage_bill[size_t(p.index())];
+}
 // LOCAL EXPERIMENT (ALICE_EXP_VALUE_ADDED_WAGE=1): set the labor-distribution target wage from
 // factory value added per worker (labor_share x (output - inputs) / employment) instead of the
 // life-needs cost that collapses with market prices. Default 0 = upstream.
@@ -5410,6 +5435,56 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 				}
 			}, market, sales);
 		}
+		if(inventory_finance) {
+			ve::apply([&](dcon::market_id m, float sold) {
+				if(size_t(m.index()) >= seller_share_cache.size())
+					return;
+				auto const& entry = seller_share_cache[size_t(m.index())];
+				if(!(entry.total > 0.f) || !std::isfinite(entry.total))
+					return;
+				// LOCAL EXPERIMENT: value the physical surplus at cost, not at the collapsed
+				// market price; national accounts value inventory at cost.
+				float inventory = 0.f;
+				for(uint32_t ci = 1; ci < state.world.commodity_size(); ++ci) {
+					dcon::commodity_id c{ dcon::commodity_id::value_base_t(ci) };
+					if(c == economy::money)
+						continue;
+					auto const s_avail = state.world.market_get_supply(m, c);
+					auto const d_emand = state.world.market_get_demand(m, c);
+					auto const unsold = std::max(0.f, s_avail - d_emand);
+					if(unsold > 0.f && std::isfinite(unsold))
+						inventory += unsold * state.world.commodity_get_cost(c);
+				}
+				if(!(inventory > 0.f) || !std::isfinite(inventory))
+					return;
+				auto const sid = state.world.market_get_zone_from_local_market(m);
+				auto const n = state.world.state_instance_get_nation_from_state_ownership(sid);
+				if(!n)
+					return;
+				auto const bank = state.world.nation_get_national_bank(n);
+				if(!std::isfinite(bank))
+					return;
+				// cash-limited inventory investment: the bank can only lend what it holds
+				auto const credit = std::min(inventory, std::max(0.f, bank));
+				if(!(credit > 0.f) || !std::isfinite(credit))
+					return;
+				state.world.nation_set_national_bank(n, bank - credit);
+				for(auto const& ps : entry.provinces) {
+					auto const own = ps.rgo + ps.guild + ps.factory;
+					if(!(own > 0.f) || !std::isfinite(own))
+						continue;
+					auto const amount = credit * own / entry.total;
+					if(!std::isfinite(amount))
+						continue;
+					if(ps.rgo > 0.f)
+						state.world.province_set_rgo_bank(ps.province, state.world.province_get_rgo_bank(ps.province) + amount * ps.rgo / own);
+					if(ps.guild > 0.f)
+						state.world.province_set_artisan_bank(ps.province, state.world.province_get_artisan_bank(ps.province) + amount * ps.guild / own);
+					if(ps.factory > 0.f)
+						state.world.province_set_factory_bank(ps.province, state.world.province_get_factory_bank(ps.province) + amount * ps.factory / own);
+				}
+			}, market, sales);
+		}
 
 		if(trace_market_flow) {
 			auto add_flow = [&](float market_flow_snapshot::*field, auto vec) {
@@ -6808,6 +6883,18 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 	Start with updating rgo/factory "banks"
 	*/
 
+	if(financed_wage) {
+		if(factory_bank_start.size() < size_t(state.world.province_size()))
+			factory_bank_start.assign(size_t(state.world.province_size()), 0.f);
+		static bool factory_bank_start_seeded = false;
+		if(!factory_bank_start_seeded) {
+			factory_bank_start_seeded = true;
+			state.world.for_each_province([&](dcon::province_id p) {
+				factory_bank_start[size_t(p.index())] = state.world.province_get_factory_bank(p);
+			});
+		}
+	}
+
 	province::for_each_market_province_parallel_over_market(state, [&](dcon::market_id mid, dcon::state_instance_id sid, dcon::province_id pid){
 		{
 			auto total_factory_profit = 0.f;
@@ -6829,6 +6916,13 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 				state.world.province_set_factory_bank(pid, current_bank - total_input_cost - total_wage_bill);
 			} else {
 				state.world.province_set_factory_bank(pid, current_bank + total_factory_profit);
+			}
+			if(financed_wage) {
+				if(financed_wage_bill.size() < size_t(state.world.province_size()))
+					financed_wage_bill.assign(size_t(state.world.province_size()), 0.f);
+				financed_wage_bill[size_t(pid.index())] = total_wage_bill;
+				if(size_t(pid.index()) < factory_bank_start.size())
+					factory_bank_start[size_t(pid.index())] = state.world.province_get_factory_bank(pid);
 			}
 		}
 

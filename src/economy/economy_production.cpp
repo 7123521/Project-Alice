@@ -40,6 +40,10 @@ static float const direct_factory_wage_share = []() {
 	auto s = std::getenv("ALICE_VALUE_ADDED_LABOR_SHARE");
 	return s ? std::max(0.f, std::min(1.f, float(std::atof(s)))) : 0.5f;
 }();
+static bool const financed_wage = []() {
+	auto s = std::getenv("ALICE_EXP_FINANCED_WAGE");
+	return s && std::atoi(s) != 0;
+}();
 
 // LOCAL EXPERIMENT (ALICE_EXP_RGO_HARVEST_UTILIZATION=1): part of the RGO harvest is seed,
 // feed, on-farm consumption and field loss; only the remainder is marketed. The fraction is
@@ -1124,13 +1128,26 @@ float factory_throughput_additional_multiplier(sys::state const& state, dcon::fa
 float get_total_wage(const sys::state& state, dcon::factory_id f) {
 	if(direct_factory_wage) {
 		auto location = state.world.factory_get_province_from_factory_location(f);
+		if(financed_wage) {
+			auto const bank = state.world.province_get_factory_bank(location);
+			auto const start = economy::get_factory_bank_start(state, location);
+			auto const inflow = std::max(0.f, bank - start);
+			int32_t n = 0;
+			for(auto fl : state.world.province_get_factory_location(location))
+				++n;
+			auto const per_factory = inflow / float(std::max(1, n));
+			auto const value_added = std::max(0.f, per_factory - state.world.factory_get_input_cost(f));
+			auto const wage = direct_factory_wage_share * value_added;
+			return std::isfinite(wage) ? wage : 0.f;
+		}
 		auto zone = state.world.province_get_state_membership(location);
 		auto market = state.world.state_instance_get_market_from_local_market(zone);
 		auto ftid = state.world.factory_get_building_type(f);
 		auto output_commodity = state.world.factory_type_get_output(ftid);
+		// LOCAL EXPERIMENT: value added is measured on output, not only on realised sales;
+		// the unsold part is financed as inventory by ALICE_EXP_INVENTORY_FINANCE.
 		auto const output_value = state.world.factory_get_output(f)
-			* state.world.market_get_price(market, output_commodity)
-			* state.world.market_get_actual_probability_to_sell(market, output_commodity);
+			* state.world.market_get_price(market, output_commodity);
 		auto const value_added = std::max(0.f, output_value - state.world.factory_get_input_cost(f));
 		auto const wage = direct_factory_wage_share * value_added;
 		return std::isfinite(wage) ? wage : 0.f;
