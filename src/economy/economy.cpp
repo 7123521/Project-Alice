@@ -755,6 +755,10 @@ static bool const weight_fix = []() {
 	auto s = std::getenv("ALICE_EXP_WEIGHT_FIX");
 	return s && std::atoi(s) != 0;
 }();
+static bool const weight_normalize = []() {
+	auto s = std::getenv("ALICE_EXP_WEIGHT_NORMALIZE");
+	return s && std::atoi(s) != 0;
+}();
 static FILE* weight_decomp_file = nullptr;
 static bool weight_decomp_file_init = false;
 static int last_weight_decomp_key = -1;
@@ -854,6 +858,17 @@ void rebalance_needs_weights(sys::state& state) {
 
 		local_cost_reasonable = ve::min(local_base_wage * 20.f, local_cost_reasonable);
 
+		auto old_total_life = ve::fp_vector{ 0.f };
+		auto old_total_everyday = ve::fp_vector{ 0.f };
+		auto old_total_luxury = ve::fp_vector{ 0.f };
+		if(weight_normalize) {
+			state.world.for_each_commodity([&](dcon::commodity_id c) {
+				old_total_life = old_total_life + state.world.market_get_life_needs_weights(market, c) * average_life_need.get(c);
+				old_total_everyday = old_total_everyday + state.world.market_get_everyday_needs_weights(market, c) * average_everyday_need.get(c);
+				old_total_luxury = old_total_luxury + state.world.market_get_luxury_needs_weights(market, c) * average_luxury_need.get(c);
+			});
+		}
+
 		state.world.for_each_commodity([&](dcon::commodity_id c) {
 			auto price = state.world.market_get_price(market, c);
 			auto available = state.world.market_get_expected_probability_to_buy(market, c);
@@ -916,6 +931,25 @@ void rebalance_needs_weights(sys::state& state) {
 			state.world.market_set_everyday_needs_weights(market, c, w_everyday);
 			state.world.market_set_luxury_needs_weights(market, c, w_luxury);
 		});
+
+		if(weight_normalize) {
+			auto new_total_life = ve::fp_vector{ 0.f };
+			auto new_total_everyday = ve::fp_vector{ 0.f };
+			auto new_total_luxury = ve::fp_vector{ 0.f };
+			state.world.for_each_commodity([&](dcon::commodity_id c) {
+				new_total_life = new_total_life + state.world.market_get_life_needs_weights(market, c) * average_life_need.get(c);
+				new_total_everyday = new_total_everyday + state.world.market_get_everyday_needs_weights(market, c) * average_everyday_need.get(c);
+				new_total_luxury = new_total_luxury + state.world.market_get_luxury_needs_weights(market, c) * average_luxury_need.get(c);
+			});
+			ve::fp_vector life_scale = ve::select(new_total_life > old_total_life && new_total_life > 0.f, old_total_life / new_total_life, ve::fp_vector{ 1.f });
+			ve::fp_vector everyday_scale = ve::select(new_total_everyday > old_total_everyday && new_total_everyday > 0.f, old_total_everyday / new_total_everyday, ve::fp_vector{ 1.f });
+			ve::fp_vector luxury_scale = ve::select(new_total_luxury > old_total_luxury && new_total_luxury > 0.f, old_total_luxury / new_total_luxury, ve::fp_vector{ 1.f });
+			state.world.for_each_commodity([&](dcon::commodity_id c) {
+				state.world.market_set_life_needs_weights(market, c, ve::min(ve::fp_vector{ 1.f }, state.world.market_get_life_needs_weights(market, c) * life_scale));
+				state.world.market_set_everyday_needs_weights(market, c, ve::min(ve::fp_vector{ 1.f }, state.world.market_get_everyday_needs_weights(market, c) * everyday_scale));
+				state.world.market_set_luxury_needs_weights(market, c, ve::min(ve::fp_vector{ 1.f }, state.world.market_get_luxury_needs_weights(market, c) * luxury_scale));
+			});
+		}
 	});
 }
 
