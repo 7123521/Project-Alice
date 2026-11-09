@@ -28,6 +28,13 @@ static bool const financed_wage = []() {
 	auto s = std::getenv("ALICE_EXP_FINANCED_WAGE");
 	return s && std::atoi(s) != 0;
 }();
+// LOCAL EXPERIMENT (ALICE_EXP_PROFIT_TO_HOUSEHOLDS=1): include the whole provincial population
+// in the rent/rgo/factory token pools, so producer profits/rents reach households, not only
+// capitalists/aristocrats. Default 0 keeps upstream.
+static bool const profit_to_households = []() {
+	auto s = std::getenv("ALICE_EXP_PROFIT_TO_HOUSEHOLDS");
+	return s && std::atoi(s) != 0;
+}();
 
 static std::vector<float> market_life_spending;
 static std::vector<float> market_disposable;
@@ -1368,7 +1375,7 @@ void update_income_non_labor(sys::state& state) {
 		
 		{
 			auto current = market_rent_tokens.get(mid);
-			market_rent_tokens.set(mid, current + aristo + capis);
+			market_rent_tokens.set(mid, current + aristo + capis + (profit_to_households ? total_pop : ve::fp_vector{ 0.f }));
 		}
 
 		{
@@ -1380,12 +1387,12 @@ void update_income_non_labor(sys::state& state) {
 			auto capis_share = state.world.province_get_capitalists_share(pid);
 			auto aristo_share = state.world.province_get_landowners_share(pid);
 			auto current = market_rgo_tokens.get(mid);
-			market_rgo_tokens.set(mid, current + capis * capis_share + aristo * aristo_share + rgo_workers * (1.f - capis_share - aristo_share));
+			market_rgo_tokens.set(mid, current + capis * capis_share + aristo * aristo_share + rgo_workers * (1.f - capis_share - aristo_share) + (profit_to_households ? total_pop : ve::fp_vector{ 0.f }));
 		}
 
 		{
 			auto current = market_factory_tokens.get(mid);
-			market_factory_tokens.set(mid, current + capis);
+			market_factory_tokens.set(mid, current + capis + (profit_to_households ? total_pop : ve::fp_vector{ 0.f }));
 		}
 
 		// MONEY
@@ -1474,7 +1481,7 @@ void update_income_non_labor(sys::state& state) {
 		{
 			auto candidates = ve::select(valid_market, market_rent_tokens.get(market), 0.f);
 			auto total_money = ve::select(valid_market, market_rent_money.get(market), 0.f);
-			auto income = ve::select((pop_type == aristo_def || pop_type == capis_def) && candidates > min_registered_token_size, total_money / candidates * size, 0.f);
+			auto income = ve::select((profit_to_households || pop_type == aristo_def || pop_type == capis_def) && candidates > min_registered_token_size, total_money / candidates * size, 0.f);
 #ifndef NDEBUG
 			ve::apply([](float v) { assert(std::isfinite(v) && v >= 0); }, income);
 			from_rent = income * expected_share;
@@ -1508,10 +1515,10 @@ void update_income_non_labor(sys::state& state) {
 		{
 			auto candidates = ve::select(valid_market, market_rgo_tokens.get(market), 0.f);
 			auto total_money = ve::select(valid_market, market_rgo_money.get(market), 0.f);
-			auto weight =
+			auto weight = ve::select(profit_to_households, ve::fp_vector{ 1.f },
 				ve::select(pop_type == capis_def, capis_share, 0.f)
 				+ ve::select(pop_type == aristo_def, aristo_share, 0.f)
-				+ ve::select(state.world.pop_type_get_is_paid_rgo_worker(pop_type), 1.f - capis_share - aristo_share, 0.f);
+				+ ve::select(state.world.pop_type_get_is_paid_rgo_worker(pop_type), 1.f - capis_share - aristo_share, 0.f));
 			auto income = ve::select(candidates > min_registered_token_size, total_money / candidates * size * weight, 0.f);
 #ifndef NDEBUG
 			ve::apply([](float v) { assert(std::isfinite(v) && v >= 0); }, income);
@@ -1524,7 +1531,7 @@ void update_income_non_labor(sys::state& state) {
 		{
 			auto candidates = ve::select(valid_market, market_factory_tokens.get(market), 0.f);
 			auto total_money = ve::select(valid_market, market_factory_money.get(market), 0.f);
-			auto income = ve::select((pop_type == capis_def) && candidates > min_registered_token_size && size > 0.f, total_money / candidates * size, 0.f);
+			auto income = ve::select((profit_to_households || pop_type == capis_def) && candidates > min_registered_token_size && size > 0.f, total_money / candidates * size, 0.f);
 #ifndef NDEBUG
 			ve::apply([](float v) { assert(std::isfinite(v) && v >= 0); }, income);
 			from_factories = income * expected_share;
