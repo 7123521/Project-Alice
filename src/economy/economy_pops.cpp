@@ -22,6 +22,8 @@ static std::vector<float> market_life_spending;
 static std::vector<float> market_disposable;
 static std::vector<float> pop_income_before;
 static std::vector<float> market_income_flow;
+static std::vector<float> market_poptype_income_flow;
+static int market_poptype_stride = 0;
 static bool const les_actual_budget = []() {
 	auto s = std::getenv("ALICE_EXP_DEMAND_LES_ACTUAL");
 	return s && std::atoi(s) != 0;
@@ -47,15 +49,29 @@ void snapshot_income_start(sys::state& state) {
 
 void finalize_income_flow(sys::state& state) {
 	market_income_flow.assign(state.world.market_size(), 0.f);
+	market_poptype_stride = int(state.world.pop_type_size());
+	market_poptype_income_flow.assign(size_t(state.world.market_size()) * size_t(market_poptype_stride), 0.f);
 	state.world.for_each_pop([&](dcon::pop_id p) {
 		auto const before = p.index() < pop_income_before.size() ? pop_income_before[p.index()] : 0.f;
 		auto const flow = std::max(0.f, state.world.pop_get_savings(p) - before);
 		auto const prov = state.world.pop_get_province_from_pop_location(p);
 		auto const sid = state.world.province_get_state_membership(prov);
 		auto const mid = state.world.state_instance_get_market_from_local_market(sid);
-		if(mid.index() < market_income_flow.size())
+		auto const pt = state.world.pop_get_poptype(p);
+		if(mid.index() < market_income_flow.size()) {
 			market_income_flow[mid.index()] += flow;
+			auto const idx = size_t(mid.index()) * size_t(state.world.pop_type_size()) + size_t(pt.id.index());
+			if(idx < market_poptype_income_flow.size())
+				market_poptype_income_flow[idx] += flow;
+		}
 	});
+}
+
+float market_poptype_income(dcon::market_id m, dcon::pop_type_id pt) {
+	if(market_poptype_stride <= 0)
+		return 0.f;
+	auto const idx = size_t(m.index()) * size_t(market_poptype_stride) + size_t(pt.index());
+	return idx < market_poptype_income_flow.size() ? market_poptype_income_flow[idx] : 0.f;
 }
 
 float market_daily_income(dcon::market_id m) {

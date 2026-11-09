@@ -59,6 +59,7 @@ float market_disposable_income(dcon::market_id m);
 void snapshot_income_start(sys::state& state);
 void finalize_income_flow(sys::state& state);
 float market_daily_income(dcon::market_id m);
+float market_poptype_income(dcon::market_id m, dcon::pop_type_id pt);
 money_from_nation estimate_income_from_nation(sys::state const& state, dcon::pop_id pop);
 float estimate_trade_spending(sys::state const& state, dcon::pop_id pop);
 float estimate_tax_spending(sys::state const& state, dcon::pop_id pop, float tax_rate);

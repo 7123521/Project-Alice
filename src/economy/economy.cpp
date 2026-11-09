@@ -787,6 +787,22 @@ static bool const demand_les_flow = []() {
 	auto s = std::getenv("ALICE_EXP_DEMAND_LES_FLOW");
 	return s && std::atoi(s) != 0;
 }();
+static bool const demand_les_strata = []() {
+	auto s = std::getenv("ALICE_EXP_DEMAND_LES_STRATA");
+	return s && std::atoi(s) != 0;
+}();
+static float const life_share_poor = []() {
+	auto s = std::getenv("ALICE_LIFE_SHARE_POOR");
+	return s ? std::clamp(float(std::atof(s)), 0.01f, 1.f) : 0.70f;
+}();
+static float const life_share_middle = []() {
+	auto s = std::getenv("ALICE_LIFE_SHARE_MIDDLE");
+	return s ? std::clamp(float(std::atof(s)), 0.01f, 1.f) : 0.45f;
+}();
+static float const life_share_rich = []() {
+	auto s = std::getenv("ALICE_LIFE_SHARE_RICH");
+	return s ? std::clamp(float(std::atof(s)), 0.01f, 1.f) : 0.20f;
+}();
 static float const demand_life_share = []() {
 	auto s = std::getenv("ALICE_DEMAND_LIFE_SHARE");
 	return s ? std::clamp(float(std::atof(s)), 0.01f, 1.f) : 0.5f;
@@ -1119,13 +1135,22 @@ void rebalance_needs_weights(sys::state& state) {
 			});
 			if(!(sum_gamma > 0.0) || !(subs > 0.0) || !std::isfinite(subs))
 				return;
-			double const budget = demand_les_flow
-				? double(demand_life_share) * double(economy::pops::market_daily_income(m))
-				: (demand_les_income
-					? double(demand_life_share) * double(economy::pops::market_disposable_income(m))
-					: (demand_les_actual
-						? double(economy::pops::market_life_needs_spending(m))
-						: double(demand_les_budget) * subs));
+			double budget = 0.0;
+			if(demand_les_strata) {
+				state.world.for_each_pop_type([&](dcon::pop_type_id pt) {
+					auto const strata = state.world.pop_type_get_strata(pt);
+					auto const share = strata == 0 ? double(life_share_poor) : (strata == 1 ? double(life_share_middle) : double(life_share_rich));
+					budget += share * double(economy::pops::market_poptype_income(m, pt));
+				});
+			} else if(demand_les_flow) {
+				budget = double(demand_life_share) * double(economy::pops::market_daily_income(m));
+			} else if(demand_les_income) {
+				budget = double(demand_life_share) * double(economy::pops::market_disposable_income(m));
+			} else if(demand_les_actual) {
+				budget = double(economy::pops::market_life_needs_spending(m));
+			} else {
+				budget = double(demand_les_budget) * subs;
+			}
 			double sum_pq = 0.0;
 			double grain_weight = 0.0;
 			double grain_q = 0.0;
