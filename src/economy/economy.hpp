@@ -100,6 +100,7 @@ dcon::unilateral_relationship_id nation_gives_free_trade_rights(sys::state& stat
 dcon::unilateral_relationship_id nation_gives_direct_free_trade_rights(sys::state& state, dcon::nation_id source, dcon::nation_id target);
 
 void initialize(sys::state& state);
+float total_foreign_settlement();
 void regenerate_unsaved_values(sys::state& state);
 
 float pop_min_wage_factor(sys::state& state, dcon::nation_id n);

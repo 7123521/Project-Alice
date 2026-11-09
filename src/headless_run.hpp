@@ -312,7 +312,7 @@ inline void dump_month(sys::state& state, FILE* nations_csv, FILE* prices_csv, F
 				bad("labor_demand_nan_slots", double(labor_dem_nan));
 		}
 		fprintf(summary_csv,
-			"%s,%.6g,%.4g,%.4g,%.4g,%.4g,%.6g,%.6g,%.4g,%.6g,%.6g,%.6g,%.6g,%.4g,%.6g,%d,%d,%d,%.6g,%.6g,%.6g,%.6g,%.0f,%.0f,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g\n",
+			"%s,%.6g,%.4g,%.4g,%.4g,%.4g,%.6g,%.6g,%.4g,%.6g,%.6g,%.6g,%.6g,%.4g,%.6g,%d,%d,%d,%.6g,%.6g,%.6g,%.6g,%.0f,%.0f,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g\n",
 			date.c_str(), pop_total, pop_total > 0 ? sat_weighted / pop_total : 0.0,
 			pop_sum[0] > 0 ? sat_sum[0] / pop_sum[0] : 0.0,
 			pop_sum[1] > 0 ? sat_sum[1] / pop_sum[1] : 0.0,
@@ -320,7 +320,7 @@ inline void dump_month(sys::state& state, FILE* nations_csv, FILE* prices_csv, F
 			double(factories), double(capacity), capacity > 0 ? double(factories) / capacity : 0.0, builds,
 			gdp_real, supply_total, demand_total, coverage / std::max(1, markets),
 			market_money, markets, routes, sea_routes, treasury, private_inv, army_dem, gov_dem,
-			builds_clothes, builds_fabric, pop_savings_total, pop_investments, pop_dividends, rgo_bank, factory_bank, rent_bank, government_bank, loan_total, subsidy_spend, trade_volume, naval_price_n > 0 ? naval_price / naval_price_n : 0.0, naval_price_n, naval_demand, land_demand, rgo_emp, fac_emp, labor_sup, labor_dem, fac_budget, fac_output_value, fac_input_cost, fac_wage, trade_house_debt_value, net_money);
+			builds_clothes, builds_fabric, pop_savings_total, pop_investments, pop_dividends, rgo_bank, factory_bank, rent_bank, government_bank, loan_total, subsidy_spend, trade_volume, naval_price_n > 0 ? naval_price / naval_price_n : 0.0, naval_price_n, naval_demand, land_demand, rgo_emp, fac_emp, labor_sup, labor_dem, fac_budget, fac_output_value, fac_input_cost, fac_wage, trade_house_debt_value, net_money, double(economy::total_foreign_settlement()));
 	}
 	// total merchant fleet: transport capacity is what lets goods leave the market that produced them
 	{
@@ -897,7 +897,7 @@ inline void run(sys::state& state, int years, std::string const& dump_dir) {
 			fprintf(summary_csv,
 				"date,population,satisfaction,sat_poor,sat_middle,sat_rich,factories,capacity,fill_ratio,builds,"
 				"gdp_real,supply_total,demand_total,coverage,market_money,markets,routes,sea_routes,"
-				"treasury,private_investment,army_demand,gov_construction_demand,builds_clothes,builds_fabric,pop_savings,market_pop_investments,market_pop_dividends,rgo_bank,factory_bank,rent_bank,government_bank,total_loans,subsidy_spending,trade_volume,naval_transport_price,land_transport_price,naval_transport_demand,land_transport_demand,rgo_employment,factory_employment,labor_supply,labor_demand,factory_hiring_budget,factory_output_value,factory_input_cost,factory_wage_bill,trade_house_debt,net_money\n");
+				"treasury,private_investment,army_demand,gov_construction_demand,builds_clothes,builds_fabric,pop_savings,market_pop_investments,market_pop_dividends,rgo_bank,factory_bank,rent_bank,government_bank,total_loans,subsidy_spending,trade_volume,naval_transport_price,land_transport_price,naval_transport_demand,land_transport_demand,rgo_employment,factory_employment,labor_supply,labor_demand,factory_hiring_budget,factory_output_value,factory_input_cost,factory_wage_bill,trade_house_debt,net_money,foreign_settlement\n");
 		if(welfare_csv)
 			fprintf(welfare_csv, "date,pop_type,population,mean_satisfaction,savings_per_capita,basket_cost_per_capita,spent_per_capita,mean_is_rich,life_sat,everyday_sat,luxury_sat\n");
 		if(provinces_csv)

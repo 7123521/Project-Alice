@@ -33,6 +33,27 @@
 
 namespace economy {
 
+// LOCAL EXPERIMENT (ALICE_EXP_CLOSED_SETTLEMENT=1): close the market settlement account.
+// The market money delta (earn - spend + refund) is split into a domestic part and a trade part.
+// The domestic part is offset against the national bank; the trade part against a foreign
+// settlement account. Per market: delta_market + delta_bank + delta_foreign = 0.
+static bool const closed_settlement = []() {
+	auto s = std::getenv("ALICE_EXP_CLOSED_SETTLEMENT");
+	return s && std::atoi(s) != 0;
+}();
+static std::vector<float> foreign_settlement;
+
+void reset_foreign_settlement(sys::state& state) {
+	foreign_settlement.assign(state.world.nation_size(), 0.f);
+}
+
+float total_foreign_settlement() {
+	float total = 0.f;
+	for(float v : foreign_settlement)
+		total += v;
+	return total;
+}
+
 dcon::province_id construction_get_location(const sys::state& state, dcon::province_land_construction_id con) {
 		return state.world.pop_get_province_from_pop_location( state.world.province_land_construction_get_pop(con));
 }
@@ -1154,6 +1175,7 @@ void update_yesterday_govt_stockpiles_cache(sys::state& state) {
 
 
 void initialize(sys::state& state) {
+	reset_foreign_settlement(state);
 	initialize_artisan_distribution(state);
 
 	state.world.for_each_commodity([&](dcon::commodity_id c) {
@@ -4238,6 +4260,38 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 			state.world.market_set_port_services_demand(market, old_port_demand + demanded_port_services);
 		}
 	});
+
+	if(closed_settlement) {
+		state.world.for_each_market([&](dcon::market_id m) {
+			auto const sid = state.world.market_get_zone_from_local_market(m);
+			auto const n = state.world.state_instance_get_nation_from_state_ownership(sid);
+			if(!n)
+				return;
+			auto const earn = state.world.market_get_total_earn(m);
+			auto const spend = state.world.market_get_total_paid(m);
+			auto const export_gains = state.world.market_get_export_cut(m);
+			auto const import_spent = state.world.market_get_import_spending(m);
+			auto const refund = state.world.market_get_shipbuilding_refund(m);
+			if(!std::isfinite(earn) || !std::isfinite(spend) || !std::isfinite(export_gains)
+				|| !std::isfinite(import_spent) || !std::isfinite(refund))
+				return;
+			auto const trade_net = export_gains - import_spent;
+			auto const market_delta = earn - spend + refund;
+			auto const domestic_net = market_delta - trade_net;
+			auto const bank = state.world.nation_get_national_bank(n);
+			if(!std::isfinite(trade_net) || !std::isfinite(domestic_net) || !std::isfinite(bank))
+				return;
+			auto const new_bank = bank - domestic_net;
+			if(!std::isfinite(new_bank) || std::abs(new_bank) > 1e15f || std::abs(domestic_net) > 1e15f)
+				return;
+			state.world.nation_set_national_bank(n, new_bank);
+			if(foreign_settlement.size() <= size_t(n.index()))
+				foreign_settlement.resize(size_t(n.index()) + 1, 0.f);
+			auto const new_foreign = foreign_settlement[n.index()] - trade_net;
+			if(std::isfinite(new_foreign))
+				foreign_settlement[n.index()] = new_foreign;
+		});
+	}
 
 	set_profile_point(state, "trade_centers_consumption");
 
