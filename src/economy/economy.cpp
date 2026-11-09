@@ -33,6 +33,14 @@
 
 namespace economy {
 
+// LOCAL EXPERIMENT (ALICE_EXP_MARKET_CASH=1): record the cost of goods sold as market purchases.
+// Upstream never writes market purchases, so sales revenue accumulates in the market money pool.
+// This is the first cash-in-advance step: a sale is matched by a purchase of equal value.
+static bool const market_cash = []() {
+	auto s = std::getenv("ALICE_EXP_MARKET_CASH");
+	return s && std::atoi(s) != 0;
+}();
+
 // LOCAL EXPERIMENT (ALICE_EXP_CLOSED_SETTLEMENT=1): close the market settlement account.
 // The market money delta (earn - spend + refund) is split into a domestic part and a trade part.
 // The domestic part is offset against the national bank; the trade part against a foreign
@@ -4088,6 +4096,7 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 		auto sales = state.world.market_get_sales(market);
 		state.world.market_set_sales(market, 0.f);
 		auto purchases = state.world.market_get_purchases(market);
+		state.world.market_set_purchases(market, 0.f);
 		auto export_gains = state.world.market_get_export_cut(market);
 		auto import_spent = state.world.market_get_import_spending(market);
 
@@ -4462,7 +4471,12 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 			//}
 
 			auto sales = state.world.market_get_sales(ids);
-			state.world.market_set_sales(ids, sales + merchants_supply * new_actual_probability_to_sell * ve_price(state, ids, c));
+			auto const sold_value = merchants_supply * new_actual_probability_to_sell * ve_price(state, ids, c);
+			state.world.market_set_sales(ids, sales + sold_value);
+			if(market_cash) {
+				auto const purchases_now = state.world.market_get_purchases(ids);
+				state.world.market_set_purchases(ids, purchases_now + sold_value);
+			}
 
 #ifndef NDEBUG
 			ve::apply([&](auto value) { assert(std::isfinite(value)); }, state.world.market_get_stockpile(ids, c));
