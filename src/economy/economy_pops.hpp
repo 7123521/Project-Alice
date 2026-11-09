@@ -54,6 +54,7 @@ std::vector<labor_ratio_wage> estimate_wage(sys::state const& state, dcon::pop_i
 float estimate_slave_income(sys::state const& state, dcon::pop_id pop);
 float estimate_trade_income(sys::state const& state, dcon::pop_id pop);
 float estimate_artisan_income(sys::state const& state, dcon::pop_id pop);
+float market_life_needs_spending(dcon::market_id m);
 money_from_nation estimate_income_from_nation(sys::state const& state, dcon::pop_id pop);
 float estimate_trade_spending(sys::state const& state, dcon::pop_id pop);
 float estimate_tax_spending(sys::state const& state, dcon::pop_id pop, float tax_rate);

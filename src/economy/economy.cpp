@@ -775,6 +775,10 @@ static bool const demand_les = []() {
 	auto s = std::getenv("ALICE_EXP_DEMAND_LES");
 	return s && std::atoi(s) != 0;
 }();
+static bool const demand_les_actual = []() {
+	auto s = std::getenv("ALICE_EXP_DEMAND_LES_ACTUAL");
+	return s && std::atoi(s) != 0;
+}();
 static float const demand_les_budget = []() {
 	auto s = std::getenv("ALICE_DEMAND_LES_BUDGET");
 	return s ? std::clamp(float(std::atof(s)), 0.05f, 5.f) : 0.5f;
@@ -1103,7 +1107,9 @@ void rebalance_needs_weights(sys::state& state) {
 			});
 			if(!(sum_gamma > 0.0) || !(subs > 0.0) || !std::isfinite(subs))
 				return;
-			double const budget = double(demand_les_budget) * subs;
+			double const budget = demand_les_actual
+				? double(economy::pops::market_life_needs_spending(m))
+				: double(demand_les_budget) * subs;
 			double sum_pq = 0.0;
 			double grain_weight = 0.0;
 			double grain_q = 0.0;

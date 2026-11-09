@@ -18,6 +18,16 @@
 namespace economy {
 namespace pops {
 
+static std::vector<float> market_life_spending;
+static bool const les_actual_budget = []() {
+	auto s = std::getenv("ALICE_EXP_DEMAND_LES_ACTUAL");
+	return s && std::atoi(s) != 0;
+}();
+
+float market_life_needs_spending(dcon::market_id m) {
+	return m.index() < market_life_spending.size() ? market_life_spending[m.index()] : 0.f;
+}
+
 // LOCAL TRACE (ALICE_TRACE_DEMAND_DECOMP): read-only grain demand decomposition by market and
 // pop type on a single probe date. No economic effect.
 static bool const demand_decomp_trace = []() {
@@ -598,6 +608,9 @@ void update_consumption(
 
 	auto to_bank = state.world.pop_make_vectorizable_float_buffer();
 	auto to_investments = state.world.pop_make_vectorizable_float_buffer();
+	auto pop_life_spending = state.world.pop_make_vectorizable_float_buffer();
+	if(les_actual_budget)
+		market_life_spending.assign(state.world.market_size(), 0.f);
 
 	state.world.execute_parallel_over_pop([&](auto ids) {
 		auto pop_size = state.world.pop_get_size(ids);
@@ -635,6 +648,7 @@ void update_consumption(
 
 		to_bank.set(ids, data.bank_savings.spent);
 		to_investments.set(ids, data.investments.spent);
+		pop_life_spending.set(ids, data.life_needs.spent);
 
 		state.world.for_each_consumption_category([&](auto cat) {
 			auto scale = data.per_consumption_category[cat.index()].demand_scale;
@@ -656,6 +670,19 @@ void update_consumption(
 		// which leads to some part of wealth not being spent most of the time
 		state.world.pop_set_savings(ids, ve::max(0.f, data.remaining_savings));
 	});
+
+	if(les_actual_budget) {
+		state.world.execute_serial_over_pop([&](auto p) {
+			auto provs = state.world.pop_get_province_from_pop_location(p);
+			auto sids = state.world.province_get_state_membership(provs);
+			auto mids = state.world.state_instance_get_market_from_local_market(sids);
+			auto amounts = pop_life_spending.get(p);
+			ve::apply([&](dcon::market_id m, float v) {
+				if(m.index() < market_life_spending.size())
+					market_life_spending[m.index()] += v;
+			}, mids, amounts);
+		});
+	}
 
 	// services are at province level:
 
