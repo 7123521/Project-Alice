@@ -771,6 +771,21 @@ static bool const trace_demand_share = []() {
 	auto s = std::getenv("ALICE_TRACE_DEMAND_SHARE");
 	return s && std::atoi(s) != 0;
 }();
+static bool const demand_les = []() {
+	auto s = std::getenv("ALICE_EXP_DEMAND_LES");
+	return s && std::atoi(s) != 0;
+}();
+static float const demand_les_budget = []() {
+	auto s = std::getenv("ALICE_DEMAND_LES_BUDGET");
+	return s ? std::clamp(float(std::atof(s)), 0.05f, 5.f) : 0.5f;
+}();
+static bool const trace_demand_les = []() {
+	auto s = std::getenv("ALICE_TRACE_DEMAND_LES");
+	return s && std::atoi(s) != 0;
+}();
+static FILE* demand_les_file = nullptr;
+static bool demand_les_file_init = false;
+static int last_demand_les_key = -1;
 static FILE* demand_share_file = nullptr;
 static bool demand_share_file_init = false;
 static int last_demand_share_key = -1;
@@ -1038,6 +1053,94 @@ void rebalance_needs_weights(sys::state& state) {
 		});
 		if(write_share_today && demand_share_file)
 			fflush(demand_share_file);
+	}
+
+	if(demand_les) {
+		bool write_les_today = false;
+		if(trace_demand_les) {
+			auto const ymd = state.current_date.to_ymd(state.start_date);
+			int const key = int(ymd.year) * 10000 + int(ymd.month) * 100 + int(ymd.day);
+			if(ymd.day == 1 && key != last_demand_les_key) {
+				last_demand_les_key = key;
+				write_les_today = true;
+				if(!demand_les_file_init) {
+					demand_les_file_init = true;
+					auto const path = std::getenv("ALICE_DEMAND_LES_FILE");
+					if(path) {
+						demand_les_file = fopen(path, "w");
+						if(demand_les_file)
+							fprintf(demand_les_file, "date,market,owner_index,budget,subsistence,sum_pq,grain_weight,grain_q,min_q\n");
+					}
+				}
+			}
+		}
+		state.world.for_each_market([&](dcon::market_id m) {
+			auto const zone = state.world.market_get_zone_from_local_market(m);
+			auto const nation = state.world.state_instance_get_nation_from_state_ownership(zone);
+			auto const poor_mul = state.world.nation_get_modifier_values(nation, sys::national_mod_offsets::poor_life_needs) + 1.f;
+			auto const mid_mul = state.world.nation_get_modifier_values(nation, sys::national_mod_offsets::middle_life_needs) + 1.f;
+			auto const rich_mul = state.world.nation_get_modifier_values(nation, sys::national_mod_offsets::rich_life_needs) + 1.f;
+			double K = 0.0;
+			state.world.for_each_pop_type([&](dcon::pop_type_id pt) {
+				auto const scale = double(state.world.market_get_life_needs_scale(m, pt));
+				auto const strata = state.world.pop_type_get_strata(pt);
+				auto const mul = strata == 0 ? double(poor_mul) : (strata == 1 ? double(mid_mul) : double(rich_mul));
+				K += scale * mul * double(state.defines.alice_lf_needs_scale);
+			});
+			if(!(K > 0.0) || !std::isfinite(K))
+				return;
+			double sum_gamma = 0.0;
+			double subs = 0.0;
+			state.world.for_each_commodity([&](dcon::commodity_id c) {
+				if(c == economy::money)
+					return;
+				auto const gamma = double(average_life_need.get(c));
+				if(gamma <= 0.0)
+					return;
+				auto const p = double(state.world.market_get_price(m, c)) + 0.000000001;
+				sum_gamma += gamma;
+				subs += K * p * gamma;
+			});
+			if(!(sum_gamma > 0.0) || !(subs > 0.0) || !std::isfinite(subs))
+				return;
+			double const budget = double(demand_les_budget) * subs;
+			double sum_pq = 0.0;
+			double grain_weight = 0.0;
+			double grain_q = 0.0;
+			double min_q = 1e30;
+			state.world.for_each_commodity([&](dcon::commodity_id c) {
+				if(c == economy::money)
+					return;
+				auto const gamma = double(average_life_need.get(c));
+				if(gamma <= 0.0)
+					return;
+				auto const p = double(state.world.market_get_price(m, c)) + 0.000000001;
+				double q = 0.0;
+				if(budget <= subs) {
+					q = gamma * K * (budget / subs);
+				} else {
+					auto const beta = gamma / sum_gamma;
+					q = gamma * K + (beta / p) * (budget - subs);
+				}
+				auto const weight = float(q / (gamma * K));
+				state.world.market_set_life_needs_weights(m, c, weight);
+				sum_pq += p * q;
+				min_q = std::min(min_q, q);
+				if(c == grain_commodity) {
+					grain_weight = double(weight);
+					grain_q = q;
+				}
+			});
+			if(write_les_today && demand_les_file) {
+				char datebuf[16];
+				auto const ymd = state.current_date.to_ymd(state.start_date);
+				std::snprintf(datebuf, sizeof(datebuf), "%04d-%02d-%02d", ymd.year, ymd.month, ymd.day);
+				fprintf(demand_les_file, "%s,%d,%d,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g\n",
+					datebuf, int(m.index()), int(nation.index()), budget, subs, sum_pq, grain_weight, grain_q, min_q);
+			}
+		});
+		if(write_les_today && demand_les_file)
+			fflush(demand_les_file);
 	}
 }
 
