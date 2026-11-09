@@ -138,6 +138,27 @@ static std::vector<float> prev_grain_stockpile;
 // the commodity base cost, so a near-zero price can still respond to demand/supply. The term is
 // symmetric (delta can be negative) and is zero when supply == demand; cost is a unit scale, not
 // a floor or anchor. Default 0 keeps upstream.
+static bool const target_price = []() {
+	auto s = std::getenv("ALICE_EXP_TARGET_PRICE");
+	return s && std::atoi(s) != 0;
+}();
+static float const target_price_speed = []() {
+	auto s = std::getenv("ALICE_TARGET_PRICE_SPEED");
+	return s ? std::clamp(float(std::atof(s)), 0.0001f, 0.1f) : 0.005f;
+}();
+static float const target_price_stock_days = []() {
+	auto s = std::getenv("ALICE_TARGET_PRICE_STOCK_DAYS");
+	return s ? std::clamp(float(std::atof(s)), 1.f, 3650.f) : 30.f;
+}();
+static float const target_price_flow_elast = []() {
+	auto s = std::getenv("ALICE_TARGET_PRICE_FLOW_ELAST");
+	return s ? std::clamp(float(std::atof(s)), 0.f, 2.f) : 0.5f;
+}();
+static float const target_price_stock_elast = []() {
+	auto s = std::getenv("ALICE_TARGET_PRICE_STOCK_ELAST");
+	return s ? std::clamp(float(std::atof(s)), 0.f, 2.f) : 0.2f;
+}();
+
 static bool const price_recovery = []() {
 	auto s = std::getenv("ALICE_EXP_PRICE_RECOVERY");
 	return s && std::atoi(s) != 0;
@@ -6979,6 +7000,22 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 				next_price = ve::select(demand <= supply, next_price * (demand + 0.000'001f) / (supply + 0.000'002f), next_price);
 			} else {
 				next_price = current_price + price_properties::commodity::change<ve::fp_vector>(current_price, supply, demand);
+				if(target_price) {
+					auto const cost = state.world.commodity_get_cost(cid);
+					auto const min_price = price_properties::commodity::min;
+					auto const max_price = price_properties::commodity::max;
+					auto const target = ve::apply([&](dcon::market_id m, float s, float d) {
+						auto const eps = 0.000001f;
+						auto const flow = (d + eps) / (s + eps);
+						auto const stock = state.world.market_get_stockpile(m, cid);
+						auto const stock_days = stock / (d + eps);
+						auto t = cost
+							* std::pow(std::max(1e-6f, flow), target_price_flow_elast)
+							* std::pow(target_price_stock_days / std::max(1.f, stock_days), target_price_stock_elast);
+						return std::clamp(t, min_price, max_price);
+					}, ids, supply, demand);
+					next_price = current_price + (target - current_price) * target_price_speed;
+				}
 				if(price_recovery) {
 					// delta from the same supply/demand ratio, recovered at unit price
 					auto const unit_change = price_properties::commodity::change<ve::fp_vector>(ve::fp_vector{1.f}, supply, demand);
@@ -6993,12 +7030,22 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 			auto next_price_clamped = ve::min(ve::max(next_price, price_properties::commodity::min), price_properties::commodity::max);
 
 			auto current_confidence = state.world.market_get_price_confidence(ids, cid);
-			auto price_ratio = current_price / next_price_clamped;
-			auto base_confidence_increase = 1.f / 365.f;
-			if(presimulation) {
-				base_confidence_increase = 1.f / 365.f * 3.f;
+			ve::fp_vector next_confidence;
+			if(target_price && !presimulation) {
+				auto const target_conf = ve::apply([&](float s, float d) {
+					auto const eps = 0.000001f;
+					auto const flow = (d + eps) / (s + eps);
+					return std::clamp(1.f - 0.5f * std::min(1.f, std::abs(std::log(std::max(1e-6f, flow)))), 0.0001f, 1.f);
+				}, supply, demand);
+				next_confidence = current_confidence + (target_conf - current_confidence) * 0.02f;
+			} else {
+				auto price_ratio = current_price / next_price_clamped;
+				auto base_confidence_increase = 1.f / 365.f;
+				if(presimulation) {
+					base_confidence_increase = 1.f / 365.f * 3.f;
+				}
+				next_confidence = ve::max(ve::fp_vector{0.0001f}, ve::min(ve::fp_vector{ 1.f }, current_confidence * ve::min(price_ratio, 1.f / price_ratio) + base_confidence_increase));
 			}
-			auto next_confidence = ve::max(ve::fp_vector{0.0001f}, ve::min(ve::fp_vector{ 1.f }, current_confidence * ve::min(price_ratio, 1.f / price_ratio) + base_confidence_increase));
 #ifndef NDEBUG
 			ve::apply([&](auto value) { assert(std::isfinite(value)); }, next_confidence);
 #endif
