@@ -36,6 +36,13 @@ namespace economy {
 // LOCAL EXPERIMENT (ALICE_EXP_MARKET_CASH=1): record the cost of goods sold as market purchases.
 // Upstream never writes market purchases, so sales revenue accumulates in the market money pool.
 // This is the first cash-in-advance step: a sale is matched by a purchase of equal value.
+// LOCAL EXPERIMENT (ALICE_EXP_PRODUCER_SETTLEMENT=1): credit market purchases to a producer
+// settlement account (national bank) and trade flows to a foreign account. Market money is only
+// working capital; purchases are capped by its cash. Default 0 keeps upstream behaviour.
+static bool const producer_settlement = []() {
+	auto s = std::getenv("ALICE_EXP_PRODUCER_SETTLEMENT");
+	return s && std::atoi(s) != 0;
+}();
 static bool const market_cash = []() {
 	auto s = std::getenv("ALICE_EXP_MARKET_CASH");
 	return s && std::atoi(s) != 0;
@@ -4096,7 +4103,6 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 		auto sales = state.world.market_get_sales(market);
 		state.world.market_set_sales(market, 0.f);
 		auto purchases = state.world.market_get_purchases(market);
-		state.world.market_set_purchases(market, 0.f);
 		if(market_cash)
 			purchases = ve::min(purchases, ve::max(0.f, budget));
 		auto export_gains = state.world.market_get_export_cut(market);
@@ -4301,6 +4307,29 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 			auto const new_foreign = foreign_settlement[n.index()] - trade_net;
 			if(std::isfinite(new_foreign))
 				foreign_settlement[n.index()] = new_foreign;
+		});
+	}
+
+	if(producer_settlement) {
+		state.world.for_each_market([&](dcon::market_id m) {
+			auto const sid = state.world.market_get_zone_from_local_market(m);
+			auto const n = state.world.state_instance_get_nation_from_state_ownership(sid);
+			if(!n)
+				return;
+			auto const purchases = state.world.market_get_purchases(m);
+			state.world.market_set_purchases(m, 0.f);
+			if(!std::isfinite(purchases) || !(purchases > 0.f))
+				return;
+			auto const bank = state.world.nation_get_national_bank(n);
+			auto const new_bank = bank + purchases;
+			if(!std::isfinite(new_bank))
+				return;
+			state.world.nation_set_national_bank(n, new_bank);
+			auto const trade_net = state.world.market_get_export_cut(m) - state.world.market_get_import_spending(m);
+			if(foreign_settlement.size() <= size_t(n.index()))
+				foreign_settlement.resize(size_t(n.index()) + 1, 0.f);
+			if(std::isfinite(trade_net))
+				foreign_settlement[n.index()] -= trade_net;
 		});
 	}
 
