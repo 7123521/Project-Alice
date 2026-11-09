@@ -23,6 +23,7 @@ namespace headless {
 inline FILE* factory_trace_csv = nullptr;
 inline FILE* construction_trace_csv = nullptr;
 inline FILE* factory_input_trace_csv = nullptr;
+inline FILE* seller_share_trace_csv = nullptr;
 
 inline std::string ymd_str(sys::year_month_day d) {
 	char buf[16];
@@ -72,6 +73,29 @@ inline void dump_construction_trace(sys::state& state, std::string const& date) 
 			double(economy::construction_progress(state, c.id)));
 	}
 	fflush(construction_trace_csv);
+}
+
+inline void dump_seller_share_trace(sys::state& state, std::string const& date) {
+	if(!seller_share_trace_csv)
+		return;
+	state.world.for_each_market([&](dcon::market_id m) {
+		auto const sid = state.world.market_get_zone_from_local_market(m);
+		if(!sid)
+			return;
+		auto const owner = state.world.state_instance_get_nation_from_state_ownership(sid);
+		state.world.for_each_commodity([&](dcon::commodity_id c) {
+			if(c == economy::money)
+				return;
+			auto const b = economy::explain_output(state, c, sid);
+			auto const total = b.rgo + b.guild + b.factories;
+			fprintf(seller_share_trace_csv,
+				"%s,%d,%s,%s,%.6g,%.6g,%.6g,%.6g\n",
+				date.c_str(), m.index(), tag_of(state, owner).c_str(),
+				text::produce_simple_string(state, state.world.commodity_get_name(c)).c_str(),
+				double(b.rgo), double(b.guild), double(b.factories), double(total));
+		});
+	});
+	fflush(seller_share_trace_csv);
 }
 
 inline void dump_factory_input_trace(sys::state& state, std::string const& date) {
@@ -864,6 +888,12 @@ inline void run(sys::state& state, int years, std::string const& dump_dir) {
 		wars_csv = fopen((dump_dir + "/wars.csv").c_str(), "w");
 		factory_trace_csv = nullptr;
 		construction_trace_csv = nullptr;
+		seller_share_trace_csv = nullptr;
+		if(std::getenv("ALICE_TRACE_SELLER_SHARE")) {
+			seller_share_trace_csv = fopen((dump_dir + "/market_seller_share.csv").c_str(), "w");
+			if(seller_share_trace_csv)
+				fprintf(seller_share_trace_csv, "date,market,owner,commodity,rgo,guild,factories,total\n");
+		}
 		if(std::getenv("ALICE_TRACE_CONSTRUCTION")) {
 			construction_trace_csv = fopen((dump_dir + "/construction_trace.csv").c_str(), "w");
 			if(construction_trace_csv)
@@ -923,6 +953,7 @@ inline void run(sys::state& state, int years, std::string const& dump_dir) {
 		dump_month(state, nations_csv, prices_csv, provinces_csv, markets_csv, welfare_csv, summary_csv, ymd_str(start));
 	dump_factory_trace(state, ymd_str(start));
 	dump_factory_input_trace(state, ymd_str(start));
+	dump_seller_share_trace(state, ymd_str(start));
 	dump_construction_trace(state, ymd_str(start));
 	dump_routes(state, routes_csv, ymd_str(start));
 	dump_wars(state, wars_csv, ymd_str(start));
@@ -938,6 +969,7 @@ inline void run(sys::state& state, int years, std::string const& dump_dir) {
 			dump_month(state, nations_csv, prices_csv, provinces_csv, markets_csv, welfare_csv, summary_csv, ymd_str(ymd));
 			dump_factory_trace(state, ymd_str(ymd));
 			dump_factory_input_trace(state, ymd_str(ymd));
+			dump_seller_share_trace(state, ymd_str(ymd));
 			dump_construction_trace(state, ymd_str(ymd));
 			fflush(nations_csv);
 			fflush(prices_csv);
@@ -974,6 +1006,7 @@ inline void run(sys::state& state, int years, std::string const& dump_dir) {
 	if(summary_csv) fclose(summary_csv);
 	if(factory_trace_csv) fclose(factory_trace_csv);
 	if(factory_input_trace_csv) fclose(factory_input_trace_csv);
+	if(seller_share_trace_csv) fclose(seller_share_trace_csv);
 	if(construction_trace_csv) fclose(construction_trace_csv);
 }
 

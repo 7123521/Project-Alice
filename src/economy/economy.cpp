@@ -39,6 +39,12 @@ namespace economy {
 // LOCAL EXPERIMENT (ALICE_EXP_PRODUCER_SETTLEMENT=1): credit market purchases to a producer
 // settlement account (national bank) and trade flows to a foreign account. Market money is only
 // working capital; purchases are capped by its cash. Default 0 keeps upstream behaviour.
+// LOCAL EXPERIMENT (ALICE_EXP_SELLER_PAYOUT=1): pay market sales to producer accounts using
+// the reconstructed rgo/guild/factory output shares. Market money is then only working capital.
+static bool const seller_payout = []() {
+	auto s = std::getenv("ALICE_EXP_SELLER_PAYOUT");
+	return s && std::atoi(s) != 0;
+}();
 static bool const producer_settlement = []() {
 	auto s = std::getenv("ALICE_EXP_PRODUCER_SETTLEMENT");
 	return s && std::atoi(s) != 0;
@@ -67,6 +73,50 @@ float total_foreign_settlement() {
 	for(float v : foreign_settlement)
 		total += v;
 	return total;
+}
+
+// LOCAL EXPERIMENT (ALICE_EXP_SELLER_PAYOUT): value-weighted producer shares per market and
+// province, rebuilt once per month. Market sales revenue is paid to the province accounts that
+// produced the goods; the same accounts then pay input costs and wages, so gross revenue is not
+// double-counted with the old separate profit credit.
+struct province_producer_share {
+	dcon::province_id province{};
+	float rgo = 0.f;
+	float guild = 0.f;
+	float factory = 0.f;
+};
+struct market_producer_share {
+	std::vector<province_producer_share> provinces;
+	float total = 0.f;
+};
+static std::vector<market_producer_share> seller_share_cache;
+static int seller_share_cache_key = -1;
+
+static void rebuild_seller_share_cache(sys::state& state, int key) {
+	seller_share_cache.clear();
+	seller_share_cache.resize(size_t(state.world.market_size()));
+	state.world.for_each_market([&](dcon::market_id m) {
+		auto const sid = state.world.market_get_zone_from_local_market(m);
+		if(!sid)
+			return;
+		auto& entry = seller_share_cache[size_t(m.index())];
+		province::for_each_province_in_state_instance(state, sid, [&](dcon::province_id pid) {
+			province_producer_share ps;
+			ps.province = pid;
+			state.world.for_each_commodity([&](dcon::commodity_id c) {
+				if(c == economy::money)
+					return;
+				auto const b = explain_output(state, c, pid);
+				auto const weight = state.world.market_get_price(m, c);
+				ps.rgo += b.rgo * weight;
+				ps.guild += b.guild * weight;
+				ps.factory += b.factories * weight;
+			});
+			entry.total += ps.rgo + ps.guild + ps.factory;
+			entry.provinces.push_back(ps);
+		});
+	});
+	seller_share_cache_key = key;
 }
 
 dcon::province_id construction_get_location(const sys::state& state, dcon::province_land_construction_id con) {
@@ -4090,6 +4140,13 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 		state.world.market_set_weighted_port_price_cost(mid, current_weight == 0.f ? 0.f : local_price * local_weight / current_weight);
 	});
 
+	if(seller_payout) {
+		auto const today = state.current_date.to_ymd(state.start_date);
+		auto const key = int(today.year) * 12 + int(today.month);
+		if(key != seller_share_cache_key)
+			rebuild_seller_share_cache(state, key);
+	}
+
 	state.world.execute_parallel_over_market([&](auto market){
 		auto area = state.world.market_get_zone_from_local_market(market);
 		auto nation = state.world.state_instance_get_nation_from_state_ownership(area);
@@ -4228,6 +4285,40 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 		auto refund = state.world.market_get_shipbuilding_refund(market);
 
 		state.world.market_set_stockpile(market, economy::money, budget + refund + earn - spend);
+
+		if(seller_payout) {
+			ve::apply([&](dcon::market_id m, float sold) {
+				if(!std::isfinite(sold) || !(sold > 0.f))
+					return;
+				if(size_t(m.index()) >= seller_share_cache.size())
+					return;
+				auto const& entry = seller_share_cache[size_t(m.index())];
+				if(!(entry.total > 0.f) || !std::isfinite(entry.total))
+					return;
+				auto const money = state.world.market_get_stockpile(m, economy::money);
+				if(!std::isfinite(money))
+					return;
+				// cash-in-advance: the market can only pay out what it holds
+				auto const pay = std::min(sold, std::max(0.f, money));
+				if(!(pay > 0.f))
+					return;
+				state.world.market_set_stockpile(m, economy::money, money - pay);
+				for(auto const& ps : entry.provinces) {
+					auto const own = ps.rgo + ps.guild + ps.factory;
+					if(!(own > 0.f) || !std::isfinite(own))
+						continue;
+					auto const amount = pay * own / entry.total;
+					if(!std::isfinite(amount))
+						continue;
+					if(ps.rgo > 0.f)
+						state.world.province_set_rgo_bank(ps.province, state.world.province_get_rgo_bank(ps.province) + amount * ps.rgo / own);
+					if(ps.guild > 0.f)
+						state.world.province_set_artisan_bank(ps.province, state.world.province_get_artisan_bank(ps.province) + amount * ps.guild / own);
+					if(ps.factory > 0.f)
+						state.world.province_set_factory_bank(ps.province, state.world.province_get_factory_bank(ps.province) + amount * ps.factory / own);
+				}
+			}, market, sales);
+		}
 
 		state.world.market_set_total_earn(market, earn);
 		state.world.market_set_total_paid(market, spend);
@@ -5560,22 +5651,42 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 	province::for_each_market_province_parallel_over_market(state, [&](dcon::market_id mid, dcon::state_instance_id sid, dcon::province_id pid){
 		{
 			auto total_factory_profit = 0.f;
+			auto total_input_cost = 0.f;
+			auto total_wage_bill = 0.f;
 			// FACTORIES
 			for(auto f : state.world.province_get_factory_location(pid)) {
 				auto fac = f.get_factory();
 				auto profit = explain_last_factory_profit(state, fac);
 				state.world.factory_set_profit(fac.id, profit.profit);
 				total_factory_profit += profit.profit;
+				total_input_cost += profit.inputs;
+				total_wage_bill += profit.wages;
 			}
 
 			auto current_bank = state.world.province_get_factory_bank(pid);
-			state.world.province_set_factory_bank(pid, current_bank + total_factory_profit);
+			if(seller_payout) {
+				// gross sales were credited at settlement; pay inputs and wages out of that revenue
+				state.world.province_set_factory_bank(pid, current_bank - total_input_cost - total_wage_bill);
+			} else {
+				state.world.province_set_factory_bank(pid, current_bank + total_factory_profit);
+			}
 		}
 
 		{
-			auto total_rgo_profit = state.world.province_get_rgo_profit(pid);
-			auto current_bank = state.world.province_get_rgo_bank(pid);
-			state.world.province_set_rgo_bank(pid, current_bank + total_rgo_profit);
+			if(seller_payout) {
+				auto rgo_wage_bill = 0.f;
+				state.world.for_each_commodity([&](dcon::commodity_id c) {
+					if(c == economy::money)
+						return;
+					rgo_wage_bill += economy::rgo_wage(state, c, pid);
+				});
+				auto current_bank = state.world.province_get_rgo_bank(pid);
+				state.world.province_set_rgo_bank(pid, current_bank - rgo_wage_bill);
+			} else {
+				auto total_rgo_profit = state.world.province_get_rgo_profit(pid);
+				auto current_bank = state.world.province_get_rgo_bank(pid);
+				state.world.province_set_rgo_bank(pid, current_bank + total_rgo_profit);
+			}
 		}
 	});
 
