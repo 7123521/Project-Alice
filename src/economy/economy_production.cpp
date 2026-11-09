@@ -14,6 +14,9 @@
 #include "economy_constants.hpp"
 #include "money.hpp"
 #include "economy.hpp"
+#include "text/text.hpp"
+#include <algorithm>
+#include <string>
 
 
 namespace production_directives {
@@ -26,6 +29,50 @@ uint32_t size(sys::state const& state) {
 }
 
 namespace economy {
+
+// LOCAL EXPERIMENT (ALICE_EXP_RGO_HARVEST_UTILIZATION=1): part of the RGO harvest is seed,
+// feed, on-farm consumption and field loss; only the remainder is marketed. The fraction is
+// per-commodity calibration (prototype: Grain 0.30, other RGO 0), not a uniform cut. Gross
+// output still counts in GDP, but it does not flood the market. Default 0 keeps upstream.
+static bool const rgo_harvest_utilization = []() {
+	auto s = std::getenv("ALICE_EXP_RGO_HARVEST_UTILIZATION");
+	return s && std::atoi(s) != 0;
+}();
+static float const rgo_utilization_grain_fraction = []() {
+	auto s = std::getenv("ALICE_RGO_UTILIZATION");
+	return s ? std::clamp(float(std::atof(s)), 0.f, 0.95f) : 0.30f;
+}();
+static bool const grain_output_mult_enabled = []() {
+	auto s = std::getenv("ALICE_EXP_GRAIN_OUTPUT_MULT");
+	return s && std::atof(s) != 1.0;
+}();
+static float const grain_output_mult = []() {
+	auto s = std::getenv("ALICE_EXP_GRAIN_OUTPUT_MULT");
+	return s ? std::clamp(float(std::atof(s)), 0.05f, 1.f) : 1.f;
+}();
+static dcon::commodity_id rgo_grain_commodity{};
+static bool rgo_grain_commodity_init = false;
+
+static void init_rgo_grain_commodity(sys::state const& state) {
+	if(rgo_grain_commodity_init)
+		return;
+	rgo_grain_commodity_init = true;
+	state.world.for_each_commodity([&](dcon::commodity_id c) {
+		if(rgo_grain_commodity || c == economy::money)
+			return;
+		auto const name = text::produce_simple_string(state, state.world.commodity_get_name(c));
+		std::string lower = name;
+		std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char ch) { return char(std::tolower(ch)); });
+		if(lower.find("grain") != std::string::npos)
+			rgo_grain_commodity = c;
+	});
+}
+
+static float rgo_utilization_fraction(sys::state const& state, dcon::commodity_id c) {
+	if(!rgo_harvest_utilization)
+		return 0.f;
+	return c == rgo_grain_commodity ? rgo_utilization_grain_fraction : 0.f;
+}
 
 // LOCAL EXPERIMENT (ALICE_EXP_PROFIT_INVESTMENT=1): factory investment tokens and expansion
 // priority use actual per-worker profit (output revenue - input cost - wage), not gross output
@@ -1845,6 +1892,9 @@ void update_rgo_consumption(
 
 void update_rgo_production(sys::state& state) {
 
+	if(grain_output_mult_enabled || rgo_harvest_utilization)
+		init_rgo_grain_commodity(state);
+
 	// calculate production
 
 	province::ve_parallel_for_each_land_province(state, [&](auto p) {
@@ -1870,6 +1920,8 @@ void update_rgo_production(sys::state& state) {
 				* mobilization_impact;
 			auto per_worker = state.world.province_get_rgo_output_per_worker(p, c);
 			auto amount = actual_amount_of_workers * per_worker;
+			if(grain_output_mult_enabled && c == rgo_grain_commodity)
+				amount = amount * grain_output_mult;
 			state.world.province_set_rgo_output(p, c, amount);
 		});
 	});
@@ -1895,6 +1947,14 @@ void update_rgo_production(sys::state& state) {
 			assert(state_instance);
 			province::for_each_province_in_state_instance(state, state_instance, [&](dcon::province_id province) {
 				auto amount = state.world.province_get_rgo_output(province, commodity);
+				auto const utilization = rgo_utilization_fraction(state, commodity);
+				if(utilization > 0.f) {
+					auto const on_farm = amount * utilization;
+					amount = amount - on_farm;
+					// own-account on-farm use is still production; keep it in GDP
+					auto const median_price = state.world.commodity_get_median_price(commodity);
+					state.world.market_set_gdp(local_market, state.world.market_get_gdp(local_market) + on_farm * median_price);
+				}
 				register_domestic_supply(state, local_market, commodity, amount, economy_reason::rgo);
 			});
 		});

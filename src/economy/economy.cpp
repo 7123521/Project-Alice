@@ -42,6 +42,10 @@ static bool const presim_stockpile_band = []() {
 	auto s = std::getenv("ALICE_EXP_PRESIM_STOCKPILE");
 	return s && std::atoi(s) != 0;
 }();
+static bool const presim_stockpile_1y = []() {
+	auto s = std::getenv("ALICE_EXP_PRESIM_STOCKPILE_1Y");
+	return s && std::atoi(s) != 0;
+}();
 
 // LOCAL EXPERIMENT (ALICE_EXP_MARKET_CASH=1): record the cost of goods sold as market purchases.
 // Upstream never writes market purchases, so sales revenue accumulates in the market money pool.
@@ -5801,10 +5805,12 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 					&& state.world.commodity_get_actually_exists_in_nature(c)
 					&& state.world.commodity_get_rgo_amount(c) > 0.f
 				) {
-					if(presim_stockpile_band) {
+					if(presim_stockpile_band || presim_stockpile_1y) {
 						auto const demand = ve::max(historical_demand, state.world.market_get_demand(markets, c));
-						auto const target_min = demand * 7.f;
-						auto const target_max = demand * 30.f;
+						auto const min_days = presim_stockpile_1y ? 180.f : 7.f;
+						auto const max_days = presim_stockpile_1y ? 365.f : 30.f;
+						auto const target_min = demand * min_days;
+						auto const target_max = demand * max_days;
 						auto const current = state.world.market_get_stockpile(markets, c);
 						state.world.market_set_stockpile(markets, c, ve::min(ve::max(current, target_min), target_max));
 					} else {
