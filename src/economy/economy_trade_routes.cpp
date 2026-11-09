@@ -145,6 +145,15 @@ constexpr term::fetch_trade_owner<left_t> trade_route_get_owner(sys::state const
 
 namespace economy {
 
+// LOCAL EXPERIMENT (ALICE_EXP_TRADE_ACCOUNT=1): general trade account, all commodities.
+// Goods: exported volume is removed from the origin stockpile (upstream only credits the target).
+// Money: origin receives the full origin value; target pays the target value; the trade house
+// receives target - origin - tariffs. Sum of credits equals the target payment.
+static bool const trade_account = []() {
+	auto s = std::getenv("ALICE_EXP_TRADE_ACCOUNT");
+	return s && std::atoi(s) != 0;
+}();
+
 /*
 New model of trade update:
 Assume that there is a segment [0, 1] of traders operating this route.
@@ -1291,11 +1300,19 @@ void fill_trade_buffers(
 					auto volume = state.world.trade_route_get_volume(route, cid) * sat;
 					auto price_origin = state.world.market_get_price(origin, cid);
 					auto price_target = state.world.market_get_price(target, cid);
-					total_earn_export = total_earn_export + volume * (price_origin * cut);
-					total_origin_tariff = total_origin_tariff + volume * (price_origin * export_rate);
-
-					if(owner == origin) {
-						total_arbitrage = total_arbitrage + volume * (price_target * (1.f - import_rate) - price_origin * (1.f + export_rate + cut));
+					if(trade_account) {
+						// origin gets the goods value; the merchant margin is target - origin - tariffs
+						total_earn_export = total_earn_export + volume * price_origin;
+						total_origin_tariff = total_origin_tariff + volume * (price_origin * export_rate);
+						if(owner == origin) {
+							total_arbitrage = total_arbitrage + volume * (price_target * (1.f - import_rate) - price_origin * (1.f + export_rate));
+						}
+					} else {
+						total_earn_export = total_earn_export + volume * (price_origin * cut);
+						total_origin_tariff = total_origin_tariff + volume * (price_origin * export_rate);
+						if(owner == origin) {
+							total_arbitrage = total_arbitrage + volume * (price_target * (1.f - import_rate) - price_origin * (1.f + export_rate + cut));
+						}
 					}
 				});
 			});
@@ -1331,7 +1348,10 @@ void fill_trade_buffers(
 					total_spend_import = total_spend_import + volume * (price_target);
 					total_target_tariff = total_target_tariff + volume * (price_target * import_rate);
 					if(owner == target) {
-						total_arbitrage = total_arbitrage + volume * (price_target * (1.f - import_rate) - price_origin * (1.f + export_rate + cut));
+						auto const margin = trade_account
+							? volume * (price_target * (1.f - import_rate) - price_origin * (1.f + export_rate))
+							: volume * (price_target * (1.f - import_rate) - price_origin * (1.f + export_rate + cut));
+						total_arbitrage = total_arbitrage + margin;
 					}
 				});
 			});
@@ -1341,6 +1361,25 @@ void fill_trade_buffers(
 			state.world.market_set_tariff_collected(target, state.world.market_get_tariff_collected(target) + total_target_tariff);
 		}
 	});
+
+	if(trade_account) {
+		// general goods conservation: every exported unit leaves the origin stockpile
+		state.world.for_each_trade_route([&](dcon::trade_route_id route) {
+			if(!state.world.trade_route_is_valid(route))
+				return;
+			auto const origin = state.world.trade_route_get_origin(route);
+			state.world.for_each_commodity([&](dcon::commodity_id cid) {
+				if(state.world.commodity_get_money_rgo(cid) || state.world.commodity_get_is_local(cid))
+					return;
+				auto const sat = state.world.market_get_actual_probability_to_buy(origin, cid);
+				auto const moved = state.world.trade_route_get_volume(route, cid) * sat;
+				if(!(moved > 0.f) || !std::isfinite(moved))
+					return;
+				auto const stock = state.world.market_get_stockpile(origin, cid);
+				state.world.market_set_stockpile(origin, cid, std::max(0.f, stock - moved));
+			});
+		});
+	}
 }
 
 }
