@@ -63,6 +63,12 @@ static bool const rgo_supply_response = []() {
 	auto s = std::getenv("ALICE_EXP_RGO_SUPPLY_RESPONSE");
 	return s && std::atoi(s) != 0;
 }();
+// LOCAL EXPERIMENT (ALICE_EXP_RGO_COST_WAGE=1): pay RGO labour a share of the cost-valued RGO
+// output of the province instead of labour_price x employment. Default 0 = upstream.
+static bool const rgo_cost_wage_enabled = []() {
+	auto s = std::getenv("ALICE_EXP_RGO_COST_WAGE");
+	return s && std::atoi(s) != 0;
+}();
 static float const rgo_supply_floor = []() {
 	auto s = std::getenv("ALICE_RGO_SUPPLY_FLOOR");
 	return s ? std::max(0.1f, std::min(1.f, float(std::atof(s)))) : 0.3f;
@@ -3009,6 +3015,16 @@ float rgo_employment(sys::state& state, dcon::commodity_id c, dcon::province_id 
 
 float rgo_wage(sys::state& state, dcon::commodity_id c, dcon::province_id p) {
 	return rgo_employment(state, c, p) * state.world.province_get_labor_price(p, labor::no_education);
+}
+
+// LOCAL EXPERIMENT: cost-valued RGO wage bill for one commodity in one province.
+float rgo_cost_wage(sys::state& state, dcon::commodity_id c, dcon::province_id p) {
+	if(!rgo_cost_wage_enabled)
+		return rgo_wage(state, c, p);
+	auto const output = state.world.province_get_rgo_output(p, c);
+	auto const cost = state.world.commodity_get_cost(c);
+	auto const wage = direct_factory_wage_share * output * cost;
+	return std::isfinite(wage) ? wage : 0.f;
 }
 
 float rgo_employment(sys::state& state, dcon::province_id p) {

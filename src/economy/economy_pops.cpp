@@ -1970,6 +1970,29 @@ void update_income_wages(sys::state& state){
 	static auto buffer_high_not_accepted_workers_wage = state.world.province_make_vectorizable_float_buffer();
 	static auto buffer_high_accepted_workers_wage = state.world.province_make_vectorizable_float_buffer();
 
+	// LOCAL EXPERIMENT (ALICE_EXP_RGO_COST_WAGE=1): province cost-valued RGO wage bill.
+	static bool const rgo_cost_wage_enabled = []() {
+		auto env = std::getenv("ALICE_EXP_RGO_COST_WAGE");
+		return env && std::atoi(env) != 0;
+	}();
+	static ve::vectorizable_buffer<float, dcon::province_id> rgo_cost_wage_bill_buf(uint32_t(1));
+	static uint32_t rgo_cost_wage_provinces = 1;
+	if(rgo_cost_wage_enabled) {
+		if(state.world.province_size() > rgo_cost_wage_provinces) {
+			rgo_cost_wage_bill_buf = state.world.province_make_vectorizable_float_buffer();
+			rgo_cost_wage_provinces = state.world.province_size();
+		}
+		state.world.for_each_province([&](dcon::province_id p) {
+			double bill = 0.0;
+			state.world.for_each_commodity([&](dcon::commodity_id c) {
+				if(c == economy::money)
+					return;
+				bill += double(economy::rgo_cost_wage(state, c, p));
+			});
+			rgo_cost_wage_bill_buf.set(p, std::isfinite(bill) ? float(bill) : 0.f);
+		});
+	}
+
 	// LOCAL EXPERIMENT: province direct factory wage bill (sum over factories).
 	static ve::vectorizable_buffer<float, dcon::province_id> direct_factory_wage_bill(uint32_t(1));
 	static uint32_t direct_factory_wage_provinces = 1;
@@ -2013,6 +2036,18 @@ void update_income_wages(sys::state& state){
 			* no_education_wage;
 
 		buffer_rgo_workers_wage.set(pid, rgo_workers_wage);
+
+		if(rgo_cost_wage_enabled) {
+			auto workers_v = ve::fp_vector{ 0.f };
+			state.world.for_each_pop_type([&](dcon::pop_type_id pt) {
+				if(state.world.pop_type_get_is_paid_rgo_worker(pt))
+					workers_v = workers_v + state.world.province_get_demographics(pid, demographics::to_key(state, pt));
+			});
+			auto const bill_v = rgo_cost_wage_bill_buf.get(pid);
+			auto const per_worker = ve::select(workers_v > 0.f, bill_v / ve::max(workers_v, ve::fp_vector{ 1.f }), ve::fp_vector{ 0.f });
+			buffer_rgo_workers_wage.set(pid, per_worker);
+			rgo_workers_wage = per_worker;
+		}
 
 		auto primary_workers_wage =
 			state.world.province_get_pop_labor_distribution(pid, pop_labor::primary_no_education)

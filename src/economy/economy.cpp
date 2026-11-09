@@ -206,6 +206,21 @@ static float const target_price_speed = []() {
 	auto s = std::getenv("ALICE_TARGET_PRICE_SPEED");
 	return s ? std::clamp(float(std::atof(s)), 0.0001f, 0.1f) : 0.005f;
 }();
+// LOCAL EXPERIMENT (ALICE_EXP_COST_PLUS_PRICE=1): price converges to cost x (1 + markup)
+// instead of reacting to supply and demand. Quantities then clear through inventory and
+// production, and the price level is the same one used to value GDP and to pay wages.
+static bool const cost_plus_price = []() {
+	auto s = std::getenv("ALICE_EXP_COST_PLUS_PRICE");
+	return s && std::atoi(s) != 0;
+}();
+static float const cost_plus_markup = []() {
+	auto s = std::getenv("ALICE_COST_PLUS_MARKUP");
+	return s ? std::clamp(float(std::atof(s)), -0.5f, 2.f) : 0.f;
+}();
+static float const cost_plus_speed = []() {
+	auto s = std::getenv("ALICE_COST_PLUS_SPEED");
+	return s ? std::clamp(float(std::atof(s)), 0.0001f, 1.f) : 0.02f;
+}();
 // LOCAL EXPERIMENT (ALICE_EXP_PRICE_INCOME_INDEX=1): re-index the price of labour by the same
 // output-price index, on the same day, so a change in the commodity price level does not change
 // real wages (and so nominal income can fund a cost-level basket). Default 0 = upstream.
@@ -7276,7 +7291,7 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 					state.world.for_each_commodity([&](dcon::commodity_id c) {
 						if(c == economy::money)
 							return;
-						rgo_wage_bill += economy::rgo_wage(state, c, pid);
+						rgo_wage_bill += economy::rgo_cost_wage(state, c, pid);
 					});
 				}
 				auto current_bank = state.world.province_get_rgo_bank(pid);
@@ -7616,7 +7631,11 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 				next_price = ve::select(demand <= supply, next_price * (demand + 0.000'001f) / (supply + 0.000'002f), next_price);
 			} else {
 				next_price = current_price + price_properties::commodity::change<ve::fp_vector>(current_price, supply, demand);
-				if(target_price) {
+				if(cost_plus_price) {
+					auto const target = state.world.commodity_get_cost(cid) * (1.f + cost_plus_markup);
+					next_price = current_price + (target - current_price) * cost_plus_speed;
+				}
+				if(target_price && !cost_plus_price) {
 					auto const cost = state.world.commodity_get_cost(cid);
 					auto const min_price = price_properties::commodity::min;
 					auto const max_price = price_properties::commodity::max;
