@@ -9,6 +9,31 @@
 #include "economy_pops.hpp"
 #include "province_templates.hpp"
 #include "economy_production.hpp"
+#include <cstdio>
+#include <cstdlib>
+#include <cmath>
+#include <execinfo.h>
+
+// LOCAL DIAGNOSTIC (ALICE_NAN_WATCH=1): catch a negative or non-finite demand registration and
+// report the calling symbol, which is where the bad amount is produced.
+extern "C" int dladdr(void const* addr, void* info);
+struct nan_dl_info { char const* dli_fname; void* dli_fbase; char const* dli_sname; void* dli_saddr; };
+static bool const nan_watch_demand = []() {
+	auto env = std::getenv("ALICE_NAN_WATCH");
+	return env && std::atoi(env) != 0;
+}();
+static void check_demand_amount(dcon::market_id m, dcon::commodity_id c, float amount) {
+	if(!nan_watch_demand)
+		return;
+	if(std::isfinite(amount) && amount >= 0.f)
+		return;
+	nan_dl_info info{};
+	dladdr(__builtin_return_address(0), &info);
+	std::fprintf(stderr, "NANWATCH bad_register_demand market=%u commodity=%u amount=%g caller=%s\n",
+		m.index(), c.index(), amount, info.dli_sname ? info.dli_sname : "?");
+	std::fflush(stderr);
+	std::abort();
+}
 
 namespace economy {
 
@@ -42,6 +67,7 @@ void register_demand(
 	//economy_reason reason
 ) {
 	assert(amount >= 0.f);
+	check_demand_amount(s, commodity_type, amount);
 	auto current = state.world.market_get_demand(s, commodity_type);
 	state.world.market_set_demand(s, commodity_type, current + amount);
 	assert(std::isfinite(state.world.market_get_demand(s, commodity_type)));
@@ -55,6 +81,24 @@ void t_register_demand(
 	ve::fp_vector amount
 	//economy_reason reason
 ) {
+	if(nan_watch_demand) {
+		bool bad = false;
+		float bad_amount = 0.f;
+		ve::apply([&](float v) {
+			if(!std::isfinite(v) || v < -1e-3f) {
+				bad = true;
+				bad_amount = v;
+			}
+		}, amount);
+		if(bad) {
+			std::fprintf(stderr, "NANWATCH bad_register_demand_vec commodity=%u amount=%g\n", commodity_type.index(), bad_amount);
+			void* bt[20];
+			int n = backtrace(bt, 20);
+			backtrace_symbols_fd(bt, n, 2);
+			std::fflush(stderr);
+			std::abort();
+		}
+	}
 #ifndef NDEBUG
 	ve::apply(
 		[](float amount) {

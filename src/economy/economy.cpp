@@ -66,6 +66,13 @@ static bool const inventory_finance = []() {
 	auto s = std::getenv("ALICE_EXP_INVENTORY_FINANCE");
 	return s && std::atoi(s) != 0;
 }();
+// LOCAL EXPERIMENT (ALICE_EXP_RGO_FACTOR_INCOME=1): do not deduct the labour-price RGO wage from
+// the rgo bank; the whole producer revenue is distributed to the rgo/rent token pools, so the
+// RGO workers and landowners receive the factor income. Default 0 keeps upstream.
+static bool const rgo_factor_income = []() {
+	auto s = std::getenv("ALICE_EXP_RGO_FACTOR_INCOME");
+	return s && std::atoi(s) != 0;
+}();
 // LOCAL EXPERIMENT (ALICE_EXP_FINANCED_WAGE=1): pay factory wages from the day's actual inflow
 // (realised sales + cash-limited inventory credit), so the bank can never pay out its stock.
 static bool const financed_wage = []() {
@@ -3459,6 +3466,12 @@ float full_private_investment_cost(sys::state& state, dcon::nation_id n) {
 	return total;
 }
 
+// LOCAL DIAGNOSTIC switch; defined early because the consumption probes use it.
+static bool const nan_watch = []() {
+	auto s = std::getenv("ALICE_NAN_WATCH");
+	return s && std::atoi(s) != 0;
+}();
+
 void update_private_consumption(sys::state& state, dcon::nation_id n, float private_investment_scale) {
 	uint32_t total_commodities = state.world.commodity_size();
 	state.world.nation_for_each_state_ownership(n, [&](auto soid) {
@@ -3467,13 +3480,14 @@ void update_private_consumption(sys::state& state, dcon::nation_id n, float priv
 
 		for(uint32_t i = 1; i < total_commodities; ++i) {
 			dcon::commodity_id cid{ dcon::commodity_id::value_base_t(i) };
-			register_demand(
-				state,
-				market,
-				cid,
-				state.world.market_get_private_construction_demand(market, cid)
-				* private_investment_scale
-			);
+			auto const amount = state.world.market_get_private_construction_demand(market, cid) * private_investment_scale;
+			if(nan_watch && !std::isfinite(amount)) {
+				fprintf(stderr, "NANWATCH private_consumption nation=%u market=%u commodity=%u base=%g scale=%g\n",
+					n.index(), market.index(), cid.index(), state.world.market_get_private_construction_demand(market, cid), private_investment_scale);
+				std::fflush(stderr);
+				std::abort();
+			}
+			register_demand(state, market, cid, amount);
 		}
 	});
 }
@@ -3494,6 +3508,12 @@ void update_national_consumption(sys::state& state, dcon::nation_id n, float spe
 		for(uint32_t i = 1; i < total_commodities; ++i) {
 			dcon::commodity_id cid{ dcon::commodity_id::value_base_t(i) };
 			auto actual_stockpile_demand = economy::combined_government_stockpile_demand(state, market, cid);
+			if(nan_watch && !std::isfinite(actual_stockpile_demand * spending_scale)) {
+				fprintf(stderr, "NANWATCH national_consumption nation=%u market=%u commodity=%u stockpile_demand=%g spending_scale=%g base_budget=%g\n",
+					n.index(), market.index(), cid.index(), actual_stockpile_demand, spending_scale, base_budget);
+				std::fflush(stderr);
+				std::abort();
+			}
 			register_demand(
 			state,
 			market,
@@ -3519,15 +3539,14 @@ void update_national_consumption(sys::state& state, dcon::nation_id n, float spe
 					auto sat_importance = std::min(1.f, 1.f / (state.world.market_get_price(market, cid) + 0.001f));
 					auto sat_coefficient = (sat_importance + (1.f - sat_importance) * sat);
 
-					register_demand(
-						state,
-						market,
-						cid,
-						overseas_factor
-						* spending_scale
-						* o_spending
-						* sat_coefficient
-					);
+					auto const overseas_amount = overseas_factor * spending_scale * o_spending * sat_coefficient;
+					if(nan_watch && !std::isfinite(overseas_amount)) {
+						fprintf(stderr, "NANWATCH overseas_consumption nation=%u market=%u commodity=%u overseas_factor=%g spending_scale=%g o_spending=%g sat=%g\n",
+							n.index(), market.index(), cid.index(), overseas_factor, spending_scale, o_spending, sat_coefficient);
+						std::fflush(stderr);
+						std::abort();
+					}
+					register_demand(state, market, cid, overseas_amount);
 				}
 			}
 		}
@@ -4034,7 +4053,91 @@ static float previous_total;
 /*
 Funnily enough, this place is great to put logging into because of the passed name.
 */
+// LOCAL DIAGNOSTIC (ALICE_NAN_WATCH=1): scan primary economic state after each stage and abort at
+// the first non-finite value, reporting date/stage/entity. Read-only; no economic effect.
+static void nan_watch_scan(sys::state& state, char const* tag) {
+	if(!nan_watch)
+		return;
+	auto const ymd = state.current_date.to_ymd(state.start_date);
+	char d[32];
+	std::snprintf(d, sizeof(d), "%04d-%02d-%02d", ymd.year, ymd.month, ymd.day);
+	auto fail = [&](char const* what, uint32_t mi, uint32_t ci, float v) {
+		fprintf(stderr, "NANWATCH %s %s %s market=%u commodity=%u value=%g\n", d, tag, what, mi, ci, v);
+		std::fflush(stderr);
+		std::abort();
+	};
+	state.world.for_each_market([&](dcon::market_id m) {
+		auto const money = state.world.market_get_stockpile(m, economy::money);
+		if(!std::isfinite(money))
+			fail("market_money", m.index(), 0u, money);
+		for(uint32_t ki = 1; ki < state.world.commodity_size(); ++ki) {
+			dcon::commodity_id c{ dcon::commodity_id::value_base_t(ki) };
+			auto const pr = state.world.market_get_price(m, c);
+			if(!std::isfinite(pr))
+				fail("price", m.index(), ki, pr);
+			auto const st = state.world.market_get_stockpile(m, c);
+			if(!std::isfinite(st))
+				fail("stockpile", m.index(), ki, st);
+			auto const sp = state.world.market_get_supply(m, c);
+			if(!std::isfinite(sp))
+				fail("supply", m.index(), ki, sp);
+			auto const ad = state.world.market_get_army_demand(m, c);
+			if(!std::isfinite(ad))
+				fail("army_demand", m.index(), ki, ad);
+			auto const gd = state.world.market_get_government_construction_demand(m, c);
+			if(!std::isfinite(gd))
+				fail("gov_construction_demand", m.index(), ki, gd);
+			auto const sd = state.world.market_get_government_stockpile_demand(m, c);
+			if(!std::isfinite(sd))
+				fail("gov_stockpile_demand", m.index(), ki, sd);
+			auto const idm = state.world.market_get_intermediate_demand(m, c);
+			if(!std::isfinite(idm))
+				fail("intermediate_demand", m.index(), ki, idm);
+			auto const dm = state.world.market_get_demand(m, c);
+			if(!std::isfinite(dm))
+				fail("demand", m.index(), ki, dm);
+		}
+	});
+	state.world.for_each_province([&](dcon::province_id p) {
+		auto const rb = state.world.province_get_rgo_bank(p);
+		if(!std::isfinite(rb))
+			fail("rgo_bank", p.index(), 0u, rb);
+		auto const fb = state.world.province_get_factory_bank(p);
+		if(!std::isfinite(fb))
+			fail("factory_bank", p.index(), 0u, fb);
+		auto const ab = state.world.province_get_artisan_bank(p);
+		if(!std::isfinite(ab))
+			fail("artisan_bank", p.index(), 0u, ab);
+	});
+	state.world.for_each_pop([&](dcon::pop_id p) {
+		auto const sv = state.world.pop_get_savings(p);
+		if(!std::isfinite(sv) || sv < -1e-3f)
+			fail("pop_savings", p.index(), 0u, sv);
+	});
+	state.world.for_each_nation([&](dcon::nation_id n) {
+		auto const tr = state.world.nation_get_treasury(n);
+		if(!std::isfinite(tr))
+			fail("treasury", n.index(), 0u, tr);
+		auto const nb = state.world.nation_get_national_bank(n);
+		if(!std::isfinite(nb))
+			fail("national_bank", n.index(), 0u, nb);
+		auto const sl = state.world.nation_get_spending_level(n);
+		if(!std::isfinite(sl))
+			fail("spending_level", n.index(), 0u, sl);
+		auto const lb = state.world.nation_get_last_base_budget(n);
+		if(!std::isfinite(lb))
+			fail("last_base_budget", n.index(), 0u, lb);
+		auto const tp = state.world.nation_get_subsidy_token_price(n);
+		if(!std::isfinite(tp))
+			fail("subsidy_token_price", n.index(), 0u, tp);
+		auto const pi = state.world.nation_get_private_investment(n);
+		if(!std::isfinite(pi))
+			fail("private_investment", n.index(), 0u, pi);
+	});
+}
+
 static void set_profile_point(sys::state& state, std::string name) {
+	nan_watch_scan(state, name.c_str());
 	/*
 	nation_monetary_breakdown data{};
 	state.world.for_each_nation([&](auto n) {
@@ -5203,7 +5306,19 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 		float pi_total = full_private_investment_cost(state, n);
 		float perceived_spending = pi_total;
 		float pi_budget = state.world.nation_get_private_investment(n) * investment_pool_investment_per_day;
-		private_spending_scale = perceived_spending <= pi_budget ? 1.0f : pi_budget / perceived_spending;
+		// LOCAL FIX (not upstream): guard the ratio against a zero or slightly negative pool.
+		// Upstream divides by pi_total whenever it exceeds a negative budget, which yields -inf
+		// when pi_total == 0 and the investment pool has drifted a hair below zero; that -inf then
+		// poisons private construction demand and every downstream money aggregate with NaN.
+		// Semantics are unchanged whenever pi_total > 0: scale = min(1, budget / spend), >= 0.
+		if(perceived_spending <= 0.f) {
+			private_spending_scale = 1.f;
+		} else if(perceived_spending <= pi_budget) {
+			private_spending_scale = 1.f;
+		} else {
+			private_spending_scale = std::max(0.f, pi_budget) / perceived_spending;
+		}
+		assert(std::isfinite(private_spending_scale) && private_spending_scale >= 0.f && private_spending_scale <= 1.f);
 		state.world.nation_set_private_investment_effective_fraction(n, private_spending_scale);
 		state.world.nation_set_private_investment(
 			n,
@@ -7096,11 +7211,13 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 		{
 			if(seller_payout) {
 				auto rgo_wage_bill = 0.f;
-				state.world.for_each_commodity([&](dcon::commodity_id c) {
-					if(c == economy::money)
-						return;
-					rgo_wage_bill += economy::rgo_wage(state, c, pid);
-				});
+				if(!rgo_factor_income) {
+					state.world.for_each_commodity([&](dcon::commodity_id c) {
+						if(c == economy::money)
+							return;
+						rgo_wage_bill += economy::rgo_wage(state, c, pid);
+					});
+				}
 				auto current_bank = state.world.province_get_rgo_bank(pid);
 				state.world.province_set_rgo_bank(pid, current_bank - rgo_wage_bill);
 			} else {

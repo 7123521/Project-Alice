@@ -268,7 +268,28 @@ auto prepare_pop_budget_templated(
 	vectorized_pops_budget<VALUE> result{ };
 
 	auto pop_size = state.world.pop_get_size(ids);
-	auto savings = state.world.pop_get_savings(ids);
+	// LOCAL FIX (not upstream): spending ratios divide by savings; a negative or -epsilon
+	// balance would flip every ratio negative. Clamp the read only.
+	auto savings = adaptive_ve::max<VALUE>(0.f, state.world.pop_get_savings(ids));
+	// LOCAL DIAGNOSTIC (ALICE_NAN_WATCH=1): negative pop savings make every spending ratio and
+	// demand negative; report the first offending pop.
+	{
+		static bool const pops_nan_watch = []() {
+			auto env = std::getenv("ALICE_NAN_WATCH");
+			return env && std::atoi(env) != 0;
+		}();
+		if(pops_nan_watch) {
+			ve::apply([&](dcon::pop_id p, float sv, float sz) {
+				if(sv < -1e-3f) {
+					auto pt = state.world.pop_get_poptype(p);
+					std::fprintf(stderr, "NANWATCH negative_savings pop=%u poptype=%u size=%g savings=%g\n",
+						p.index(), pt.id.index(), sz, sv);
+					std::fflush(stderr);
+					std::abort();
+				}
+			}, ids, savings, pop_size);
+		}
+	}
 	auto provs = state.world.pop_get_province_from_pop_location(ids);
 	auto states = state.world.province_get_state_membership(provs);
 	auto markets = state.world.state_instance_get_market_from_local_market(states);
@@ -1718,7 +1739,12 @@ void update_income_national_subsidy(sys::state& state){
 			/ 100.f;
 
 
-		auto investment_dividents = (state.world.nation_get_private_investment(owners) + state.world.nation_get_national_bank(owners)) * investment_divident_rate;
+		// LOCAL FIX (not upstream): dividends cannot be paid out of a negative pool. When the
+		// national bank holds central-bank credit (a negative balance) the upstream expression
+		// pays a negative dividend, which drives pop savings below zero and from there every
+		// spending ratio and demand registration becomes negative.
+		auto investment_dividents = ve::max(ve::fp_vector{ 0.f },
+			state.world.nation_get_private_investment(owners) + state.world.nation_get_national_bank(owners)) * investment_divident_rate;
 		auto investment_budget =
 			owner_spending
 			* budget
