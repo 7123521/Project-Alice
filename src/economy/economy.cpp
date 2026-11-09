@@ -237,6 +237,91 @@ static float const cost_plus_speed = []() {
 	auto s = std::getenv("ALICE_COST_PLUS_SPEED");
 	return s ? std::clamp(float(std::atof(s)), 0.0001f, 1.f) : 0.02f;
 }();
+// LOCAL EXPERIMENT (ALICE_EXP_HOUSEHOLD_TRANSFER=1): the state redistributes a share of daily
+// cost-valued GDP from its cash balances to households, in proportion to population. Prices and
+// wages keep upstream behaviour; the transfer only monetises households so industrial sales can
+// rise. Cash-limited by treasury and national bank: no money is created.
+static bool const household_transfer = []() {
+	auto s = std::getenv("ALICE_EXP_HOUSEHOLD_TRANSFER");
+	return s && std::atoi(s) != 0;
+}();
+static float const household_transfer_rate = []() {
+	auto s = std::getenv("ALICE_HOUSEHOLD_TRANSFER_RATE");
+	return s ? std::clamp(float(std::atof(s)), 0.0001f, 1.f) : 0.1f;
+}();
+
+static void apply_household_transfer(sys::state& state) {
+	if(!household_transfer)
+		return;
+	double gdp = 0.0;
+	state.world.for_each_market([&](dcon::market_id m) {
+		for(uint32_t k = 1; k < state.world.commodity_size(); ++k) {
+			dcon::commodity_id c{ dcon::commodity_id::value_base_t(k) };
+			if(c == economy::money)
+				continue;
+			auto const sup = double(state.world.market_get_supply(m, c));
+			auto const cost = double(state.world.commodity_get_cost(c));
+			if(sup > 0.0 && cost > 0.0 && std::isfinite(sup))
+				gdp += sup * cost;
+		}
+	});
+	if(!(gdp > 0.0) || !std::isfinite(gdp))
+		return;
+	double const budget = double(household_transfer_rate) * gdp;
+	if(!(budget > 0.0) || !std::isfinite(budget))
+		return;
+
+	auto const nation_count = state.world.nation_size();
+	std::vector<double> pop_by_nation(size_t(nation_count), 0.0);
+	state.world.for_each_pop([&](dcon::pop_id p) {
+		auto const prov = state.world.pop_get_province_from_pop_location(p);
+		auto const n = state.world.province_get_nation_from_province_ownership(prov);
+		if(n && size_t(n.index()) < pop_by_nation.size())
+			pop_by_nation[size_t(n.index())] += double(state.world.pop_get_size(p));
+	});
+	double total_pop = 0.0;
+	for(auto v : pop_by_nation)
+		total_pop += v;
+	if(!(total_pop > 0.0) || !std::isfinite(total_pop))
+		return;
+
+	double const per_capita = budget / total_pop;
+	std::vector<double> per_capita_nation(size_t(nation_count), 0.0);
+	double transferred = 0.0;
+	state.world.for_each_nation([&](dcon::nation_id n) {
+		if(!state.world.nation_is_valid(n))
+			return;
+		auto const idx = size_t(n.index());
+		if(idx >= pop_by_nation.size() || !(pop_by_nation[idx] > 0.0))
+			return;
+		auto const desired = per_capita * pop_by_nation[idx];
+		auto const treasury = double(state.world.nation_get_treasury(n));
+		auto const bank = double(state.world.nation_get_national_bank(n));
+		auto const available = std::max(0.0, treasury) + std::max(0.0, bank);
+		auto const actual = std::min(desired, available);
+		if(!(actual > 0.0) || !std::isfinite(actual))
+			return;
+		auto const from_treasury = std::min(actual, std::max(0.0, treasury));
+		auto const from_bank = actual - from_treasury;
+		state.world.nation_set_treasury(n, float(double(state.world.nation_get_treasury(n)) - from_treasury));
+		state.world.nation_set_national_bank(n, float(double(state.world.nation_get_national_bank(n)) - from_bank));
+		per_capita_nation[idx] = actual / pop_by_nation[idx];
+		transferred += actual;
+	});
+	if(!(transferred > 0.0) || !std::isfinite(transferred))
+		return;
+	state.world.for_each_pop([&](dcon::pop_id p) {
+		auto const prov = state.world.pop_get_province_from_pop_location(p);
+		auto const n = state.world.province_get_nation_from_province_ownership(prov);
+		if(!n || size_t(n.index()) >= per_capita_nation.size())
+			return;
+		auto const per = per_capita_nation[size_t(n.index())];
+		if(!(per > 0.0))
+			return;
+		auto const size = double(state.world.pop_get_size(p));
+		state.world.pop_set_savings(p, float(double(state.world.pop_get_savings(p)) + size * per));
+	});
+}
 // LOCAL EXPERIMENT (ALICE_EXP_PRICE_INCOME_INDEX=1): re-index the price of labour by the same
 // output-price index, on the same day, so a change in the commodity price level does not change
 // real wages (and so nominal income can fund a cost-level basket). Default 0 = upstream.
@@ -7487,6 +7572,8 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 	});
 
 	set_profile_point(state, "tariffs");
+
+	apply_household_transfer(state);
 
 	
 
