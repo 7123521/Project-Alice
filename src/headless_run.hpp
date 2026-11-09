@@ -3,6 +3,7 @@
 // writes monthly CSVs (nations.csv, prices.csv, provinces.csv) on the 1st of each month.
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <string>
 
@@ -17,6 +18,8 @@
 #include "gamestate/commands.hpp"
 
 namespace headless {
+
+inline FILE* factory_trace_csv = nullptr;
 
 inline std::string ymd_str(sys::year_month_day d) {
 	char buf[16];
@@ -46,6 +49,26 @@ inline dcon::commodity_id find_good(sys::state& state, char const* name) {
 inline std::string csv_safe(std::string s) {
 	for(auto& c : s) if(c == ',' || c == '\n' || c == '\r') c = ' ';
 	return s;
+}
+
+inline void dump_factory_trace(sys::state& state, std::string const& date) {
+	if(!factory_trace_csv)
+		return;
+	state.world.for_each_factory([&](dcon::factory_id f) {
+		auto const location = state.world.factory_get_province_from_factory_location(f);
+		auto const owner = state.world.province_get_nation_from_province_ownership(location);
+		auto const ftid = state.world.factory_get_building_type(f);
+		auto const good = state.world.factory_type_get_output(ftid);
+		auto const d = economy::diagnose_factory(state, f);
+		fprintf(factory_trace_csv,
+			"%s,%d,%s,%s,%s,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g\n",
+			date.c_str(), f.index(), tag_of(state, owner).c_str(),
+			text::produce_simple_string(state, state.world.province_get_name(location)).c_str(),
+			text::produce_simple_string(state, state.world.commodity_get_name(good)).c_str(),
+			double(state.world.factory_get_size(f)), double(d.output_per_worker), double(d.output_price),
+			double(d.input_cost_per_worker), double(d.wage_per_worker), double(d.profit), double(d.tokens), double(d.expand_priority));
+	});
+	fflush(factory_trace_csv);
 }
 
 inline void dump_month(sys::state& state, FILE* nations_csv, FILE* prices_csv, FILE* provinces_csv, FILE* markets_csv, FILE* welfare_csv, FILE* summary_csv, std::string const& date) {
@@ -780,6 +803,12 @@ inline void run(sys::state& state, int years, std::string const& dump_dir) {
 		markets_csv = fopen((dump_dir + "/markets.csv").c_str(), "w");
 		routes_csv = fopen((dump_dir + "/routes.csv").c_str(), "w");
 		wars_csv = fopen((dump_dir + "/wars.csv").c_str(), "w");
+		factory_trace_csv = nullptr;
+		if(std::getenv("ALICE_TRACE_FACTORY")) {
+			factory_trace_csv = fopen((dump_dir + "/factory_trace.csv").c_str(), "w");
+			if(factory_trace_csv)
+				fprintf(factory_trace_csv, "date,factory,owner,province,good,size,output_per_worker,output_price,input_cost_per_worker,wage_per_worker,profit,tokens,expand_priority\n");
+		}
 		// Static province map, written once: map pixel -> province id (id 0 = sea/uncolonised).
 		{
 			FILE* map_file = fopen((dump_dir + "/province_map.bin").c_str(), "wb");
@@ -824,6 +853,7 @@ inline void run(sys::state& state, int years, std::string const& dump_dir) {
 	fflush(stdout);
 	if(nations_csv)
 		dump_month(state, nations_csv, prices_csv, provinces_csv, markets_csv, welfare_csv, summary_csv, ymd_str(start));
+	dump_factory_trace(state, ymd_str(start));
 	dump_routes(state, routes_csv, ymd_str(start));
 	dump_wars(state, wars_csv, ymd_str(start));
 
@@ -836,6 +866,7 @@ inline void run(sys::state& state, int years, std::string const& dump_dir) {
 		auto ymd = state.current_date.to_ymd(state.start_date);
 		if(ymd.day == 1 && nations_csv) {
 			dump_month(state, nations_csv, prices_csv, provinces_csv, markets_csv, welfare_csv, summary_csv, ymd_str(ymd));
+			dump_factory_trace(state, ymd_str(ymd));
 			fflush(nations_csv);
 			fflush(prices_csv);
 			fflush(provinces_csv);
@@ -869,6 +900,7 @@ inline void run(sys::state& state, int years, std::string const& dump_dir) {
 	if(wars_csv) fclose(wars_csv);
 	if(welfare_csv) fclose(welfare_csv);
 	if(summary_csv) fclose(summary_csv);
+	if(factory_trace_csv) fclose(factory_trace_csv);
 }
 
 } // namespace headless

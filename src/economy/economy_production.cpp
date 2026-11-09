@@ -27,6 +27,15 @@ uint32_t size(sys::state const& state) {
 
 namespace economy {
 
+// LOCAL EXPERIMENT (ALICE_EXP_PROFIT_INVESTMENT=1): factory investment tokens and expansion
+// priority use actual per-worker profit (output revenue - input cost - wage), not gross output
+// revenue. Profitable factories expand; unprofitable ones do not attract investment. Default 0
+// keeps upstream behaviour.
+static bool const profit_investment = []() {
+	auto s = std::getenv("ALICE_EXP_PROFIT_INVESTMENT");
+	return s && std::atoi(s) != 0;
+}();
+
 constexpr float base_expansion_scale = 10.f;
 
 /*
@@ -1252,9 +1261,12 @@ float factory_investment_tokens(
 	auto time = state.world.factory_type_get_construction_time(factory_type);
 	auto per_worker_output_cost = state.world.factory_get_output_per_worker(factory) * state.world.market_get_price(market, output_type);
 	auto per_worker_input_cost = state.world.factory_get_input_cost_per_worker(factory);
-	auto profit = per_worker_output_cost;
+	auto per_worker_wage = get_total_wage(state, factory) / std::max(1.f, size);
+	auto profit = per_worker_output_cost - per_worker_input_cost - per_worker_wage;
+	if(!profit_investment)
+		profit = per_worker_output_cost;
 
-	return  factory_priority_bonus * (profit + subsidy);
+	return  factory_priority_bonus * (std::max(0.f, profit) + subsidy);
 }
 
 float rgo_investment_tokens(
@@ -1318,6 +1330,27 @@ inline float investment_expand_factory_priority(
 	return std::clamp((factory_total_desired_employment(state, factory) - 0.8f * size) * 5.f / (size + 1.f), 0.f, 1.f);
 }
 
+factory_diagnostic diagnose_factory(sys::state const& state, dcon::factory_id f) {
+	auto const location = state.world.factory_get_province_from_factory_location(f);
+	auto const nation = state.world.province_get_nation_from_province_ownership(location);
+	auto const zone = state.world.province_get_state_membership(location);
+	auto const market = state.world.state_instance_get_market_from_local_market(zone);
+	auto const ftid = state.world.factory_get_building_type(f);
+	auto const output_commodity = state.world.factory_type_get_output(ftid);
+	auto const size = state.world.factory_get_size(f);
+	factory_diagnostic result;
+	result.output_per_worker = state.world.factory_get_output_per_worker(f);
+	result.input_cost_per_worker = state.world.factory_get_input_cost_per_worker(f);
+	result.wage_per_worker = get_total_wage(state, f) / std::max(1.f, size);
+	result.output_price = state.world.market_get_price(market, output_commodity);
+	result.profit = result.output_per_worker * result.output_price - result.input_cost_per_worker - result.wage_per_worker;
+	result.tokens = factory_investment_tokens(state, nation, location, f);
+	result.expand_priority = investment_expand_factory_priority(state, f);
+	if(profit_investment && result.profit <= 0.f)
+		result.expand_priority = 0.f;
+	return result;
+}
+
 void update_production_investement_consumption(
 	sys::state& state
 ) {
@@ -1365,11 +1398,14 @@ void update_production_investement_consumption(
 			auto base_size = state.world.factory_type_get_base_workforce(factory_type);
 			auto per_worker_output_cost = state.world.factory_get_output_per_worker(factory) * state.world.market_get_price(market, output_type);
 			auto per_worker_input_cost = state.world.factory_get_input_cost_per_worker(factory);
-			auto profit = per_worker_output_cost; // - per_worker_input_cost - state.world.province_get_labor_price(province, economy::labor::basic_education);
+			auto per_worker_wage = get_total_wage(state, factory) / std::max(1.f, size);
+			auto profit = per_worker_output_cost - per_worker_input_cost - per_worker_wage;
 
 			// SIZE
 
 			float expand_priority = investment_expand_factory_priority(state, factory);
+			if(profit_investment && profit <= 0.f)
+				expand_priority = 0.f;
 
 			if(expand_priority > 0.f) {
 				auto investment = available_investment * factory_tokens / total_tokens * expand_priority;

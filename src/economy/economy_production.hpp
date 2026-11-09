@@ -353,6 +353,18 @@ breakdown_commodity explain_output(sys::state& state, dcon::commodity_id c, dcon
 breakdown_commodity explain_output(sys::state& state, dcon::commodity_id c);
 
 
+struct factory_diagnostic {
+	float output_per_worker = 0.f;
+	float input_cost_per_worker = 0.f;
+	float wage_per_worker = 0.f;
+	float output_price = 0.f;
+	float profit = 0.f;
+	float tokens = 0.f;
+	float expand_priority = 0.f;
+};
+
+factory_diagnostic diagnose_factory(sys::state const& state, dcon::factory_id f);
+
 namespace gdp {
 float value_nation(sys::state& state, dcon::nation_id n);
 float value_market(sys::state& state, dcon::market_id n);
