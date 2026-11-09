@@ -134,6 +134,51 @@ static FILE* grain_flow_file = nullptr;
 static bool grain_flow_file_init = false;
 static std::string last_grain_flow_date;
 static std::vector<float> prev_grain_stockpile;
+static bool const trace_price_decomp = []() {
+	auto s = std::getenv("ALICE_TRACE_PRICE_DECOMP");
+	return s && std::atoi(s) != 0;
+}();
+static FILE* price_decomp_file = nullptr;
+static bool price_decomp_file_init = false;
+static std::string last_price_decomp_date;
+static std::vector<dcon::commodity_id> price_decomp_goods;
+static bool price_decomp_goods_init = false;
+
+static void init_price_decomp_goods(sys::state& state) {
+	if(price_decomp_goods_init)
+		return;
+	price_decomp_goods_init = true;
+	auto const list = std::getenv("ALICE_PRICE_DECOMP_GOODS");
+	if(!list)
+		return;
+	std::string names(list);
+	size_t start = 0;
+	while(start < names.size()) {
+		auto const end = names.find(',', start);
+		auto token = names.substr(start, end == std::string::npos ? std::string::npos : end - start);
+		std::string lower = token;
+		std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char ch) { return char(std::tolower(ch)); });
+		while(!lower.empty() && lower.front() == ' ')
+			lower.erase(lower.begin());
+		while(!lower.empty() && lower.back() == ' ')
+			lower.pop_back();
+		if(!lower.empty()) {
+			state.world.for_each_commodity([&](dcon::commodity_id c) {
+				if(c == economy::money)
+					return;
+				auto const name = text::produce_simple_string(state, state.world.commodity_get_name(c));
+				std::string n = name;
+				std::transform(n.begin(), n.end(), n.begin(), [](unsigned char ch) { return char(std::tolower(ch)); });
+				if(n.find(lower) != std::string::npos && std::find(price_decomp_goods.begin(), price_decomp_goods.end(), c) == price_decomp_goods.end())
+					price_decomp_goods.push_back(c);
+			});
+		}
+		if(end == std::string::npos)
+			break;
+		start = end + 1;
+	}
+}
+
 static bool const trace_pop_demand = []() {
 	auto s = std::getenv("ALICE_TRACE_POP_DEMAND");
 	return s && std::atoi(s) != 0;
@@ -404,6 +449,55 @@ static void dump_grain_flow_trace(sys::state& state, sys::year_month_day const& 
 			double(state.world.market_get_actual_probability_to_buy(m, grain)), double(state.world.market_get_actual_probability_to_sell(m, grain)));
 	});
 	fflush(grain_flow_file);
+}
+
+static void dump_price_decomp_trace(sys::state& state, sys::year_month_day const& ymd) {
+	if(!trace_price_decomp || ymd.day != 1)
+		return;
+	init_price_decomp_goods(state);
+	if(price_decomp_goods.empty())
+		return;
+	if(!price_decomp_file_init) {
+		price_decomp_file_init = true;
+		auto const path = std::getenv("ALICE_PRICE_DECOMP_FILE");
+		if(path) {
+			price_decomp_file = fopen(path, "w");
+			if(price_decomp_file)
+				fprintf(price_decomp_file, "date,market,owner_index,good,price,base_cost,price_over_cost,confidence,agg_supply,agg_demand,supply,demand,stockpile,stockpile_sales,consumption,expected_buy,expected_sell,actual_buy,actual_sell,life_weight,everyday_weight,luxury_weight,price_change,at_floor\n");
+		}
+	}
+	if(!price_decomp_file)
+		return;
+	char datebuf[16];
+	std::snprintf(datebuf, sizeof(datebuf), "%04d-%02d-%02d", ymd.year, ymd.month, ymd.day);
+	if(last_price_decomp_date == datebuf)
+		return;
+	last_price_decomp_date = datebuf;
+	for(auto const c : price_decomp_goods) {
+		auto const base_cost = state.world.commodity_get_cost(c);
+		auto const good_name = text::produce_simple_string(state, state.world.commodity_get_name(c));
+		state.world.for_each_market([&](dcon::market_id m) {
+			auto const price = state.world.market_get_price(m, c);
+			auto const agg_supply = state.world.market_get_aggregated_supply_history(m, c);
+			auto const agg_demand = state.world.market_get_aggregated_demand_history(m, c);
+			auto const change = price_properties::commodity::change<float>(price, agg_supply, agg_demand);
+			auto const zone = state.world.market_get_zone_from_local_market(m);
+			auto const owner = state.world.state_instance_get_nation_from_state_ownership(zone);
+			auto const at_floor = price < 1e-9f ? 1 : 0;
+			fprintf(price_decomp_file, "%s,%d,%d,%s,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%d\n",
+				datebuf, int(m.index()), int(owner.index()), good_name.c_str(),
+				double(price), double(base_cost), double(price / std::max(1e-12f, base_cost)),
+				double(state.world.market_get_price_confidence(m, c)), double(agg_supply), double(agg_demand),
+				double(state.world.market_get_supply(m, c)), double(state.world.market_get_demand(m, c)),
+				double(state.world.market_get_stockpile(m, c)), double(state.world.market_get_stockpile_sales(m, c)),
+				double(state.world.market_get_consumption(m, c)),
+				double(state.world.market_get_expected_probability_to_buy(m, c)), double(state.world.market_get_expected_probability_to_sell(m, c)),
+				double(state.world.market_get_actual_probability_to_buy(m, c)), double(state.world.market_get_actual_probability_to_sell(m, c)),
+				double(state.world.market_get_life_needs_weights(m, c)), double(state.world.market_get_everyday_needs_weights(m, c)), double(state.world.market_get_luxury_needs_weights(m, c)),
+				double(change), at_floor);
+		});
+	}
+	fflush(price_decomp_file);
 }
 
 static void dump_pop_demand_probe(sys::state& state, sys::year_month_day const& ymd) {
@@ -4965,6 +5059,7 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 	dump_market_flow_trace(state, trace_ymd);
 	dump_grain_trace(state, trace_ymd);
 	dump_grain_flow_trace(state, trace_ymd);
+	dump_price_decomp_trace(state, trace_ymd);
 	dump_pop_demand_probe(state, trace_ymd);
 	dump_rgo_subsistence_trace(state, trace_ymd);
 	dump_labor_reservation_trace(state, trace_ymd);
