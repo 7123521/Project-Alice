@@ -24,6 +24,8 @@
 #include "commands.hpp"
 #include <vector>
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include "economy_pops_constants.hpp"
 #include "economy_templates.hpp"
 #include "economy_templates_pure.hpp"
@@ -73,6 +75,136 @@ float total_foreign_settlement() {
 	for(float v : foreign_settlement)
 		total += v;
 	return total;
+}
+
+// LOCAL TRACE (ALICE_TRACE_MARKET_FLOW / ALICE_TRACE_GRAIN): monthly per-market flow identity
+// and grain price decomposition. Read-only; no economic effect.
+static bool const trace_market_flow = []() {
+	auto s = std::getenv("ALICE_TRACE_MARKET_FLOW");
+	return s && std::atoi(s) != 0;
+}();
+static bool const trace_grain = []() {
+	auto s = std::getenv("ALICE_TRACE_GRAIN");
+	return s && std::atoi(s) != 0;
+}();
+
+struct market_flow_snapshot {
+	float money_before = 0.f;
+	float money_after = 0.f;
+	float sales = 0.f;
+	float purchases = 0.f;
+	float exports = 0.f;
+	float imports = 0.f;
+	float investments = 0.f;
+	float unused_dividends = 0.f;
+	float dividends = 0.f;
+	float reinvest = 0.f;
+	float debt = 0.f;
+	float ship_build = 0.f;
+	float ship_maint = 0.f;
+	float refund = 0.f;
+	float arb_pos = 0.f;
+	float arb_neg = 0.f;
+	float payout = 0.f;
+};
+static std::vector<market_flow_snapshot> market_flow_snap;
+static FILE* market_flow_file = nullptr;
+static bool market_flow_file_init = false;
+static FILE* grain_trace_file = nullptr;
+static bool grain_trace_file_init = false;
+static dcon::commodity_id grain_commodity{};
+static bool grain_commodity_init = false;
+
+static void init_grain_commodity(sys::state& state) {
+	if(grain_commodity_init)
+		return;
+	grain_commodity_init = true;
+	state.world.for_each_commodity([&](dcon::commodity_id c) {
+		if(grain_commodity || c == economy::money)
+			return;
+		auto const name = text::produce_simple_string(state, state.world.commodity_get_name(c));
+		std::string lower = name;
+		std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char ch) { return char(std::tolower(ch)); });
+		if(lower.find("grain") != std::string::npos)
+			grain_commodity = c;
+	});
+}
+
+static void dump_market_flow_trace(sys::state& state, sys::year_month_day const& ymd) {
+	if(!trace_market_flow || ymd.day != 1)
+		return;
+	if(!market_flow_file_init) {
+		market_flow_file_init = true;
+		auto const path = std::getenv("ALICE_MARKET_FLOW_FILE");
+		if(path) {
+			market_flow_file = fopen(path, "w");
+			if(market_flow_file)
+				fprintf(market_flow_file, "date,market,owner_index,money_before,money_after,delta,sales,purchases,exports,imports,investments,unused_dividends,dividends,reinvest,debt,ship_build,ship_maint,refund,arb_pos,arb_neg,payout,residual\n");
+		}
+	}
+	if(!market_flow_file)
+		return;
+	char datebuf[16];
+	std::snprintf(datebuf, sizeof(datebuf), "%04d-%02d-%02d", ymd.year, ymd.month, ymd.day);
+	auto const n = std::min(market_flow_snap.size(), size_t(state.world.market_size()));
+	for(size_t i = 0; i < n; ++i) {
+		auto const& f = market_flow_snap[i];
+		auto const delta = f.money_after - f.money_before;
+		auto const expected = f.arb_pos - f.arb_neg + f.exports + f.investments + f.unused_dividends + f.sales
+			+ f.refund - f.imports - f.purchases - f.dividends - f.ship_build - f.ship_maint - f.payout;
+		auto const residual = delta - expected;
+		auto const m = dcon::market_id{dcon::market_id::value_base_t(i)};
+		auto const zone = state.world.market_get_zone_from_local_market(m);
+		auto const owner = state.world.state_instance_get_nation_from_state_ownership(zone);
+		fprintf(market_flow_file, "%s,%d,%d,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g\n",
+			datebuf, int(i), owner.index(),
+			double(f.money_before), double(f.money_after), double(delta), double(f.sales), double(f.purchases),
+			double(f.exports), double(f.imports), double(f.investments), double(f.unused_dividends), double(f.dividends),
+			double(f.reinvest), double(f.debt), double(f.ship_build), double(f.ship_maint), double(f.refund),
+			double(f.arb_pos), double(f.arb_neg), double(f.payout), double(residual));
+	}
+	fflush(market_flow_file);
+	std::fill(market_flow_snap.begin(), market_flow_snap.end(), market_flow_snapshot{});
+}
+
+static void dump_grain_trace(sys::state& state, sys::year_month_day const& ymd) {
+	if(!trace_grain || ymd.day != 1)
+		return;
+	init_grain_commodity(state);
+	if(!grain_commodity)
+		return;
+	if(!grain_trace_file_init) {
+		grain_trace_file_init = true;
+		auto const path = std::getenv("ALICE_GRAIN_TRACE_FILE");
+		if(path) {
+			grain_trace_file = fopen(path, "w");
+			if(grain_trace_file)
+				fprintf(grain_trace_file, "date,market,owner_index,price,agg_supply,agg_demand,supply,demand,stockpile,stockpile_sales,consumption,expected_buy,expected_sell,actual_buy,actual_sell,price_change\n");
+		}
+	}
+	if(!grain_trace_file)
+		return;
+	char datebuf[16];
+	std::snprintf(datebuf, sizeof(datebuf), "%04d-%02d-%02d", ymd.year, ymd.month, ymd.day);
+	state.world.for_each_market([&](dcon::market_id m) {
+		auto const price = state.world.market_get_price(m, grain_commodity);
+		auto const agg_supply = state.world.market_get_aggregated_supply_history(m, grain_commodity);
+		auto const agg_demand = state.world.market_get_aggregated_demand_history(m, grain_commodity);
+		auto const price_change = price_properties::commodity::change<float>(price, agg_supply, agg_demand);
+		auto const zone = state.world.market_get_zone_from_local_market(m);
+		auto const owner = state.world.state_instance_get_nation_from_state_ownership(zone);
+		fprintf(grain_trace_file, "%s,%d,%d,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g\n",
+			datebuf, m.index(), owner.index(), double(price), double(agg_supply), double(agg_demand),
+			double(state.world.market_get_supply(m, grain_commodity)), double(state.world.market_get_demand(m, grain_commodity)),
+			double(state.world.market_get_stockpile(m, grain_commodity)), double(state.world.market_get_stockpile_sales(m, grain_commodity)),
+			double(state.world.market_get_consumption(m, grain_commodity)),
+			double(state.world.market_get_expected_probability_to_buy(m, grain_commodity)),
+			double(state.world.market_get_expected_probability_to_sell(m, grain_commodity)),
+			double(state.world.market_get_actual_probability_to_buy(m, grain_commodity)),
+			double(state.world.market_get_actual_probability_to_sell(m, grain_commodity)),
+			double(price_change));
+	});
+	fflush(grain_trace_file);
 }
 
 // LOCAL EXPERIMENT (ALICE_EXP_SELLER_PAYOUT): value-weighted producer shares per market and
@@ -4140,6 +4272,12 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 		state.world.market_set_weighted_port_price_cost(mid, current_weight == 0.f ? 0.f : local_price * local_weight / current_weight);
 	});
 
+	auto const trace_ymd = state.current_date.to_ymd(state.start_date);
+	if(trace_market_flow && market_flow_snap.size() < size_t(state.world.market_size()))
+		market_flow_snap.assign(size_t(state.world.market_size()), market_flow_snapshot{});
+	dump_market_flow_trace(state, trace_ymd);
+	dump_grain_trace(state, trace_ymd);
+
 	if(seller_payout) {
 		auto const today = state.current_date.to_ymd(state.start_date);
 		auto const key = int(today.year) * 12 + int(today.month);
@@ -4152,6 +4290,7 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 		auto nation = state.world.state_instance_get_nation_from_state_ownership(area);
 
 		auto budget = state.world.market_get_stockpile(market, economy::money);
+		auto const money_before = budget;
 
 		auto arbitrage = state.world.market_get_arbitrage(market);
 		auto investments = state.world.market_get_pop_investments(market);
@@ -4284,7 +4423,8 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 
 		auto refund = state.world.market_get_shipbuilding_refund(market);
 
-		state.world.market_set_stockpile(market, economy::money, budget + refund + earn - spend);
+		auto const next_money = budget + refund + earn - spend;
+		state.world.market_set_stockpile(market, economy::money, next_money);
 
 		if(seller_payout) {
 			ve::apply([&](dcon::market_id m, float sold) {
@@ -4303,6 +4443,8 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 				if(!(pay > 0.f))
 					return;
 				state.world.market_set_stockpile(m, economy::money, money - pay);
+				if(trace_market_flow && size_t(m.index()) < market_flow_snap.size())
+					market_flow_snap[size_t(m.index())].payout += pay;
 				for(auto const& ps : entry.provinces) {
 					auto const own = ps.rgo + ps.guild + ps.factory;
 					if(!(own > 0.f) || !std::isfinite(own))
@@ -4318,6 +4460,31 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 						state.world.province_set_factory_bank(ps.province, state.world.province_get_factory_bank(ps.province) + amount * ps.factory / own);
 				}
 			}, market, sales);
+		}
+
+		if(trace_market_flow) {
+			auto add_flow = [&](float market_flow_snapshot::*field, auto vec) {
+				ve::apply([&](dcon::market_id m, float v) {
+					if(size_t(m.index()) < market_flow_snap.size())
+						market_flow_snap[size_t(m.index())].*field += v;
+				}, market, vec);
+			};
+			add_flow(&market_flow_snapshot::money_before, money_before);
+			add_flow(&market_flow_snapshot::money_after, next_money);
+			add_flow(&market_flow_snapshot::sales, sales);
+			add_flow(&market_flow_snapshot::purchases, purchases);
+			add_flow(&market_flow_snapshot::exports, export_gains);
+			add_flow(&market_flow_snapshot::imports, import_spent);
+			add_flow(&market_flow_snapshot::investments, investments);
+			add_flow(&market_flow_snapshot::unused_dividends, unused_dividends);
+			add_flow(&market_flow_snapshot::dividends, next_dividends);
+			add_flow(&market_flow_snapshot::reinvest, reinvestment);
+			add_flow(&market_flow_snapshot::debt, debt_payment);
+			add_flow(&market_flow_snapshot::ship_build, ship_building_spend);
+			add_flow(&market_flow_snapshot::ship_maint, ship_maintenance_spend);
+			add_flow(&market_flow_snapshot::refund, refund);
+			add_flow(&market_flow_snapshot::arb_pos, ve::select(arbitrage > 0.f, arbitrage, 0.f));
+			add_flow(&market_flow_snapshot::arb_neg, ve::select(arbitrage > 0.f, 0.f, -arbitrage));
 		}
 
 		state.world.market_set_total_earn(market, earn);
