@@ -360,6 +360,10 @@ struct factory_diagnostic {
 	float output_price = 0.f;
 	float profit = 0.f;
 	float profit_per_capacity = 0.f;
+	float actual_output_per_capacity = 0.f;
+	float actual_probability_to_sell = 0.f;
+	float employment_ratio = 0.f;
+	float subsidy = 0.f;
 	float desired_employment = 0.f;
 	float construction_cost_per_capacity = 0.f;
 	float tokens = 0.f;

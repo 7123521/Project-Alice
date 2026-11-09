@@ -1359,7 +1359,15 @@ factory_diagnostic diagnose_factory(sys::state const& state, dcon::factory_id f)
 	result.wage_per_worker = get_total_wage(state, f) / std::max(1.f, size);
 	result.output_price = state.world.market_get_price(market, output_commodity);
 	result.profit = result.output_per_worker * result.output_price - result.input_cost_per_worker - result.wage_per_worker;
-	result.profit_per_capacity = explain_last_factory_profit(state, f).profit / std::max(1.f, size);
+	auto const profit_explanation = explain_last_factory_profit(state, f);
+	result.profit_per_capacity = profit_explanation.profit / std::max(1.f, size);
+	result.subsidy = profit_explanation.subsidy;
+	result.actual_output_per_capacity = state.world.factory_get_output(f) / std::max(1.f, size);
+	result.actual_probability_to_sell = state.world.market_get_actual_probability_to_sell(market, output_commodity);
+	auto const employment = state.world.factory_get_unqualified_employment(f)
+		+ state.world.factory_get_primary_employment(f)
+		+ state.world.factory_get_secondary_employment(f);
+	result.employment_ratio = employment / std::max(1.f, size);
 	result.desired_employment = factory_total_desired_employment(state, f);
 	auto const& costs = state.world.factory_type_get_construction_costs(ftid);
 	auto const costs_data = get_inputs_data(state, market, costs);
