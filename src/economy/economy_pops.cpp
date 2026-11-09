@@ -15,6 +15,17 @@
 #include <string>
 #include <algorithm>
 
+// LOCAL TRACE (ALICE_TRACE_POP_BUDGET=1): per-day totals of the pops' required basket cost,
+// spending, savings and money income, written on the first day of each month. Read-only.
+static bool const pop_budget_trace = []() {
+	auto env = std::getenv("ALICE_TRACE_POP_BUDGET");
+	return env && std::atoi(env) != 0;
+}();
+static FILE* pop_budget_file = nullptr;
+static bool pop_budget_file_init = false;
+static double trace_daily_wage_income = 0.0;
+static double trace_daily_property_income = 0.0;
+
 namespace economy {
 namespace pops {
 
@@ -727,6 +738,23 @@ void update_consumption(
 	if(les_income_budget)
 		market_disposable.assign(state.world.market_size(), 0.f);
 
+	static ve::vectorizable_buffer<float, dcon::pop_id> trace_required(uint32_t(1));
+	static ve::vectorizable_buffer<float, dcon::pop_id> trace_required_life(uint32_t(1));
+	static ve::vectorizable_buffer<float, dcon::pop_id> trace_spent(uint32_t(1));
+	static ve::vectorizable_buffer<float, dcon::pop_id> trace_spent_life(uint32_t(1));
+	static ve::vectorizable_buffer<float, dcon::pop_id> trace_savings(uint32_t(1));
+	static ve::vectorizable_buffer<float, dcon::pop_id> trace_ratio_life(uint32_t(1));
+	static uint32_t trace_pop_count = 1;
+	if(pop_budget_trace && state.world.pop_size() > trace_pop_count) {
+		trace_required = state.world.pop_make_vectorizable_float_buffer();
+		trace_required_life = state.world.pop_make_vectorizable_float_buffer();
+		trace_spent = state.world.pop_make_vectorizable_float_buffer();
+		trace_spent_life = state.world.pop_make_vectorizable_float_buffer();
+		trace_savings = state.world.pop_make_vectorizable_float_buffer();
+		trace_ratio_life = state.world.pop_make_vectorizable_float_buffer();
+		trace_pop_count = state.world.pop_size();
+	}
+
 	state.world.execute_parallel_over_pop([&](auto ids) {
 		auto pop_size = state.world.pop_get_size(ids);
 
@@ -735,6 +763,16 @@ void update_consumption(
 
 		// get all data into vectors
 		vectorized_pops_budget<ve::fp_vector> data = prepare_pop_budget_templated(state, ids);
+
+		if(pop_budget_trace) {
+			trace_required.set(ids,
+				data.life_needs.required + data.everyday_needs.required + data.luxury_needs.required);
+			trace_required_life.set(ids, data.life_needs.required);
+			trace_spent.set(ids, data.spent_total);
+			trace_spent_life.set(ids, data.life_needs.spent);
+			trace_savings.set(ids, state.world.pop_get_savings(ids));
+			trace_ratio_life.set(ids, data.life_needs.satisfied_with_money_ratio);
+		}
 
 		// "for free" in the context of life/everyday/luxury needs means subsistence/gifts
 		// so we apply it directly there, it's not registered as demand
@@ -1076,6 +1114,54 @@ void update_consumption(
 		});
 	});
 
+	if(pop_budget_trace) {
+		if(!pop_budget_file_init) {
+			pop_budget_file_init = true;
+			auto const path = std::getenv("ALICE_POP_BUDGET_FILE");
+			if(path)
+				pop_budget_file = fopen(path, "w");
+			if(pop_budget_file)
+				fprintf(pop_budget_file, "date,pops,savings,required,required_life,spent,spent_life,ratio_life,wage_income,property_income,ratio_weighted,share_below25,share_below50,share_below100\n");
+		}
+		auto const ymd = state.current_date.to_ymd(state.start_date);
+		if(pop_budget_file && ymd.day == 1) {
+			double req = 0.0, req_life = 0.0, spent = 0.0, spent_life = 0.0, savings = 0.0, ratio = 0.0;
+			double ratio_w_num = 0.0, ratio_w_den = 0.0;
+			double below25 = 0.0, below50 = 0.0, below75 = 0.0, below100 = 0.0;
+			uint32_t count = 0;
+			state.world.execute_serial_over_pop([&](auto ids) {
+				ve::apply([&](float a, float b, float c, float d, float e, float g) {
+					req += double(a);
+					req_life += double(b);
+					spent += double(c);
+					spent_life += double(d);
+					savings += double(e);
+					ratio += double(g);
+					++count;
+					if(b > 0.f) {
+						ratio_w_num += double(b) * double(g);
+						ratio_w_den += double(b);
+						if(g < 0.25f) below25 += double(b);
+						if(g < 0.50f) below50 += double(b);
+						if(g < 0.75f) below75 += double(b);
+						if(g < 1.00f) below100 += double(b);
+					}
+				}, trace_required.get(ids), trace_required_life.get(ids), trace_spent.get(ids),
+					trace_spent_life.get(ids), trace_savings.get(ids), trace_ratio_life.get(ids));
+			});
+			char datebuf[16];
+			std::snprintf(datebuf, sizeof(datebuf), "%04d-%02d-%02d", ymd.year, ymd.month, ymd.day);
+			fprintf(pop_budget_file, "%s,%u,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g\n",
+				datebuf, count, savings, req, req_life, spent, spent_life,
+				count > 0 ? ratio / double(count) : 0.0,
+				trace_daily_wage_income, trace_daily_property_income,
+				ratio_w_den > 0.0 ? ratio_w_num / ratio_w_den : 0.0,
+				ratio_w_den > 0.0 ? below25 / ratio_w_den : 0.0,
+				ratio_w_den > 0.0 ? below50 / ratio_w_den : 0.0,
+				ratio_w_den > 0.0 ? below100 / ratio_w_den : 0.0);
+			fflush(pop_budget_file);
+		}
+	}
 }
 
 float estimate_artisan_income(sys::state const& state, dcon::province_id pid, dcon::pop_type_id ptid, float size) {
@@ -1566,6 +1652,9 @@ void update_income_non_labor(sys::state& state) {
 		auto total = from_rgo + from_rent + from_market + from_factories + from_market_national;
 #endif // !NDEBUG
 		state.world.pop_set_savings(pop_vector, initial_savings + total_income);
+		if(pop_budget_trace) {
+			ve::apply([&](float v) { trace_daily_property_income += double(v); }, total_income);
+		}
 	});
 
 	/*
@@ -2149,6 +2238,14 @@ void update_income_wages(sys::state& state){
 		ve::apply([](float v) { assert(std::isfinite(v) && v >= 0); }, wage + savings);
 #endif // !NDEBUG
 	});
+
+	if(pop_budget_trace) {
+		double sum = 0.0;
+		state.world.execute_serial_over_pop([&](auto ids) {
+			ve::apply([&](float v) { sum += double(v); }, pop_wage_income.get(ids));
+		});
+		trace_daily_wage_income = sum;
+	}
 
 	market_poptype_wage_stride = int(state.world.pop_type_size());
 	market_poptype_wage.assign(size_t(state.world.market_size()) * size_t(market_poptype_wage_stride), 0.f);
