@@ -759,6 +759,21 @@ static bool const weight_normalize = []() {
 	auto s = std::getenv("ALICE_EXP_WEIGHT_NORMALIZE");
 	return s && std::atoi(s) != 0;
 }();
+static bool const demand_share = []() {
+	auto s = std::getenv("ALICE_EXP_DEMAND_SHARE");
+	return s && std::atoi(s) != 0;
+}();
+static float const demand_share_elasticity = []() {
+	auto s = std::getenv("ALICE_DEMAND_SHARE_ELASTICITY");
+	return s ? std::clamp(float(std::atof(s)), 0.f, 5.f) : 1.0f;
+}();
+static bool const trace_demand_share = []() {
+	auto s = std::getenv("ALICE_TRACE_DEMAND_SHARE");
+	return s && std::atoi(s) != 0;
+}();
+static FILE* demand_share_file = nullptr;
+static bool demand_share_file_init = false;
+static int last_demand_share_key = -1;
 static FILE* weight_decomp_file = nullptr;
 static bool weight_decomp_file_init = false;
 static int last_weight_decomp_key = -1;
@@ -951,6 +966,79 @@ void rebalance_needs_weights(sys::state& state) {
 			});
 		}
 	});
+
+	if(demand_share) {
+		bool write_share_today = false;
+		if(trace_demand_share) {
+			auto const ymd = state.current_date.to_ymd(state.start_date);
+			int const key = int(ymd.year) * 10000 + int(ymd.month) * 100 + int(ymd.day);
+			if(ymd.day == 1 && key != last_demand_share_key) {
+				last_demand_share_key = key;
+				write_share_today = true;
+				if(!demand_share_file_init) {
+					demand_share_file_init = true;
+					auto const path = std::getenv("ALICE_DEMAND_SHARE_FILE");
+					if(path) {
+						demand_share_file = fopen(path, "w");
+						if(demand_share_file)
+							fprintf(demand_share_file, "date,market,owner_index,sum_share,sum_base_weight,life_count,grain_weight,grain_share,grain_alpha,grain_price\n");
+					}
+				}
+			}
+		}
+		state.world.for_each_market([&](dcon::market_id m) {
+			double sum = 0.0;
+			state.world.for_each_commodity([&](dcon::commodity_id c) {
+				if(c == economy::money)
+					return;
+				auto const alpha = double(average_life_need.get(c));
+				if(alpha <= 0.0)
+					return;
+				auto const p = double(state.world.market_get_price(m, c)) + 0.000000001;
+				sum += alpha * std::pow(p, -double(demand_share_elasticity));
+			});
+			if(!(sum > 0.0) || !std::isfinite(sum))
+				return;
+			double sum_share = 0.0;
+			double sum_base_weight = 0.0;
+			double grain_weight = 0.0;
+			double grain_share = 0.0;
+			double grain_alpha = 0.0;
+			double grain_price = 0.0;
+			state.world.for_each_commodity([&](dcon::commodity_id c) {
+				if(c == economy::money)
+					return;
+				auto const alpha = double(average_life_need.get(c));
+				if(alpha <= 0.0)
+					return;
+				auto const p = double(state.world.market_get_price(m, c)) + 0.000000001;
+				auto const share = alpha * std::pow(p, -double(demand_share_elasticity)) / sum;
+				auto weight = float(double(life_count) * share / alpha);
+				weight = std::clamp(weight, 0.f, 1.f);
+				state.world.market_set_life_needs_weights(m, c, weight);
+				sum_share += share;
+				sum_base_weight += alpha * double(weight);
+				if(c == grain_commodity) {
+					grain_weight = double(weight);
+					grain_share = share;
+					grain_alpha = alpha;
+					grain_price = p;
+				}
+			});
+			if(write_share_today && demand_share_file) {
+				auto const zone = state.world.market_get_zone_from_local_market(m);
+				auto const owner = state.world.state_instance_get_nation_from_state_ownership(zone);
+				char datebuf[16];
+				auto const ymd = state.current_date.to_ymd(state.start_date);
+				std::snprintf(datebuf, sizeof(datebuf), "%04d-%02d-%02d", ymd.year, ymd.month, ymd.day);
+				fprintf(demand_share_file, "%s,%d,%d,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g\n",
+					datebuf, int(m.index()), int(owner.index()), sum_share, sum_base_weight, double(life_count),
+					grain_weight, grain_share, grain_alpha, grain_price);
+			}
+		});
+		if(write_share_today && demand_share_file)
+			fflush(demand_share_file);
+	}
 }
 
 
