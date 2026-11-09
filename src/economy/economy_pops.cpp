@@ -19,13 +19,21 @@ namespace economy {
 namespace pops {
 
 static std::vector<float> market_life_spending;
+static std::vector<float> market_disposable;
 static bool const les_actual_budget = []() {
 	auto s = std::getenv("ALICE_EXP_DEMAND_LES_ACTUAL");
+	return s && std::atoi(s) != 0;
+}();
+static bool const les_income_budget = []() {
+	auto s = std::getenv("ALICE_EXP_DEMAND_LES_INCOME");
 	return s && std::atoi(s) != 0;
 }();
 
 float market_life_needs_spending(dcon::market_id m) {
 	return m.index() < market_life_spending.size() ? market_life_spending[m.index()] : 0.f;
+}
+float market_disposable_income(dcon::market_id m) {
+	return m.index() < market_disposable.size() ? market_disposable[m.index()] : 0.f;
 }
 
 // LOCAL TRACE (ALICE_TRACE_DEMAND_DECOMP): read-only grain demand decomposition by market and
@@ -609,11 +617,17 @@ void update_consumption(
 	auto to_bank = state.world.pop_make_vectorizable_float_buffer();
 	auto to_investments = state.world.pop_make_vectorizable_float_buffer();
 	auto pop_life_spending = state.world.pop_make_vectorizable_float_buffer();
+	auto pop_disposable = state.world.pop_make_vectorizable_float_buffer();
 	if(les_actual_budget)
 		market_life_spending.assign(state.world.market_size(), 0.f);
+	if(les_income_budget)
+		market_disposable.assign(state.world.market_size(), 0.f);
 
 	state.world.execute_parallel_over_pop([&](auto ids) {
 		auto pop_size = state.world.pop_get_size(ids);
+
+		if(les_income_budget)
+			pop_disposable.set(ids, state.world.pop_get_savings(ids));
 
 		// get all data into vectors
 		vectorized_pops_budget<ve::fp_vector> data = prepare_pop_budget_templated(state, ids);
@@ -671,16 +685,25 @@ void update_consumption(
 		state.world.pop_set_savings(ids, ve::max(0.f, data.remaining_savings));
 	});
 
-	if(les_actual_budget) {
+	if(les_actual_budget || les_income_budget) {
 		state.world.execute_serial_over_pop([&](auto p) {
 			auto provs = state.world.pop_get_province_from_pop_location(p);
 			auto sids = state.world.province_get_state_membership(provs);
 			auto mids = state.world.state_instance_get_market_from_local_market(sids);
-			auto amounts = pop_life_spending.get(p);
-			ve::apply([&](dcon::market_id m, float v) {
-				if(m.index() < market_life_spending.size())
-					market_life_spending[m.index()] += v;
-			}, mids, amounts);
+			if(les_actual_budget) {
+				auto amounts = pop_life_spending.get(p);
+				ve::apply([&](dcon::market_id m, float v) {
+					if(m.index() < market_life_spending.size())
+						market_life_spending[m.index()] += v;
+				}, mids, amounts);
+			}
+			if(les_income_budget) {
+				auto amounts = pop_disposable.get(p);
+				ve::apply([&](dcon::market_id m, float v) {
+					if(m.index() < market_disposable.size())
+						market_disposable[m.index()] += v;
+				}, mids, amounts);
+			}
 		});
 	}
 

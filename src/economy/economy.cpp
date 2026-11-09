@@ -779,6 +779,14 @@ static bool const demand_les_actual = []() {
 	auto s = std::getenv("ALICE_EXP_DEMAND_LES_ACTUAL");
 	return s && std::atoi(s) != 0;
 }();
+static bool const demand_les_income = []() {
+	auto s = std::getenv("ALICE_EXP_DEMAND_LES_INCOME");
+	return s && std::atoi(s) != 0;
+}();
+static float const demand_life_share = []() {
+	auto s = std::getenv("ALICE_DEMAND_LIFE_SHARE");
+	return s ? std::clamp(float(std::atof(s)), 0.01f, 1.f) : 0.5f;
+}();
 static float const demand_les_budget = []() {
 	auto s = std::getenv("ALICE_DEMAND_LES_BUDGET");
 	return s ? std::clamp(float(std::atof(s)), 0.05f, 5.f) : 0.5f;
@@ -1107,13 +1115,16 @@ void rebalance_needs_weights(sys::state& state) {
 			});
 			if(!(sum_gamma > 0.0) || !(subs > 0.0) || !std::isfinite(subs))
 				return;
-			double const budget = demand_les_actual
-				? double(economy::pops::market_life_needs_spending(m))
-				: double(demand_les_budget) * subs;
+			double const budget = demand_les_income
+				? double(demand_life_share) * double(economy::pops::market_disposable_income(m))
+				: (demand_les_actual
+					? double(economy::pops::market_life_needs_spending(m))
+					: double(demand_les_budget) * subs);
 			double sum_pq = 0.0;
 			double grain_weight = 0.0;
 			double grain_q = 0.0;
 			double min_q = 1e30;
+			double const prior = 1.0 / sum_gamma;
 			state.world.for_each_commodity([&](dcon::commodity_id c) {
 				if(c == economy::money)
 					return;
@@ -1122,13 +1133,18 @@ void rebalance_needs_weights(sys::state& state) {
 					return;
 				auto const p = double(state.world.market_get_price(m, c)) + 0.000000001;
 				double q = 0.0;
-				if(budget <= subs) {
+				double weight = 0.0;
+				if(!(budget > 0.0)) {
+					weight = prior;
+					q = gamma * K * weight;
+				} else if(budget <= subs) {
 					q = gamma * K * (budget / subs);
+					weight = q / (gamma * K);
 				} else {
 					auto const beta = gamma / sum_gamma;
 					q = gamma * K + (beta / p) * (budget - subs);
+					weight = q / (gamma * K);
 				}
-				auto const weight = float(q / (gamma * K));
 				state.world.market_set_life_needs_weights(m, c, weight);
 				sum_pq += p * q;
 				min_q = std::min(min_q, q);
