@@ -442,7 +442,7 @@ inline void dump_month(sys::state& state, FILE* nations_csv, FILE* prices_csv, F
 		}
 		auto labor_sat = double(state.world.province_get_labor_demand_satisfaction(p, economy::labor::no_education));
 		auto rgo_target = double(state.world.province_get_rgo_target_employment(p, best_c));
-		fprintf(provinces_csv, "%s,%d,%s,%s,%s,%.6g,%s,%.6g,%.6g,%.6g,%.6g,%s,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g\n",
+		fprintf(provinces_csv, "%s,%d,%s,%s,%s,%.6g,%s,%.6g,%.6g,%.6g,%.6g,%s,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g\n",
 			date.c_str(), i,
 			text::produce_simple_string(state, state.world.province_get_name(p)).c_str(),
 			tag_of(state, state.world.province_get_nation_from_province_ownership(p)).c_str(),
@@ -468,7 +468,10 @@ inline void dump_month(sys::state& state, FILE* nations_csv, FILE* prices_csv, F
 			// quantity that decides how much industry a province can ever hold.
 			double(state.world.province_get_advanced_province_building_private_size(
 				p, advanced_province_buildings::list::local_cities_and_towns)),
-			double(state.world.province_get_labor_demand(p, economy::labor::no_education) <= 0.f ? 1.0 : 0.0));
+			double(state.world.province_get_labor_demand(p, economy::labor::no_education) <= 0.f ? 1.0 : 0.0),
+			double(state.world.province_get_labor_supply(p, economy::labor::high_education_and_accepted)),
+			double(state.world.province_get_labor_demand(p, economy::labor::high_education_and_accepted)),
+			double(state.world.province_get_labor_price(p, economy::labor::high_education_and_accepted)));
 	}
 	// routes touching each market, so the dump shows where goods can actually move
 	static std::vector<int32_t> route_count;
@@ -801,7 +804,7 @@ inline void run(sys::state& state, int years, std::string const& dump_dir) {
 		if(welfare_csv)
 			fprintf(welfare_csv, "date,pop_type,population,mean_satisfaction,savings_per_capita,basket_cost_per_capita,spent_per_capita,mean_is_rich,life_sat,everyday_sat,luxury_sat\n");
 		if(provinces_csv)
-			fprintf(provinces_csv, "date,province,name,owner,controller,population,rgo_good,rgo_size,rgo_target_employment,rgo_actual_employment,rgo_output,main_rgo,main_rgo_size,main_rgo_target,main_rgo_actual,labor_demand_satisfaction,factory_employment,factory_capacity,labor_supply_no_edu,labor_supply_basic,labor_supply_high,labor_demand_no_edu,labor_demand_basic,city_size,zero_demand\n");
+			fprintf(provinces_csv, "date,province,name,owner,controller,population,rgo_good,rgo_size,rgo_target_employment,rgo_actual_employment,rgo_output,main_rgo,main_rgo_size,main_rgo_target,main_rgo_actual,labor_demand_satisfaction,factory_employment,factory_capacity,labor_supply_no_edu,labor_supply_basic,labor_supply_high,labor_demand_no_edu,labor_demand_basic,city_size,zero_demand,labor_supply_high_acc,labor_demand_high_acc,labor_price_high_acc\n");
 		if(nations_csv)
 			fprintf(nations_csv, "date,tag,prestige,industrial_score,military_score,rank,is_gp,is_civilized,treasury,population,provinces,infamy,war_exhaustion,unlocked_commodities,military_spending,army_goods_cost,government,ruling_party,active_regiments,sphere_leader,vassals,nat_money,bank,market,pops,inv,rgo,factory,artisans,total\n");
 		if(prices_csv)
