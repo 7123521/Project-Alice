@@ -79,6 +79,12 @@ static bool const gov_stockpile_purchase = []() {
 	auto s = std::getenv("ALICE_EXP_GOV_STOCKPILE_PURCHASE");
 	return s && std::atoi(s) != 0;
 }();
+// LOCAL EXPERIMENT (ALICE_CB_CREDIT_LIMIT): bounded central-bank inventory/working-capital credit.
+// The national bank may go negative down to -limit; future sales repay it.
+static float const cb_credit_limit = []() {
+	auto s = std::getenv("ALICE_CB_CREDIT_LIMIT");
+	return s ? std::max(0.f, float(std::atof(s))) : 50000000.f;
+}();
 static float const gov_stockpile_target_days = []() {
 	auto s = std::getenv("ALICE_GOV_STOCKPILE_TARGET_DAYS");
 	return s ? std::max(30.f, std::min(3650.f, float(std::atof(s)))) : 365.f;
@@ -1364,13 +1370,11 @@ void rebalance_needs_weights(sys::state& state) {
 
 			if(needs_share) {
 				w_life = ve::min(ve::fp_vector{ 1.f }, needed_life / life_count);
-				w_everyday = ve::min(ve::fp_vector{ 1.f }, needed_everyday / everyday_count);
-				w_luxury = ve::min(ve::fp_vector{ 1.f }, needed_luxury / luxury_count);
 			} else {
 				w_life = ve::max(ve::fp_vector{0.f}, ve::min(ve::fp_vector{1.f}, w_life + dw_life * 10.f * state.defines.alice_need_drift_speed));
-				w_everyday = ve::max(ve::fp_vector{ 0.f }, ve::min(ve::fp_vector{ 1.f }, w_everyday + dw_everyday * 10.f * state.defines.alice_need_drift_speed));
-				w_luxury = ve::max(ve::fp_vector{ 0.f }, ve::min(ve::fp_vector{ 1.f }, w_luxury + dw_luxury * 10.f * state.defines.alice_need_drift_speed));
 			}
+			w_everyday = ve::max(ve::fp_vector{ 0.f }, ve::min(ve::fp_vector{ 1.f }, w_everyday + dw_everyday * 10.f * state.defines.alice_need_drift_speed));
+			w_luxury = ve::max(ve::fp_vector{ 0.f }, ve::min(ve::fp_vector{ 1.f }, w_luxury + dw_luxury * 10.f * state.defines.alice_need_drift_speed));
 
 			state.world.market_set_life_needs_weights(market, c, w_life);
 			state.world.market_set_everyday_needs_weights(market, c, w_everyday);
@@ -4698,8 +4702,8 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 					auto luxury_base = state.world.pop_type_get_luxury_needs(pop_type, c);
 
 					auto life_costs = prices * life_base * life_needs_mult * (needs_share ? ve::fp_vector{ 1.f } : life_weights);
-					auto everyday_costs = prices * everyday_base * everyday_needs_mult * (needs_share ? ve::fp_vector{ 1.f } : everyday_weights) * invention_factor;
-					auto luxury_costs = prices * luxury_base * luxury_needs_mult * (needs_share ? ve::fp_vector{ 1.f } : luxury_weights) * invention_factor;
+					auto everyday_costs = prices * everyday_base * everyday_needs_mult * everyday_weights * invention_factor;
+					auto luxury_costs = prices * luxury_base * luxury_needs_mult * luxury_weights * invention_factor;
 
 					state.world.market_set_life_needs_costs(
 						markets,
@@ -4776,8 +4780,8 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 					auto luxury_base = state.world.pop_type_get_luxury_needs(pop_type, c);
 
 					auto life_costs = prices * life_base * life_needs_mult * (needs_share ? ve::fp_vector{ 1.f } : life_weights);
-					auto everyday_costs = prices * everyday_base * everyday_needs_mult * (needs_share ? ve::fp_vector{ 1.f } : everyday_weights) * invention_factor;
-					auto luxury_costs = prices * luxury_base * luxury_needs_mult * (needs_share ? ve::fp_vector{ 1.f } : luxury_weights) * invention_factor;
+					auto everyday_costs = prices * everyday_base * everyday_needs_mult * everyday_weights * invention_factor;
+					auto luxury_costs = prices * luxury_base * luxury_needs_mult * luxury_weights * invention_factor;
 
 					state.world.market_set_life_needs_costs(
 						markets,
@@ -4853,8 +4857,8 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 					auto luxury_base = state.world.pop_type_get_luxury_needs(pop_type, c);
 
 					auto life_costs = prices * life_base * life_needs_mult * (needs_share ? ve::fp_vector{ 1.f } : life_weights);
-					auto everyday_costs = prices * everyday_base * everyday_needs_mult * (needs_share ? ve::fp_vector{ 1.f } : everyday_weights) * invention_factor;
-					auto luxury_costs = prices * luxury_base * luxury_needs_mult * (needs_share ? ve::fp_vector{ 1.f } : luxury_weights) * invention_factor;
+					auto everyday_costs = prices * everyday_base * everyday_needs_mult * everyday_weights * invention_factor;
+					auto luxury_costs = prices * luxury_base * luxury_needs_mult * luxury_weights * invention_factor;
 
 					state.world.market_set_life_needs_costs(
 						markets,
@@ -5516,7 +5520,7 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 				}
 			}, market);
 		}
-		if(inventory_finance) {
+		if(false) {
 			ve::apply([&](dcon::market_id m, float sold) {
 				if(size_t(m.index()) >= seller_share_cache.size())
 					return;
@@ -5640,6 +5644,79 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 			state.world.market_set_port_services_demand(market, old_port_demand + demanded_port_services);
 		}
 	});
+
+	if(inventory_finance) {
+		state.world.for_each_market([&](dcon::market_id m) {
+			if(size_t(m.index()) >= seller_share_cache.size())
+				return;
+			auto const& entry = seller_share_cache[size_t(m.index())];
+			if(!(entry.total > 0.f) || !std::isfinite(entry.total))
+				return;
+			auto const sid = state.world.market_get_zone_from_local_market(m);
+			auto const n = state.world.state_instance_get_nation_from_state_ownership(sid);
+			if(!n)
+				return;
+			auto bank = state.world.nation_get_national_bank(n);
+			if(!std::isfinite(bank))
+				return;
+			if(bank < 0.f) {
+				double producer_total = 0.0;
+				for(auto const& ps : entry.provinces) {
+					auto const own = ps.rgo + ps.guild + ps.factory;
+					if(!(own > 0.f))
+						continue;
+					if(ps.rgo > 0.f) producer_total += double(std::max(0.f, state.world.province_get_rgo_bank(ps.province)));
+					if(ps.guild > 0.f) producer_total += double(std::max(0.f, state.world.province_get_artisan_bank(ps.province)));
+					if(ps.factory > 0.f) producer_total += double(std::max(0.f, state.world.province_get_factory_bank(ps.province)));
+				}
+				auto const repay = std::min(double(-bank) * 0.01, producer_total * 0.1);
+				if(repay > 0.0 && std::isfinite(repay)) {
+					for(auto const& ps : entry.provinces) {
+						auto const own = ps.rgo + ps.guild + ps.factory;
+						if(!(own > 0.f))
+							continue;
+						auto const amount = float(repay) * own / entry.total;
+						if(!std::isfinite(amount))
+							continue;
+						if(ps.rgo > 0.f) state.world.province_set_rgo_bank(ps.province, std::max(0.f, state.world.province_get_rgo_bank(ps.province) - amount * ps.rgo / own));
+						if(ps.guild > 0.f) state.world.province_set_artisan_bank(ps.province, std::max(0.f, state.world.province_get_artisan_bank(ps.province) - amount * ps.guild / own));
+						if(ps.factory > 0.f) state.world.province_set_factory_bank(ps.province, std::max(0.f, state.world.province_get_factory_bank(ps.province) - amount * ps.factory / own));
+					}
+					bank += float(repay);
+					state.world.nation_set_national_bank(n, bank);
+				}
+			}
+			double inventory = 0.0;
+			for(uint32_t ci = 1; ci < state.world.commodity_size(); ++ci) {
+				dcon::commodity_id c{ dcon::commodity_id::value_base_t(ci) };
+				if(c == economy::money)
+					continue;
+				auto const sup = state.world.market_get_supply(m, c);
+				auto const dem = state.world.market_get_demand(m, c);
+				auto const unsold = std::max(0.f, sup - dem);
+				if(unsold > 0.f && std::isfinite(unsold))
+					inventory += double(unsold) * double(state.world.commodity_get_cost(c));
+			}
+			if(!(inventory > 0.0) || !std::isfinite(inventory))
+				return;
+			auto const available = std::max(0.f, bank + cb_credit_limit);
+			auto const credit = std::min(float(inventory), available);
+			if(!(credit > 0.f) || !std::isfinite(credit))
+				return;
+			state.world.nation_set_national_bank(n, bank - credit);
+			for(auto const& ps : entry.provinces) {
+				auto const own = ps.rgo + ps.guild + ps.factory;
+				if(!(own > 0.f) || !std::isfinite(own))
+					continue;
+				auto const amount = credit * own / entry.total;
+				if(!std::isfinite(amount))
+					continue;
+				if(ps.rgo > 0.f) state.world.province_set_rgo_bank(ps.province, state.world.province_get_rgo_bank(ps.province) + amount * ps.rgo / own);
+				if(ps.guild > 0.f) state.world.province_set_artisan_bank(ps.province, state.world.province_get_artisan_bank(ps.province) + amount * ps.guild / own);
+				if(ps.factory > 0.f) state.world.province_set_factory_bank(ps.province, state.world.province_get_factory_bank(ps.province) + amount * ps.factory / own);
+			}
+		});
+	}
 
 	if(gov_stockpile_purchase)
 		recreate_total_government_stockpiles(state);

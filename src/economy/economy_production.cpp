@@ -63,6 +63,10 @@ static bool const rgo_supply_response = []() {
 	auto s = std::getenv("ALICE_EXP_RGO_SUPPLY_RESPONSE");
 	return s && std::atoi(s) != 0;
 }();
+static float const rgo_supply_floor = []() {
+	auto s = std::getenv("ALICE_RGO_SUPPLY_FLOOR");
+	return s ? std::max(0.1f, std::min(1.f, float(std::atof(s)))) : 0.3f;
+}();
 static bool const grain_output_mult_enabled = []() {
 	auto s = std::getenv("ALICE_EXP_GRAIN_OUTPUT_MULT");
 	return s && std::atof(s) != 1.0;
@@ -1150,12 +1154,16 @@ float get_total_wage(const sys::state& state, dcon::factory_id f) {
 		auto market = state.world.state_instance_get_market_from_local_market(zone);
 		auto ftid = state.world.factory_get_building_type(f);
 		auto output_commodity = state.world.factory_type_get_output(ftid);
-		// LOCAL EXPERIMENT: value added is measured on output, not only on realised sales;
-		// the unsold part is financed as inventory by ALICE_EXP_INVENTORY_FINANCE.
-		auto const output_value = state.world.factory_get_output(f)
-			* state.world.market_get_price(market, output_commodity);
-		auto const value_added = std::max(0.f, output_value - state.world.factory_get_input_cost(f));
-		auto const wage = direct_factory_wage_share * value_added;
+		// LOCAL EXPERIMENT: cost-valued value added, so wages are not tied to the collapsed
+		// market price level. The input share is taken from the market-value ratio.
+		auto const output_qty = state.world.factory_get_output(f);
+		auto const market_out = output_qty * state.world.market_get_price(market, output_commodity);
+		auto const cost_out = output_qty * state.world.commodity_get_cost(output_commodity);
+		auto const input_share = market_out > 0.f
+			? std::max(0.f, std::min(0.95f, state.world.factory_get_input_cost(f) / market_out))
+			: 0.5f;
+		auto const cost_va = cost_out * (1.f - input_share);
+		auto const wage = direct_factory_wage_share * cost_va;
 		return std::isfinite(wage) ? wage : 0.f;
 	}
 	auto labor_market = state.world.factory_get_province_from_factory_location(f);
@@ -1974,7 +1982,7 @@ void update_rgo_production(sys::state& state) {
 				auto const mid = state.world.state_instance_get_market_from_local_market(sid);
 				auto const price = state.world.market_get_price(mid, c);
 				auto const cost = state.world.commodity_get_cost(c);
-				auto const factor = ve::max(ve::fp_vector{0.3f}, ve::min(ve::fp_vector{1.f}, price / std::max(cost, 0.000001f)));
+				auto const factor = ve::max(ve::fp_vector{rgo_supply_floor}, ve::min(ve::fp_vector{1.f}, price / std::max(cost, 0.000001f)));
 				amount = amount * factor;
 			}
 			state.world.province_set_rgo_output(p, c, amount);
@@ -2351,7 +2359,7 @@ void update_employment(sys::state& state, bool ignore_reality, float presim_empl
 			auto provisional_output = output_per_worker * current_employment;
 			if(rgo_supply_response) {
 				auto const cost = state.world.commodity_get_cost(c);
-				auto const factor = ve::max(ve::fp_vector{0.3f}, ve::min(ve::fp_vector{1.f}, current_price / std::max(cost, 0.000001f)));
+				auto const factor = ve::max(ve::fp_vector{rgo_supply_floor}, ve::min(ve::fp_vector{1.f}, current_price / std::max(cost, 0.000001f)));
 				provisional_output = provisional_output * factor;
 			}
 			state.world.province_set_rgo_output(pids, c, provisional_output);
