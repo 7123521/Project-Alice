@@ -24,12 +24,20 @@ static std::vector<float> pop_income_before;
 static std::vector<float> market_income_flow;
 static std::vector<float> market_poptype_income_flow;
 static int market_poptype_stride = 0;
+static std::vector<float> market_poptype_wage;
+static int market_poptype_wage_stride = 0;
+static std::vector<float> market_poptype_budget;
+static int market_poptype_budget_stride = 0;
 static bool const les_actual_budget = []() {
 	auto s = std::getenv("ALICE_EXP_DEMAND_LES_ACTUAL");
 	return s && std::atoi(s) != 0;
 }();
 static bool const les_income_budget = []() {
 	auto s = std::getenv("ALICE_EXP_DEMAND_LES_INCOME");
+	return s && std::atoi(s) != 0;
+}();
+static bool const trace_pop_demand = []() {
+	auto s = std::getenv("ALICE_TRACE_POP_DEMAND");
 	return s && std::atoi(s) != 0;
 }();
 
@@ -72,6 +80,20 @@ float market_poptype_income(dcon::market_id m, dcon::pop_type_id pt) {
 		return 0.f;
 	auto const idx = size_t(m.index()) * size_t(market_poptype_stride) + size_t(pt.index());
 	return idx < market_poptype_income_flow.size() ? market_poptype_income_flow[idx] : 0.f;
+}
+
+float market_poptype_wage_income(dcon::market_id m, dcon::pop_type_id pt) {
+	if(market_poptype_wage_stride <= 0)
+		return 0.f;
+	auto const idx = size_t(m.index()) * size_t(market_poptype_wage_stride) + size_t(pt.index());
+	return idx < market_poptype_wage.size() ? market_poptype_wage[idx] : 0.f;
+}
+
+float market_poptype_life_budget(dcon::market_id m, dcon::pop_type_id pt) {
+	if(market_poptype_budget_stride <= 0)
+		return 0.f;
+	auto const idx = size_t(m.index()) * size_t(market_poptype_budget_stride) + size_t(pt.index());
+	return idx < market_poptype_budget.size() ? market_poptype_budget[idx] : 0.f;
 }
 
 float market_daily_income(dcon::market_id m) {
@@ -659,6 +681,7 @@ void update_consumption(
 	auto to_bank = state.world.pop_make_vectorizable_float_buffer();
 	auto to_investments = state.world.pop_make_vectorizable_float_buffer();
 	auto pop_life_spending = state.world.pop_make_vectorizable_float_buffer();
+	auto pop_life_budget = state.world.pop_make_vectorizable_float_buffer();
 	auto pop_disposable = state.world.pop_make_vectorizable_float_buffer();
 	if(les_actual_budget)
 		market_life_spending.assign(state.world.market_size(), 0.f);
@@ -705,6 +728,7 @@ void update_consumption(
 		to_bank.set(ids, data.bank_savings.spent);
 		to_investments.set(ids, data.investments.spent);
 		pop_life_spending.set(ids, data.life_needs.spent);
+		pop_life_budget.set(ids, data.life_needs.required);
 
 		state.world.for_each_consumption_category([&](auto cat) {
 			auto scale = data.per_consumption_category[cat.index()].demand_scale;
@@ -727,7 +751,7 @@ void update_consumption(
 		state.world.pop_set_savings(ids, ve::max(0.f, data.remaining_savings));
 	});
 
-	if(les_actual_budget || les_income_budget) {
+	if(les_actual_budget || les_income_budget || trace_pop_demand) {
 		state.world.execute_serial_over_pop([&](auto p) {
 			auto provs = state.world.pop_get_province_from_pop_location(p);
 			auto sids = state.world.province_get_state_membership(provs);
@@ -745,6 +769,19 @@ void update_consumption(
 					if(m.index() < market_disposable.size())
 						market_disposable[m.index()] += v;
 				}, mids, amounts);
+			}
+			{
+				auto pts = state.world.pop_get_poptype(p);
+				auto amounts = pop_life_budget.get(p);
+				ve::apply([&](dcon::market_id m, dcon::pop_type_id pt, float v) {
+					auto const idx = size_t(m.index()) * size_t(state.world.pop_type_size()) + size_t(pt.index());
+					if(market_poptype_budget_stride <= 0) {
+						market_poptype_budget_stride = int(state.world.pop_type_size());
+						market_poptype_budget.assign(size_t(state.world.market_size()) * size_t(market_poptype_budget_stride), 0.f);
+					}
+					if(idx < market_poptype_budget.size())
+						market_poptype_budget[idx] += v;
+				}, mids, pts, amounts);
 			}
 		});
 	}
@@ -1963,6 +2000,7 @@ void update_income_wages(sys::state& state){
 		state.world.province_set_rgo_bank(pid, old_rgo_cash + profit_from_slaves);
 	});
 
+	auto pop_wage_income = state.world.pop_make_vectorizable_float_buffer();
 	state.world.execute_parallel_over_pop([&](auto pops) {
 		auto savings = state.world.pop_get_savings(pops);
 		auto pop_type = state.world.pop_get_poptype(pops);
@@ -1994,10 +2032,26 @@ void update_income_wages(sys::state& state){
 			)
 		);
 		auto wage = ve::select(size == 0.f, 0.f, size * wage_per_person);
+		pop_wage_income.set(pops, wage);
 		state.world.pop_set_savings(pops, wage + savings);
 #ifndef NDEBUG
 		ve::apply([](float v) { assert(std::isfinite(v) && v >= 0); }, wage + savings);
 #endif // !NDEBUG
+	});
+
+	market_poptype_wage_stride = int(state.world.pop_type_size());
+	market_poptype_wage.assign(size_t(state.world.market_size()) * size_t(market_poptype_wage_stride), 0.f);
+	state.world.execute_serial_over_pop([&](auto p) {
+		auto provs = state.world.pop_get_province_from_pop_location(p);
+		auto sids = state.world.province_get_state_membership(provs);
+		auto mids = state.world.state_instance_get_market_from_local_market(sids);
+		auto pts = state.world.pop_get_poptype(p);
+		auto amounts = pop_wage_income.get(p);
+		ve::apply([&](dcon::market_id m, dcon::pop_type_id pt, float v) {
+			auto const idx = size_t(m.index()) * size_t(market_poptype_wage_stride) + size_t(pt.index());
+			if(idx < market_poptype_wage.size())
+				market_poptype_wage[idx] += v;
+		}, mids, pts, amounts);
 	});
 }
 

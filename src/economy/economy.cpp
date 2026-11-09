@@ -134,6 +134,14 @@ static FILE* grain_flow_file = nullptr;
 static bool grain_flow_file_init = false;
 static std::string last_grain_flow_date;
 static std::vector<float> prev_grain_stockpile;
+static bool const trace_pop_demand = []() {
+	auto s = std::getenv("ALICE_TRACE_POP_DEMAND");
+	return s && std::atoi(s) != 0;
+}();
+static FILE* pop_demand_file = nullptr;
+static bool pop_demand_file_init = false;
+static std::string last_pop_demand_date;
+
 static bool const trace_rgo_subsistence = []() {
 	auto s = std::getenv("ALICE_TRACE_RGO_SUBSISTENCE");
 	return s && std::atoi(s) != 0;
@@ -396,6 +404,71 @@ static void dump_grain_flow_trace(sys::state& state, sys::year_month_day const& 
 			double(state.world.market_get_actual_probability_to_buy(m, grain)), double(state.world.market_get_actual_probability_to_sell(m, grain)));
 	});
 	fflush(grain_flow_file);
+}
+
+static void dump_pop_demand_probe(sys::state& state, sys::year_month_day const& ymd) {
+	if(!trace_pop_demand)
+		return;
+	auto const probe = std::getenv("ALICE_DEMAND_PROBE_DATE");
+	if(!probe)
+		return;
+	char datebuf[16];
+	std::snprintf(datebuf, sizeof(datebuf), "%04d-%02d-%02d", ymd.year, ymd.month, ymd.day);
+	if(std::string(probe) != datebuf)
+		return;
+	if(last_pop_demand_date == datebuf)
+		return;
+	last_pop_demand_date = datebuf;
+	init_grain_commodity(state);
+	if(!grain_commodity)
+		return;
+	if(!pop_demand_file_init) {
+		pop_demand_file_init = true;
+		auto const path = std::getenv("ALICE_POP_DEMAND_FILE");
+		if(path) {
+			pop_demand_file = fopen(path, "w");
+			if(pop_demand_file)
+				fprintf(pop_demand_file, "date,market,owner_index,pop_type,strata,budget,grain_share,grain_q,market_stock,market_demand,market_consumption,grain_price\n");
+		}
+	}
+	if(!pop_demand_file)
+		return;
+	auto const grain = grain_commodity;
+	state.world.for_each_market([&](dcon::market_id m) {
+		auto const zone = state.world.market_get_zone_from_local_market(m);
+		auto const owner = state.world.state_instance_get_nation_from_state_ownership(zone);
+		auto const stock = state.world.market_get_stockpile(m, grain);
+		auto const demand = state.world.market_get_demand(m, grain);
+		auto const consumption = state.world.market_get_consumption(m, grain);
+		auto const grain_price = state.world.market_get_price(m, grain) + 0.000000001f;
+		state.world.for_each_pop_type([&](dcon::pop_type_id pt) {
+			auto const budget = double(economy::pops::market_poptype_life_budget(m, pt));
+			if(!(budget > 0.0) || !std::isfinite(budget))
+				return;
+			double sum = 0.0;
+			state.world.for_each_commodity([&](dcon::commodity_id c) {
+				if(c == economy::money)
+					return;
+				auto const gamma = double(state.world.pop_type_get_life_needs(pt, c));
+				if(gamma <= 0.0)
+					return;
+				auto const p = double(state.world.market_get_price(m, c)) + 0.000000001;
+				sum += gamma / p;
+			});
+			if(!(sum > 0.0) || !std::isfinite(sum))
+				return;
+			auto const gamma_grain = double(state.world.pop_type_get_life_needs(pt, grain));
+			if(gamma_grain <= 0.0)
+				return;
+			auto const share = (gamma_grain / double(grain_price)) / sum;
+			auto const q = share * budget / double(grain_price);
+			auto const strata = state.world.pop_type_get_strata(pt);
+			fprintf(pop_demand_file, "%s,%d,%d,%d,%d,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g\n",
+				datebuf, int(m.index()), int(owner.index()), int(pt.index()), int(strata),
+				budget, share, q, double(stock), double(demand), double(consumption), double(grain_price));
+		});
+	});
+	fflush(pop_demand_file);
 }
 
 static void dump_rgo_subsistence_trace(sys::state& state, sys::year_month_day const& ymd) {
@@ -791,6 +864,10 @@ static bool const demand_les_strata = []() {
 	auto s = std::getenv("ALICE_EXP_DEMAND_LES_STRATA");
 	return s && std::atoi(s) != 0;
 }();
+static bool const demand_les_wage = []() {
+	auto s = std::getenv("ALICE_EXP_DEMAND_LES_WAGE");
+	return s && std::atoi(s) != 0;
+}();
 static float const life_share_poor = []() {
 	auto s = std::getenv("ALICE_LIFE_SHARE_POOR");
 	return s ? std::clamp(float(std::atof(s)), 0.01f, 1.f) : 0.70f;
@@ -1140,7 +1217,9 @@ void rebalance_needs_weights(sys::state& state) {
 				state.world.for_each_pop_type([&](dcon::pop_type_id pt) {
 					auto const strata = state.world.pop_type_get_strata(pt);
 					auto const share = strata == 0 ? double(life_share_poor) : (strata == 1 ? double(life_share_middle) : double(life_share_rich));
-					budget += share * double(economy::pops::market_poptype_income(m, pt));
+					budget += share * double(demand_les_wage
+						? economy::pops::market_poptype_wage_income(m, pt)
+						: economy::pops::market_poptype_income(m, pt));
 				});
 			} else if(demand_les_flow) {
 				budget = double(demand_life_share) * double(economy::pops::market_daily_income(m));
@@ -4886,6 +4965,7 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 	dump_market_flow_trace(state, trace_ymd);
 	dump_grain_trace(state, trace_ymd);
 	dump_grain_flow_trace(state, trace_ymd);
+	dump_pop_demand_probe(state, trace_ymd);
 	dump_rgo_subsistence_trace(state, trace_ymd);
 	dump_labor_reservation_trace(state, trace_ymd);
 
