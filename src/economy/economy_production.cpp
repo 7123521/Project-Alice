@@ -57,6 +57,12 @@ static float const rgo_utilization_grain_fraction = []() {
 	auto s = std::getenv("ALICE_RGO_UTILIZATION");
 	return s ? std::clamp(float(std::atof(s)), 0.f, 0.95f) : 0.30f;
 }();
+// LOCAL EXPERIMENT (ALICE_EXP_RGO_SUPPLY_RESPONSE=1): RGO output responds to the price/cost
+// ratio (clamped to 0.3..1.0), so a commodity priced below cost is produced in smaller quantity.
+static bool const rgo_supply_response = []() {
+	auto s = std::getenv("ALICE_EXP_RGO_SUPPLY_RESPONSE");
+	return s && std::atoi(s) != 0;
+}();
 static bool const grain_output_mult_enabled = []() {
 	auto s = std::getenv("ALICE_EXP_GRAIN_OUTPUT_MULT");
 	return s && std::atof(s) != 1.0;
@@ -1963,6 +1969,14 @@ void update_rgo_production(sys::state& state) {
 			auto amount = actual_amount_of_workers * per_worker;
 			if(grain_output_mult_enabled && c == rgo_grain_commodity)
 				amount = amount * grain_output_mult;
+			if(rgo_supply_response) {
+				auto const sid = state.world.province_get_state_membership(p);
+				auto const mid = state.world.state_instance_get_market_from_local_market(sid);
+				auto const price = state.world.market_get_price(mid, c);
+				auto const cost = state.world.commodity_get_cost(c);
+				auto const factor = ve::max(ve::fp_vector{0.3f}, ve::min(ve::fp_vector{1.f}, price / std::max(cost, 0.000001f)));
+				amount = amount * factor;
+			}
 			state.world.province_set_rgo_output(p, c, amount);
 		});
 	});
@@ -2334,7 +2348,13 @@ void update_employment(sys::state& state, bool ignore_reality, float presim_empl
 
 			new_employment = ve::max(ve::fp_vector{0.f}, ve::min(new_employment, current_size));
 			state.world.province_set_rgo_target_employment(pids, c, new_employment);
-			state.world.province_set_rgo_output(pids, c, output_per_worker * current_employment);
+			auto provisional_output = output_per_worker * current_employment;
+			if(rgo_supply_response) {
+				auto const cost = state.world.commodity_get_cost(c);
+				auto const factor = ve::max(ve::fp_vector{0.3f}, ve::min(ve::fp_vector{1.f}, current_price / std::max(cost, 0.000001f)));
+				provisional_output = provisional_output * factor;
+			}
+			state.world.province_set_rgo_output(pids, c, provisional_output);
 		});
 	});
 
