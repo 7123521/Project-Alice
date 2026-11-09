@@ -178,6 +178,17 @@ static float const price_recovery_speed = []() {
 	auto s = std::getenv("ALICE_PRICE_RECOVERY_SPEED");
 	return s ? std::clamp(float(std::atof(s)), 0.f, 0.1f) : 0.005f;
 }();
+// LOCAL EXPERIMENT (ALICE_EXP_DEFICIT_PRICE_RECOVERY=1): in markets where current demand exceeds
+// current supply and the price is below 1% of cost, add a cost-scaled recovery term driven by the
+// current imbalance. This is a zero-singularity price-discovery fix, not a global price floor.
+static bool const deficit_price_recovery = []() {
+	auto s = std::getenv("ALICE_EXP_DEFICIT_PRICE_RECOVERY");
+	return s && std::atoi(s) != 0;
+}();
+static float const deficit_price_recovery_speed = []() {
+	auto s = std::getenv("ALICE_DEFICIT_PRICE_RECOVERY_SPEED");
+	return s ? std::clamp(float(std::atof(s)), 0.0001f, 0.05f) : 0.005f;
+}();
 
 static bool const trace_joint_clear = []() {
 	auto s = std::getenv("ALICE_TRACE_JOINT_CLEAR");
@@ -7170,6 +7181,17 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 					auto const cost_scale = state.world.commodity_get_cost(cid);
 					next_price = next_price + cost_scale * delta * price_recovery_speed;
 				}
+				if(deficit_price_recovery) {
+					// LOCAL EXPERIMENT: scarcity target cost x (demand/supply), capped at 4x cost.
+					// Only markets with current demand > supply are moved; surplus hubs are untouched.
+					auto const cur_supply = state.world.market_get_supply(ids, cid);
+					auto const cur_demand = state.world.market_get_demand(ids, cid);
+					auto const cost = state.world.commodity_get_cost(cid);
+					auto const flow = ve::max(ve::fp_vector{1.f}, cur_demand / ve::max(cur_supply, ve::fp_vector{0.000001f}));
+					auto const target = cost * ve::min(ve::fp_vector{4.f}, flow);
+					auto const mask = (cur_demand > cur_supply) && (current_price < target);
+					next_price = next_price + ve::select(mask, (target - current_price) * deficit_price_recovery_speed, ve::fp_vector{0.f});
+				}
 			}
 #ifndef NDEBUG
 			ve::apply([&](auto value) { assert(std::isfinite(value)); }, next_price);
@@ -7192,6 +7214,19 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 					base_confidence_increase = 1.f / 365.f * 3.f;
 				}
 				next_confidence = ve::max(ve::fp_vector{0.0001f}, ve::min(ve::fp_vector{ 1.f }, current_confidence * ve::min(price_ratio, 1.f / price_ratio) + base_confidence_increase));
+			}
+			if(deficit_price_recovery) {
+				auto const cur_supply = state.world.market_get_supply(ids, cid);
+				auto const cur_demand = state.world.market_get_demand(ids, cid);
+				auto const cost = state.world.commodity_get_cost(cid);
+				auto const flow_raw = (cur_demand + 0.000001f) / (cur_supply + 0.000002f);
+				auto const flow = ve::max(ve::fp_vector{1.f}, flow_raw);
+				auto const target = cost * ve::min(ve::fp_vector{4.f}, flow);
+				auto const mask = (cur_demand > cur_supply) && (current_price < target);
+				auto const target_conf = ve::apply([&](float f) {
+					return std::clamp(1.f - 0.5f * std::abs(std::log(std::max(1e-6f, f))), 0.1f, 1.f);
+				}, flow_raw);
+				next_confidence = ve::select(mask, ve::max(next_confidence, target_conf), next_confidence);
 			}
 #ifndef NDEBUG
 			ve::apply([&](auto value) { assert(std::isfinite(value)); }, next_confidence);
