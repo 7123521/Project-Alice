@@ -2438,6 +2438,14 @@ std::vector<full_construction_factory> estimate_private_investment_upgrade(sys::
 }
 
 /* Returns number of initiated projects */
+// LOCAL EXPERIMENT (ALICE_EXP_PROFIT_CONSTRUCTION=1): when selecting a new factory type, choose
+// the candidate with the shortest payback = construction cost / profit, instead of a random
+// candidate from the desired list. Default 0 keeps upstream behaviour.
+static bool const profit_construction = []() {
+	auto s = std::getenv("ALICE_EXP_PROFIT_CONSTRUCTION");
+	return s && std::atoi(s) != 0;
+}();
+
 std::vector<full_construction_factory> estimate_private_investment_construct(sys::state& state, dcon::nation_id nid, bool craved, float est_private_const_spending, bool& potential_target_exists) {
 	std::vector<full_construction_factory> res;
 
@@ -2513,6 +2521,28 @@ std::vector<full_construction_factory> estimate_private_investment_construct(sys
 		auto selected = desired_types[
 			rng::reduce(uint32_t(rng::get_random(state, uint32_t((n.id.index() << 6) ^ s.index()))), uint32_t(desired_types.size()))
 		];
+		if(profit_construction) {
+			auto const wage = state.world.province_get_labor_price(s, economy::labor::basic_education) * 2.f;
+			float best_payback = std::numeric_limits<float>::infinity();
+			dcon::factory_type_id best{};
+			for(auto t : desired_types) {
+				if(state.world.factory_type_get_is_coastal(t) && !state.world.province_get_port_to(s))
+					continue;
+				auto const cost = economy::factory_type_build_cost(state, nid, s, t, true) + 0.1f;
+				auto const output = economy::factory_type_output_cost(state, nid, market, t);
+				auto const input = economy::factory_type_input_cost(state, nid, market, t) + 0.1f;
+				auto const profit = output - input - wage * float(state.world.factory_type_get_base_workforce(t));
+				if(!(profit > 0.f))
+					continue;
+				auto const payback = cost / std::max(0.00001f, profit);
+				if(payback < best_payback) {
+					best_payback = payback;
+					best = t;
+				}
+			}
+			if(best)
+				selected = best;
+		}
 
 		if(
 			state.world.factory_type_get_is_coastal(selected)
