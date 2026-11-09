@@ -116,14 +116,16 @@ inline void dump_factory_trace(sys::state& state, std::string const& date) {
 		auto const good = state.world.factory_type_get_output(ftid);
 		auto const d = economy::diagnose_factory(state, f);
 		fprintf(factory_trace_csv,
-			"%s,%d,%s,%s,%s,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g\n",
+			"%s,%d,%s,%s,%s,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g\n",
 			date.c_str(), f.index(), tag_of(state, owner).c_str(),
 			text::produce_simple_string(state, state.world.province_get_name(location)).c_str(),
 			text::produce_simple_string(state, state.world.commodity_get_name(good)).c_str(),
-			double(state.world.factory_get_size(f)), double(d.desired_employment), double(d.construction_cost_per_capacity),
+			double(state.world.factory_get_size(f)), double(d.base_workforce), double(d.hiring_budget), double(d.affordable_employment),
+			double(d.desired_employment), double(d.construction_cost_per_capacity),
 			double(d.output_per_worker), double(d.output_price), double(d.input_cost_per_worker), double(d.wage_per_worker),
 			double(d.profit), double(d.profit_per_capacity), double(d.actual_output_per_capacity), double(d.actual_probability_to_sell),
-			double(d.employment_ratio), double(d.min_expected_input), double(d.min_available_input), double(d.subsidy), double(d.tokens), double(d.expand_priority));
+			double(d.employment_ratio), double(d.labor_satisfaction), double(d.hiring_sat), double(d.hiring_multiplier),
+			double(d.min_expected_input), double(d.min_available_input), double(d.subsidy), double(d.tokens), double(d.expand_priority));
 	});
 	fflush(factory_trace_csv);
 }
@@ -870,7 +872,7 @@ inline void run(sys::state& state, int years, std::string const& dump_dir) {
 		if(std::getenv("ALICE_TRACE_FACTORY")) {
 			factory_trace_csv = fopen((dump_dir + "/factory_trace.csv").c_str(), "w");
 			if(factory_trace_csv)
-				fprintf(factory_trace_csv, "date,factory,owner,province,good,size,desired_employment,construction_cost_per_capacity,output_per_worker,output_price,input_cost_per_worker,wage_per_worker,profit,profit_per_capacity,actual_output_per_capacity,actual_probability_to_sell,employment_ratio,min_expected_input,min_available_input,subsidy,tokens,expand_priority\n");
+				fprintf(factory_trace_csv, "date,factory,owner,province,good,size,base_workforce,hiring_budget,affordable_employment,desired_employment,construction_cost_per_capacity,output_per_worker,output_price,input_cost_per_worker,wage_per_worker,profit,profit_per_capacity,actual_output_per_capacity,actual_probability_to_sell,employment_ratio,labor_satisfaction,hiring_sat,hiring_multiplier,min_expected_input,min_available_input,subsidy,tokens,expand_priority\n");
 			factory_input_trace_csv = fopen((dump_dir + "/factory_input_trace.csv").c_str(), "w");
 			if(factory_input_trace_csv)
 				fprintf(factory_input_trace_csv, "date,factory,owner,province,output_good,input_good,amount,price,actual_buy_prob,expected_buy_prob,supply,demand,stockpile\n");

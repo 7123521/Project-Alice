@@ -1345,6 +1345,9 @@ inline float investment_expand_factory_priority(
 	return demand_factor * std::clamp(return_ratio, 0.f, 1.f);
 }
 
+template<typename VALUE>
+VALUE hiring_caution_multiplier(VALUE sat);
+
 factory_diagnostic diagnose_factory(sys::state const& state, dcon::factory_id f) {
 	auto const location = state.world.factory_get_province_from_factory_location(f);
 	auto const nation = state.world.province_get_nation_from_province_ownership(location);
@@ -1358,6 +1361,13 @@ factory_diagnostic diagnose_factory(sys::state const& state, dcon::factory_id f)
 	result.input_cost_per_worker = state.world.factory_get_input_cost_per_worker(f);
 	result.wage_per_worker = get_total_wage(state, f) / std::max(1.f, size);
 	result.output_price = state.world.market_get_price(market, output_commodity);
+	result.base_workforce = float(state.world.factory_type_get_base_workforce(ftid));
+	result.hiring_budget = factory_profit_to_wage_bound * size * result.output_per_worker * result.output_price;
+	auto const min_wage = std::min(
+		state.world.province_get_labor_price(location, labor::no_education),
+		std::min(state.world.province_get_labor_price(location, labor::basic_education),
+			state.world.province_get_labor_price(location, labor::high_education)));
+	result.affordable_employment = result.hiring_budget / std::max(1e-9f, min_wage);
 	result.profit = result.output_per_worker * result.output_price - result.input_cost_per_worker - result.wage_per_worker;
 	auto const profit_explanation = explain_last_factory_profit(state, f);
 	result.profit_per_capacity = profit_explanation.profit / std::max(1.f, size);
@@ -1368,10 +1378,13 @@ factory_diagnostic diagnose_factory(sys::state const& state, dcon::factory_id f)
 		+ state.world.factory_get_primary_employment(f)
 		+ state.world.factory_get_secondary_employment(f);
 	result.employment_ratio = employment / std::max(1.f, size);
+	result.labor_satisfaction = state.world.province_get_labor_demand_satisfaction(location, labor::basic_education);
 	auto const& factory_inputs = state.world.factory_type_get_inputs(ftid);
 	auto const input_data = get_inputs_data(state, market, factory_inputs);
 	result.min_expected_input = input_data.min_expected;
 	result.min_available_input = input_data.min_available;
+	result.hiring_sat = result.labor_satisfaction * result.actual_probability_to_sell * result.min_expected_input;
+	result.hiring_multiplier = hiring_caution_multiplier(result.hiring_sat);
 	result.desired_employment = factory_total_desired_employment(state, f);
 	auto const& costs = state.world.factory_type_get_construction_costs(ftid);
 	auto const costs_data = get_inputs_data(state, market, costs);
@@ -2103,18 +2116,39 @@ static_assert(employment_strategy_caution >= 0.f);
 static_assert(employment_strategy_caution < 1.f);
 constexpr inline float employment_strategy_caution_multiplier = 1.f / (1.f - employment_strategy_caution);
 
+// LOCAL EXPERIMENT (ALICE_EXP_SMOOTH_HIRING=1): replace the hard 0.7 hiring-caution threshold
+// with a smooth multiplier. Below 0.7 the upstream rule multiplies positive hiring by zero, which
+// locks factories into permanent under-employment when input/sales conditions are uncertain.
+static bool const smooth_hiring = []() {
+	auto s = std::getenv("ALICE_EXP_SMOOTH_HIRING");
+	return s && std::atoi(s) != 0;
+}();
+
+template<typename VALUE>
+VALUE hiring_caution_multiplier(VALUE sat) {
+	if constexpr(std::same_as<VALUE, float>) {
+		if(smooth_hiring)
+			return std::clamp(sat, 0.f, 1.f);
+		return std::max(0.f, (sat - employment_strategy_caution) * employment_strategy_caution_multiplier);
+	} else {
+		if(smooth_hiring)
+			return ve::min(ve::max(sat, 0.f), 1.f);
+		return ve::max(0.f, (sat - employment_strategy_caution) * employment_strategy_caution_multiplier);
+	}
+}
+
 template<typename VALUE>
 VALUE gradient_to_employment_change(VALUE gradient, VALUE wage, VALUE current_employment, VALUE sat) {
 	if constexpr(std::same_as<VALUE, float>) {
-		auto mult = 
+		auto mult =
 			gradient > 0.f
-			? std::max(0.f, (sat - employment_strategy_caution) * employment_strategy_caution_multiplier)
+			? hiring_caution_multiplier(sat)
 			: 1.f;
 		return (current_employment * 0.001f + 1.f) * gradient * mult;
 	} else {
 		auto mult = ve::select(
 			gradient > 0.f,
-			ve::max(0.f, (sat - employment_strategy_caution) * employment_strategy_caution_multiplier),
+			hiring_caution_multiplier(sat),
 			1.f
 		);
 		return (current_employment * 0.001f + 1.f) * gradient * mult;

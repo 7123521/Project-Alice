@@ -358,11 +358,17 @@ struct factory_diagnostic {
 	float input_cost_per_worker = 0.f;
 	float wage_per_worker = 0.f;
 	float output_price = 0.f;
+	float base_workforce = 0.f;
+	float hiring_budget = 0.f;
+	float affordable_employment = 0.f;
 	float profit = 0.f;
 	float profit_per_capacity = 0.f;
 	float actual_output_per_capacity = 0.f;
 	float actual_probability_to_sell = 0.f;
 	float employment_ratio = 0.f;
+	float labor_satisfaction = 0.f;
+	float hiring_sat = 0.f;
+	float hiring_multiplier = 0.f;
 	float min_expected_input = 0.f;
 	float min_available_input = 0.f;
 	float subsidy = 0.f;
