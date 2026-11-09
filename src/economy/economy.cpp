@@ -4097,6 +4097,8 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 		state.world.market_set_sales(market, 0.f);
 		auto purchases = state.world.market_get_purchases(market);
 		state.world.market_set_purchases(market, 0.f);
+		if(market_cash)
+			purchases = ve::min(purchases, ve::max(0.f, budget));
 		auto export_gains = state.world.market_get_export_cut(market);
 		auto import_spent = state.world.market_get_import_spending(market);
 
@@ -4474,8 +4476,10 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 			auto const sold_value = merchants_supply * new_actual_probability_to_sell * ve_price(state, ids, c);
 			state.world.market_set_sales(ids, sales + sold_value);
 			if(market_cash) {
+				auto const cash = ve::max(0.f, state.world.market_get_stockpile(ids, economy::money));
+				auto const paid = ve::min(sold_value, cash);
 				auto const purchases_now = state.world.market_get_purchases(ids);
-				state.world.market_set_purchases(ids, purchases_now + sold_value);
+				state.world.market_set_purchases(ids, purchases_now + paid);
 			}
 
 #ifndef NDEBUG
