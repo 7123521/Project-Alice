@@ -250,6 +250,37 @@ static float const household_transfer_rate = []() {
 	return s ? std::clamp(float(std::atof(s)), 0.0001f, 1.f) : 0.1f;
 }();
 
+// LOCAL EXPERIMENT (ALICE_EXP_RENT_TO_INVESTMENT=1): the private building savings pool of local
+// cities and towns is idle when city expansion is not profitable. Move a fraction of it per day
+// into the nation's private investment pool, so it funds factory construction instead of sitting
+// on the books. Cash-conserving; default 0 = upstream.
+static bool const rent_to_investment = []() {
+	auto s = std::getenv("ALICE_EXP_RENT_TO_INVESTMENT");
+	return s && std::atoi(s) != 0;
+}();
+static float const rent_to_investment_rate = []() {
+	auto s = std::getenv("ALICE_RENT_TO_INVESTMENT_RATE");
+	return s ? std::clamp(float(std::atof(s)), 0.0001f, 0.2f) : 0.01f;
+}();
+
+static void apply_rent_to_investment(sys::state& state) {
+	if(!rent_to_investment)
+		return;
+	state.world.for_each_province([&](dcon::province_id p) {
+		auto const pool = state.world.province_get_advanced_province_building_private_savings(p, advanced_province_buildings::list::local_cities_and_towns);
+		if(!(pool > 0.f) || !std::isfinite(pool))
+			return;
+		auto const n = state.world.province_get_nation_from_province_ownership(p);
+		if(!n)
+			return;
+		auto const move = pool * rent_to_investment_rate;
+		if(!(move > 0.f) || !std::isfinite(move))
+			return;
+		state.world.province_set_advanced_province_building_private_savings(p, advanced_province_buildings::list::local_cities_and_towns, pool - move);
+		state.world.nation_set_private_investment(n, state.world.nation_get_private_investment(n) + move);
+	});
+}
+
 static void apply_household_transfer(sys::state& state) {
 	if(!household_transfer)
 		return;
@@ -7573,6 +7604,7 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 
 	set_profile_point(state, "tariffs");
 
+	apply_rent_to_investment(state);
 	apply_household_transfer(state);
 
 	
