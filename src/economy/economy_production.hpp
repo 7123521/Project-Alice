@@ -363,6 +363,8 @@ struct factory_diagnostic {
 	float actual_output_per_capacity = 0.f;
 	float actual_probability_to_sell = 0.f;
 	float employment_ratio = 0.f;
+	float min_expected_input = 0.f;
+	float min_available_input = 0.f;
 	float subsidy = 0.f;
 	float desired_employment = 0.f;
 	float construction_cost_per_capacity = 0.f;
