@@ -127,6 +127,15 @@ void update_factory_types_priority(sys::state& state) {
 	});
 }
 
+// LOCAL EXPERIMENT (ALICE_EXP_CONSTRUCTION_FEASIBILITY=1): evaluate new construction with the
+// expected actual output: potential output x min_expected_input x the nation's current factory
+// employment ratio. This prevents building capacity that the economy is not staffing or feeding.
+// Default 0 keeps upstream behaviour.
+static bool const construction_feasibility = []() {
+	auto s = std::getenv("ALICE_EXP_CONSTRUCTION_FEASIBILITY");
+	return s && std::atoi(s) != 0;
+}();
+
 void filter_factories_disjunctive(
 	sys::state& state,
 	dcon::nation_id nid,
@@ -143,6 +152,22 @@ void filter_factories_disjunctive(
 
 	auto n = dcon::fatten(state.world, nid);
 	auto wage = state.world.province_get_labor_price(pid, economy::labor::basic_education) * 2.f;
+
+	float expected_employment_ratio = 1.f;
+	if(construction_feasibility) {
+		float capacity = 0.f;
+		float employment = 0.f;
+		for(auto po : n.get_province_ownership()) {
+			auto p = po.get_province();
+			for(auto fl : p.get_factory_location()) {
+				auto fac = fl.get_factory();
+				capacity += state.world.factory_get_size(fac);
+				employment += economy::factory_total_employment(state, fac);
+			}
+		}
+		if(capacity > 0.f)
+			expected_employment_ratio = std::min(1.f, employment / capacity);
+	}
 
 	if(!desired_types.empty()) {
 		return;
@@ -171,13 +196,20 @@ void filter_factories_disjunctive(
 		// it provides a quite wide range of potential mistakes which makes the process a bit more interesting
 		float output = economy::factory_type_output_cost(state, n, mid, type) * effective_profit * (1.f + std::remainder(rng::get_random(state, n.id.value * pid.value * type.id.value) / 100.f, 0.5f) - 0.25f);
 		float input = economy::factory_type_input_cost(state, n, mid, type) + 0.1f;
-		float profitability = (output - input - wage * type.get_base_workforce()) / input;
-		float payback_time = cost / std::max(0.00001f, (output - input - wage * type.get_base_workforce()));
+		float feasible_output = output;
+		if(construction_feasibility) {
+			auto const inputs = economy::get_inputs_data(state, mid, type.get_inputs());
+			feasible_output = output * inputs.min_expected * expected_employment_ratio;
+		}
+		float profit = feasible_output - input - wage * type.get_base_workforce();
+		float profitability = profit / input;
+		float payback_time = cost / std::max(0.00001f, profit);
 
 		if(
-			output_is_in_demand
-			|| profitability > filter_profitability
-			|| payback_time < filter_payback_time
+			(!construction_feasibility || profit > 0.f)
+			&& (output_is_in_demand
+				|| profitability > filter_profitability
+				|| payback_time < filter_payback_time)
 		) {
 			desired_types.push_back(type.id);
 		}
