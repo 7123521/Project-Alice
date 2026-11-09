@@ -148,6 +148,18 @@ constexpr term::fetch_trade_owner<left_t> trade_route_get_owner(sys::state const
 
 namespace economy {
 
+// LOCAL EXPERIMENT (ALICE_EXP_TRADE_BY_SCARCITY=1): after the price-based volume update, add a
+// stock/demand-days routing term, so goods move from high-stock-days to low-stock-days markets.
+static bool const trade_by_scarcity = []() {
+	auto s = std::getenv("ALICE_EXP_TRADE_BY_SCARCITY");
+	return s && std::atoi(s) != 0;
+}();
+static float const trade_scarcity_scale = []() {
+	auto s = std::getenv("ALICE_TRADE_SCARCITY_SCALE");
+	return s ? std::max(0.1f, std::min(100.f, float(std::atof(s)))) : 10.f;
+}();
+
+
 // LOCAL EXPERIMENT (ALICE_EXP_TRADE_ACCOUNT=1): general trade account, all commodities.
 // Goods: exported volume is removed from the origin stockpile (upstream only credits the target).
 // Money: origin receives the full origin value; target pays the target value; the trade house
@@ -1001,6 +1013,37 @@ void update_trade_routes_volume(
 				trade_import_used[ti] += value;
 				trade_import_month[ti] += value;
 				remaining_value = std::max(0.f, remaining_value - value);
+			});
+		});
+	}
+
+	if(trade_by_scarcity) {
+		state.world.for_each_trade_route([&](dcon::trade_route_id route) {
+			if(!state.world.trade_route_is_valid(route))
+				return;
+			if(state.world.trade_route_get_is_trade_forbidden(route))
+				return;
+			auto const origin = state.world.trade_route_get_origin(route);
+			auto const target = state.world.trade_route_get_target(route);
+			state.world.for_each_commodity([&](dcon::commodity_id cid) {
+				if(cid == economy::money || state.world.commodity_get_money_rgo(cid) || state.world.commodity_get_is_local(cid))
+					return;
+				auto const volume = state.world.trade_route_get_volume(route, cid);
+				if(!(volume > 0.f) || !std::isfinite(volume))
+					return;
+				auto const stock_o = state.world.market_get_stockpile(origin, cid);
+				auto const stock_t = state.world.market_get_stockpile(target, cid);
+				auto const dem_o = state.world.market_get_demand(origin, cid);
+				auto const dem_t = state.world.market_get_demand(target, cid);
+				auto const eps = 0.000001f;
+				auto const days_o = stock_o / (dem_o + eps);
+				auto const days_t = stock_t / (dem_t + eps);
+				auto const sc = std::max(-1.f, std::min(1.f, (days_o - days_t) / (days_o + days_t + eps)));
+				if(!std::isfinite(sc))
+					return;
+				auto const change = (volume * 0.001f + 0.1f) * sc * trade_scarcity_scale;
+				auto const next = std::max(0.f, volume + change);
+				state.world.trade_route_set_volume(route, cid, next);
 			});
 		});
 	}
