@@ -1195,6 +1195,14 @@ static bool weight_decomp_file_init = false;
 static int last_weight_decomp_key = -1;
 static std::string weight_probe_datebuf;
 
+// LOCAL EXPERIMENT (ALICE_EXP_NEEDS_SHARE=1): allocate each needs category by need share
+// (average need of the commodity / total average need) instead of the availability-price drift.
+// This keeps base needs registered even when relative prices are distorted. Default 0 = upstream.
+static bool const needs_share = []() {
+	auto s = std::getenv("ALICE_EXP_NEEDS_SHARE");
+	return s && std::atoi(s) != 0;
+}();
+
 void rebalance_needs_weights(sys::state& state) {
 	bool write_weight_today = false;
 	if(trace_weight_decomp) {
@@ -1354,9 +1362,15 @@ void rebalance_needs_weights(sys::state& state) {
 					ve::max(ve::fp_vector{0.f}, ve::min(ve::fp_vector{1.f}, w_life + dw_life * 10.f * state.defines.alice_need_drift_speed)));
 			}
 
-			w_life = ve::max(ve::fp_vector{0.f}, ve::min(ve::fp_vector{1.f}, w_life + dw_life * 10.f * state.defines.alice_need_drift_speed));
-			w_everyday = ve::max(ve::fp_vector{ 0.f }, ve::min(ve::fp_vector{ 1.f }, w_everyday + dw_everyday * 10.f * state.defines.alice_need_drift_speed));
-			w_luxury = ve::max(ve::fp_vector{ 0.f }, ve::min(ve::fp_vector{ 1.f }, w_luxury + dw_luxury * 10.f * state.defines.alice_need_drift_speed));
+			if(needs_share) {
+				w_life = ve::min(ve::fp_vector{ 1.f }, needed_life / life_count);
+				w_everyday = ve::min(ve::fp_vector{ 1.f }, needed_everyday / everyday_count);
+				w_luxury = ve::min(ve::fp_vector{ 1.f }, needed_luxury / luxury_count);
+			} else {
+				w_life = ve::max(ve::fp_vector{0.f}, ve::min(ve::fp_vector{1.f}, w_life + dw_life * 10.f * state.defines.alice_need_drift_speed));
+				w_everyday = ve::max(ve::fp_vector{ 0.f }, ve::min(ve::fp_vector{ 1.f }, w_everyday + dw_everyday * 10.f * state.defines.alice_need_drift_speed));
+				w_luxury = ve::max(ve::fp_vector{ 0.f }, ve::min(ve::fp_vector{ 1.f }, w_luxury + dw_luxury * 10.f * state.defines.alice_need_drift_speed));
+			}
 
 			state.world.market_set_life_needs_weights(market, c, w_life);
 			state.world.market_set_everyday_needs_weights(market, c, w_everyday);
@@ -4683,9 +4697,9 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 					auto everyday_base = state.world.pop_type_get_everyday_needs(pop_type, c);
 					auto luxury_base = state.world.pop_type_get_luxury_needs(pop_type, c);
 
-					auto life_costs = prices * life_base * life_needs_mult * life_weights;
-					auto everyday_costs = prices * everyday_base * everyday_needs_mult * everyday_weights * invention_factor;
-					auto luxury_costs = prices * luxury_base * luxury_needs_mult * luxury_weights * invention_factor;
+					auto life_costs = prices * life_base * life_needs_mult * (needs_share ? ve::fp_vector{ 1.f } : life_weights);
+					auto everyday_costs = prices * everyday_base * everyday_needs_mult * (needs_share ? ve::fp_vector{ 1.f } : everyday_weights) * invention_factor;
+					auto luxury_costs = prices * luxury_base * luxury_needs_mult * (needs_share ? ve::fp_vector{ 1.f } : luxury_weights) * invention_factor;
 
 					state.world.market_set_life_needs_costs(
 						markets,
@@ -4761,9 +4775,9 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 					auto everyday_base = state.world.pop_type_get_everyday_needs(pop_type, c);
 					auto luxury_base = state.world.pop_type_get_luxury_needs(pop_type, c);
 
-					auto life_costs = prices * life_base * life_needs_mult * life_weights;
-					auto everyday_costs = prices * everyday_base * everyday_needs_mult * everyday_weights * invention_factor;
-					auto luxury_costs = prices * luxury_base * luxury_needs_mult * luxury_weights * invention_factor;
+					auto life_costs = prices * life_base * life_needs_mult * (needs_share ? ve::fp_vector{ 1.f } : life_weights);
+					auto everyday_costs = prices * everyday_base * everyday_needs_mult * (needs_share ? ve::fp_vector{ 1.f } : everyday_weights) * invention_factor;
+					auto luxury_costs = prices * luxury_base * luxury_needs_mult * (needs_share ? ve::fp_vector{ 1.f } : luxury_weights) * invention_factor;
 
 					state.world.market_set_life_needs_costs(
 						markets,
@@ -4838,9 +4852,9 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 					auto everyday_base = state.world.pop_type_get_everyday_needs(pop_type, c);
 					auto luxury_base = state.world.pop_type_get_luxury_needs(pop_type, c);
 
-					auto life_costs = prices * life_base * life_needs_mult * life_weights;
-					auto everyday_costs = prices * everyday_base * everyday_needs_mult * everyday_weights * invention_factor;
-					auto luxury_costs = prices * luxury_base * luxury_needs_mult * luxury_weights * invention_factor;
+					auto life_costs = prices * life_base * life_needs_mult * (needs_share ? ve::fp_vector{ 1.f } : life_weights);
+					auto everyday_costs = prices * everyday_base * everyday_needs_mult * (needs_share ? ve::fp_vector{ 1.f } : everyday_weights) * invention_factor;
+					auto luxury_costs = prices * luxury_base * luxury_needs_mult * (needs_share ? ve::fp_vector{ 1.f } : luxury_weights) * invention_factor;
 
 					state.world.market_set_life_needs_costs(
 						markets,
