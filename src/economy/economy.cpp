@@ -206,6 +206,67 @@ static float const target_price_speed = []() {
 	auto s = std::getenv("ALICE_TARGET_PRICE_SPEED");
 	return s ? std::clamp(float(std::atof(s)), 0.0001f, 0.1f) : 0.005f;
 }();
+// LOCAL EXPERIMENT (ALICE_EXP_PRICE_INCOME_INDEX=1): re-index the price of labour by the same
+// output-price index, on the same day, so a change in the commodity price level does not change
+// real wages (and so nominal income can fund a cost-level basket). Default 0 = upstream.
+static bool const price_income_index = []() {
+	auto s = std::getenv("ALICE_EXP_PRICE_INCOME_INDEX");
+	return s && std::atoi(s) != 0;
+}();
+// Which index to re-scale the price of labour by: "basket" = the worker's life+everyday basket
+// cost (the worker's cost of living), "output" = value-weighted market price / cost.
+static bool const price_index_basket = []() {
+	auto s = std::getenv("ALICE_PRICE_INCOME_INDEX_MODE");
+	return s ? std::string_view(s) != std::string_view("output") : true;
+}();
+static ve::vectorizable_buffer<float, dcon::market_id> price_level_now(uint32_t(1));
+static ve::vectorizable_buffer<float, dcon::market_id> price_level_prev(uint32_t(1));
+static bool price_level_buffers_ready = false;
+static uint32_t price_level_markets = 0;
+
+// Cost of the worker's life+everyday basket at the market's current prices. This is the same
+// index the labour price control and the pops' required budget use, so a change in this index is
+// exactly a change in the worker's cost of living.
+static void refresh_price_level(sys::state& state) {
+	if(!price_income_index)
+		return;
+	auto const n = state.world.market_size();
+	if(!price_level_buffers_ready || price_level_markets < n) {
+		price_level_now = state.world.market_make_vectorizable_float_buffer();
+		price_level_prev = state.world.market_make_vectorizable_float_buffer();
+		price_level_markets = n;
+		price_level_buffers_ready = true;
+	}
+	auto const worker_type = state.culture_definitions.primary_factory_worker;
+	state.world.for_each_market([&](dcon::market_id m) {
+		double lvl_d = 0.0;
+		if(price_index_basket) {
+			auto const life = double(state.world.market_get_life_needs_costs(m, worker_type));
+			auto const everyday = double(state.world.market_get_everyday_needs_costs(m, worker_type));
+			lvl_d = life + everyday;
+		} else {
+			double num = 0.0;
+			double den = 0.0;
+			for(uint32_t k = 1; k < state.world.commodity_size(); ++k) {
+				dcon::commodity_id c{ dcon::commodity_id::value_base_t(k) };
+				auto const cost = double(state.world.commodity_get_cost(c));
+				if(!(cost > 0.0))
+					continue;
+				auto const sup = double(state.world.market_get_supply(m, c));
+				auto const pr = double(state.world.market_get_price(m, c));
+				if(!(sup > 0.0) || !(pr > 0.0) || !std::isfinite(sup) || !std::isfinite(pr))
+					continue;
+				num += sup * pr;
+				den += sup * cost;
+			}
+			lvl_d = den > 0.0 ? num / den : 0.0;
+		}
+		float lvl = (lvl_d > 0.0 && std::isfinite(lvl_d)) ? float(lvl_d) : 0.f;
+		if(!(lvl > 0.f) || !std::isfinite(lvl))
+			lvl = price_level_prev.get(m);
+		price_level_now.set(m, lvl);
+	});
+}
 static float const target_price_stock_days = []() {
 	auto s = std::getenv("ALICE_TARGET_PRICE_STOCK_DAYS");
 	return s ? std::clamp(float(std::atof(s)), 1.f, 3650.f) : 30.f;
@@ -7462,6 +7523,8 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 
 	// price of labor
 
+	refresh_price_level(state);
+
 	concurrency::parallel_for(int32_t(0), int32_t(labor::total), [&](int32_t i) {
 		province::ve_for_each_land_province(state, [&](auto ids) {
 			ve::fp_vector supply = state.world.province_get_labor_supply(ids, i);
@@ -7511,12 +7574,29 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 			ve::apply([&](auto value) { assert(std::isfinite(value)); }, current_price);
 #endif
 			current_price = ve::max(price_properties::labor::min, ve::min(price_control * 0.0001f + current_price * 0.9999f, price_properties::labor::max));
+			if(price_income_index) {
+				// same index, same day: keep the real wage unchanged when the output price level moves
+				auto const pl = price_level_now.get(mids);
+				auto const pl_old = price_level_prev.get(mids);
+				auto const raw = pl / ve::max(pl_old, ve::fp_vector{ 0.000000001f });
+				auto const ratio = ve::select(pl_old > 0.f,
+					ve::max(ve::fp_vector{ 0.9f }, ve::min(ve::fp_vector{ 1.1f }, raw)),
+					ve::fp_vector{ 1.f });
+				current_price = current_price * ratio;
+				current_price = ve::max(price_properties::labor::min, ve::min(current_price, price_properties::labor::max));
+			}
 #ifndef NDEBUG
 			ve::apply([&](auto value) { assert(value > 0.f); }, current_price);
 #endif
 			state.world.province_set_labor_price(ids, i, ve::select(nids == dcon::nation_id{}, old_price, current_price));
 		});
 	});
+
+	if(price_income_index) {
+		state.world.for_each_market([&](dcon::market_id m) {
+			price_level_prev.set(m, price_level_now.get(m));
+		});
+	}
 
 	set_profile_point(state, "update labor prices");
 
