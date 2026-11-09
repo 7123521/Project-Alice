@@ -61,12 +61,13 @@ inline void dump_factory_trace(sys::state& state, std::string const& date) {
 		auto const good = state.world.factory_type_get_output(ftid);
 		auto const d = economy::diagnose_factory(state, f);
 		fprintf(factory_trace_csv,
-			"%s,%d,%s,%s,%s,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g\n",
+			"%s,%d,%s,%s,%s,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g\n",
 			date.c_str(), f.index(), tag_of(state, owner).c_str(),
 			text::produce_simple_string(state, state.world.province_get_name(location)).c_str(),
 			text::produce_simple_string(state, state.world.commodity_get_name(good)).c_str(),
-			double(state.world.factory_get_size(f)), double(d.output_per_worker), double(d.output_price),
-			double(d.input_cost_per_worker), double(d.wage_per_worker), double(d.profit), double(d.tokens), double(d.expand_priority));
+			double(state.world.factory_get_size(f)), double(d.desired_employment), double(d.construction_cost_per_capacity),
+			double(d.output_per_worker), double(d.output_price), double(d.input_cost_per_worker), double(d.wage_per_worker),
+			double(d.profit), double(d.profit_per_capacity), double(d.tokens), double(d.expand_priority));
 	});
 	fflush(factory_trace_csv);
 }
@@ -807,7 +808,7 @@ inline void run(sys::state& state, int years, std::string const& dump_dir) {
 		if(std::getenv("ALICE_TRACE_FACTORY")) {
 			factory_trace_csv = fopen((dump_dir + "/factory_trace.csv").c_str(), "w");
 			if(factory_trace_csv)
-				fprintf(factory_trace_csv, "date,factory,owner,province,good,size,output_per_worker,output_price,input_cost_per_worker,wage_per_worker,profit,tokens,expand_priority\n");
+				fprintf(factory_trace_csv, "date,factory,owner,province,good,size,desired_employment,construction_cost_per_capacity,output_per_worker,output_price,input_cost_per_worker,wage_per_worker,profit,profit_per_capacity,tokens,expand_priority\n");
 		}
 		// Static province map, written once: map pixel -> province id (id 0 = sea/uncolonised).
 		{

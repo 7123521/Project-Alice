@@ -1326,8 +1326,23 @@ inline float investment_expand_factory_priority(
 	const sys::state& state,
 	dcon::factory_id factory
 ) {
-	auto size = state.world.factory_get_size(factory);
-	return std::clamp((factory_total_desired_employment(state, factory) - 0.8f * size) * 5.f / (size + 1.f), 0.f, 1.f);
+	auto const size = state.world.factory_get_size(factory);
+	auto const demand_factor = std::clamp((factory_total_desired_employment(state, factory) - 0.8f * size) * 5.f / (size + 1.f), 0.f, 1.f);
+	if(!profit_investment)
+		return demand_factor;
+	auto const profit_per_capacity = explain_last_factory_profit(state, factory).profit / std::max(1.f, size);
+	auto const location = state.world.factory_get_province_from_factory_location(factory);
+	auto const zone = state.world.province_get_state_membership(location);
+	auto const market = state.world.state_instance_get_market_from_local_market(zone);
+	auto const ftid = state.world.factory_get_building_type(factory);
+	auto const& costs = state.world.factory_type_get_construction_costs(ftid);
+	auto const costs_data = get_inputs_data(state, market, costs);
+	auto const base_size = state.world.factory_type_get_base_workforce(ftid);
+	auto const cost_per_capacity = costs_data.total_cost / std::max(1.f, float(base_size)) / 2.f;
+	// annualise the daily profit flow before comparing it with the one-time construction cost
+	auto const annual_profit_per_capacity = profit_per_capacity * 365.f;
+	auto const return_ratio = cost_per_capacity > 0.f ? std::max(0.f, annual_profit_per_capacity) / cost_per_capacity : 0.f;
+	return demand_factor * std::clamp(return_ratio, 0.f, 1.f);
 }
 
 factory_diagnostic diagnose_factory(sys::state const& state, dcon::factory_id f) {
@@ -1344,10 +1359,14 @@ factory_diagnostic diagnose_factory(sys::state const& state, dcon::factory_id f)
 	result.wage_per_worker = get_total_wage(state, f) / std::max(1.f, size);
 	result.output_price = state.world.market_get_price(market, output_commodity);
 	result.profit = result.output_per_worker * result.output_price - result.input_cost_per_worker - result.wage_per_worker;
+	result.profit_per_capacity = explain_last_factory_profit(state, f).profit / std::max(1.f, size);
+	result.desired_employment = factory_total_desired_employment(state, f);
+	auto const& costs = state.world.factory_type_get_construction_costs(ftid);
+	auto const costs_data = get_inputs_data(state, market, costs);
+	auto const base_size = state.world.factory_type_get_base_workforce(ftid);
+	result.construction_cost_per_capacity = costs_data.total_cost / std::max(1.f, float(base_size)) / 2.f;
 	result.tokens = factory_investment_tokens(state, nation, location, f);
 	result.expand_priority = investment_expand_factory_priority(state, f);
-	if(profit_investment && result.profit <= 0.f)
-		result.expand_priority = 0.f;
 	return result;
 }
 

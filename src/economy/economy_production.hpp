@@ -359,6 +359,9 @@ struct factory_diagnostic {
 	float wage_per_worker = 0.f;
 	float output_price = 0.f;
 	float profit = 0.f;
+	float profit_per_capacity = 0.f;
+	float desired_employment = 0.f;
+	float construction_cost_per_capacity = 0.f;
 	float tokens = 0.f;
 	float expand_priority = 0.f;
 };
