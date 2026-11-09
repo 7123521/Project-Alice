@@ -150,8 +150,10 @@ static void dump_market_flow_trace(sys::state& state, sys::year_month_day const&
 	for(size_t i = 0; i < n; ++i) {
 		auto const& f = market_flow_snap[i];
 		auto const delta = f.money_after - f.money_before;
+		// delta is measured before the seller payout pass-through; exclude payout from both sides
+		// so residual is the actual closure error of the settlement identity.
 		auto const expected = f.arb_pos - f.arb_neg + f.exports + f.investments + f.unused_dividends + f.sales
-			+ f.refund - f.imports - f.purchases - f.dividends - f.ship_build - f.ship_maint - f.payout;
+			+ f.refund - f.imports - f.purchases - f.dividends - f.ship_build - f.ship_maint;
 		auto const residual = delta - expected;
 		auto const m = dcon::market_id{dcon::market_id::value_base_t(i)};
 		auto const zone = state.world.market_get_zone_from_local_market(m);
