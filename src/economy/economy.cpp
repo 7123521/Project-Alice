@@ -5669,7 +5669,9 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 					if(ps.guild > 0.f) producer_total += double(std::max(0.f, state.world.province_get_artisan_bank(ps.province)));
 					if(ps.factory > 0.f) producer_total += double(std::max(0.f, state.world.province_get_factory_bank(ps.province)));
 				}
-				auto const repay = std::min(double(-bank) * 0.01, producer_total * 0.1);
+				// sales-first working capital: repay the outstanding CB credit from the
+				// market's producer balances before issuing new inventory credit.
+				auto const repay = std::min(double(-bank), producer_total * 0.8);
 				if(repay > 0.0 && std::isfinite(repay)) {
 					for(auto const& ps : entry.provinces) {
 						auto const own = ps.rgo + ps.guild + ps.factory;
@@ -5692,8 +5694,12 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 				if(c == economy::money)
 					continue;
 				auto const sup = state.world.market_get_supply(m, c);
+				auto const offer = state.world.market_get_stockpile_sales(m, c);
 				auto const dem = state.world.market_get_demand(m, c);
-				auto const unsold = std::max(0.f, sup - dem);
+				// LOCAL EXPERIMENT: finance current production only, not the merchant
+				// stockpile offer that is already part of market supply.
+				auto const production = std::max(0.f, sup - offer);
+				auto const unsold = std::max(0.f, production - dem);
 				if(unsold > 0.f && std::isfinite(unsold))
 					inventory += double(unsold) * double(state.world.commodity_get_cost(c));
 			}
