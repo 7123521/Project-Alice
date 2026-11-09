@@ -59,6 +59,17 @@ static bool const seller_payout = []() {
 	auto s = std::getenv("ALICE_EXP_SELLER_PAYOUT");
 	return s && std::atoi(s) != 0;
 }();
+// LOCAL EXPERIMENT (ALICE_EXP_VALUE_ADDED_WAGE=1): set the labor-distribution target wage from
+// factory value added per worker (labor_share x (output - inputs) / employment) instead of the
+// life-needs cost that collapses with market prices. Default 0 = upstream.
+static bool const value_added_wage = []() {
+	auto s = std::getenv("ALICE_EXP_VALUE_ADDED_WAGE");
+	return s && std::atoi(s) != 0;
+}();
+static float const value_added_labor_share = []() {
+	auto s = std::getenv("ALICE_VALUE_ADDED_LABOR_SHARE");
+	return s ? std::clamp(float(std::atof(s)), 0.f, 1.f) : 0.5f;
+}();
 static bool const producer_settlement = []() {
 	auto s = std::getenv("ALICE_EXP_PRODUCER_SETTLEMENT");
 	return s && std::atoi(s) != 0;
@@ -538,7 +549,7 @@ static void dump_joint_clear_probe(sys::state& state, sys::year_month_day const&
 		if(path) {
 			joint_clear_file = fopen(path, "w");
 			if(joint_clear_file)
-				fprintf(joint_clear_file, "date,market,owner_index,good,base_demand,stock,target_stock,supply,supply_available,p_star,p_star_over_cost,q_star,current_price,current_demand,current_consumption\n");
+				fprintf(joint_clear_file, "date,market,owner_index,good,base_demand,stock,target_stock,supply,supply_available,p_star,p_star_over_cost,q_star,current_price,current_demand,current_consumption,base_need\n");
 		}
 	}
 	if(!joint_clear_file)
@@ -563,6 +574,12 @@ static void dump_joint_clear_probe(sys::state& state, sys::year_month_day const&
 					+ scale_everyday * double(state.world.pop_type_get_everyday_needs(pt, c)) * double(state.defines.alice_ev_needs_scale)
 					+ scale_luxury * double(state.world.pop_type_get_luxury_needs(pt, c)) * double(state.defines.alice_lx_needs_scale);
 			});
+			auto const base_need = base_demand;
+			auto const current_demand = double(state.world.market_get_demand(m, c));
+			// LOCAL EXPERIMENT: the prior is the larger of the needs-based demand and the
+			// demand the engine currently registers. A pure needs prior is too small for goods
+			// whose demand is mostly everyday/luxury or whose need weights have collapsed.
+			base_demand = std::max(base_need, current_demand);
 			if(!(base_demand > 0.0) || !std::isfinite(base_demand))
 				return;
 			auto const stock = double(state.world.market_get_stockpile(m, c));
@@ -574,11 +591,12 @@ static void dump_joint_clear_probe(sys::state& state, sys::year_month_day const&
 			auto const p_star = double(cost) * base_demand / supply_available;
 			auto const zone = state.world.market_get_zone_from_local_market(m);
 			auto const owner = state.world.state_instance_get_nation_from_state_ownership(zone);
-			fprintf(joint_clear_file, "%s,%d,%d,%s,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g\n",
+			fprintf(joint_clear_file, "%s,%d,%d,%s,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g\n",
 				datebuf, int(m.index()), int(owner.index()), good_name.c_str(),
 				base_demand, stock, target_stock, supply, supply_available, p_star,
 				p_star / std::max(1e-12, double(cost)), supply_available,
-				double(state.world.market_get_price(m, c)), double(state.world.market_get_demand(m, c)), double(state.world.market_get_consumption(m, c)));
+				double(state.world.market_get_price(m, c)), current_demand, double(state.world.market_get_consumption(m, c)),
+				base_need);
 		});
 	}
 	fflush(joint_clear_file);
@@ -6494,17 +6512,46 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 		// very simple labor distribution for now:
 		// just follow wages proportionally and reduce supply when wages are small
 
+		// LOCAL EXPERIMENT (ALICE_EXP_VALUE_ADDED_WAGE): province factory value added per worker.
+		static ve::vectorizable_buffer<float, dcon::province_id> value_added_wage_buffer(uint32_t(1));
+		static uint32_t value_added_wage_provinces = 1;
+		if(value_added_wage) {
+			if(state.world.province_size() > value_added_wage_provinces) {
+				value_added_wage_buffer = state.world.province_make_vectorizable_float_buffer();
+				value_added_wage_provinces = state.world.province_size();
+			}
+			state.world.for_each_province([&](dcon::province_id p) {
+				double va = 0.0;
+				double emp = 0.0;
+				for(auto fl : state.world.province_get_factory_location(p)) {
+					auto fac = fl.get_factory();
+					auto ex = explain_last_factory_profit(state, fac);
+					va += double(ex.output + ex.subsidy - ex.inputs);
+					emp += double(economy::factory_total_employment(state, fac));
+				}
+				auto const w = emp > 0.0
+					? float(double(value_added_labor_share) * std::max(0.0, va / emp))
+					: 0.f;
+				value_added_wage_buffer.set(p, std::isfinite(w) ? w : 0.f);
+			});
+		}
+
 		state.world.execute_parallel_over_province([&](auto ids) {
 			auto states = state.world.province_get_state_membership(ids);
 			auto markets = state.world.state_instance_get_market_from_local_market(states);
-			auto target_wage =
-				state.world.market_get_life_needs_costs(markets, state.culture_definitions.primary_factory_worker)
-				/ state.defines.alice_needs_scaling_factor
-				* labor_greed_life
-				+ economy::price_properties::labor::min;
+			auto target_wage = value_added_wage
+				? value_added_wage_buffer.get(ids) + ve::fp_vector{ economy::price_properties::labor::min }
+				: state.world.market_get_life_needs_costs(markets, state.culture_definitions.primary_factory_worker)
+					/ state.defines.alice_needs_scaling_factor
+					* labor_greed_life
+					+ economy::price_properties::labor::min;
 
 			auto no_education = state.world.province_get_labor_price(ids, labor::no_education);
-			target_wage = ve::min(target_wage, no_education * 0.05f);
+			// LOCAL EXPERIMENT: the 5% cap is tied to the no-education wage and would neutralise
+			// the value-added target; keep upstream behaviour when the switch is off.
+			if(!value_added_wage) {
+				target_wage = ve::min(target_wage, no_education * 0.05f);
+			}
 			auto basic_education = state.world.province_get_labor_price(ids, labor::basic_education);
 			auto high_education = state.world.province_get_labor_price(ids, labor::high_education);
 			auto high_education_and_accepted = state.world.province_get_labor_price(ids, labor::high_education_and_accepted);
