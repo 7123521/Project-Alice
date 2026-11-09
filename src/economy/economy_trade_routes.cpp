@@ -12,6 +12,9 @@
 #include "province.hpp"
 #include "price.hpp"
 #include "terms.hpp"
+#include <cstdio>
+#include <cstdlib>
+#include <string>
 
 #ifdef NDEBUG
 #ifdef _MSC_VER
@@ -153,6 +156,71 @@ static bool const trade_account = []() {
 	auto s = std::getenv("ALICE_EXP_TRADE_ACCOUNT");
 	return s && std::atoi(s) != 0;
 }();
+
+// LOCAL EXPERIMENT (ALICE_EXP_TRADE_FINANCE=1): general income/credit-based trade finance.
+// Daily import budget = 50% of the market's realized daily income (sales + export revenue EMA);
+// trade credit limit = 60 days of that income. Negative market money is the credit balance.
+static bool const trade_finance = []() {
+	auto s = std::getenv("ALICE_EXP_TRADE_FINANCE");
+	return s && std::atoi(s) != 0;
+}();
+static std::vector<float> trade_income_ema;
+static std::vector<float> trade_import_used;
+static std::vector<float> trade_import_month;
+static std::vector<float> trade_outstanding;
+static FILE* trade_finance_file = nullptr;
+static bool trade_finance_file_init = false;
+static std::string last_trade_finance_date;
+
+static void update_trade_finance_daily(sys::state& state) {
+	if(!trade_finance)
+		return;
+	auto const n = size_t(state.world.market_size());
+	if(trade_income_ema.size() < n) {
+		trade_income_ema.resize(n, 0.f);
+		trade_import_used.resize(n, 0.f);
+		trade_import_month.resize(n, 0.f);
+		trade_outstanding.resize(n, 0.f);
+	}
+	state.world.for_each_market([&](dcon::market_id m) {
+		auto const i = size_t(m.index());
+		auto const income = state.world.market_get_sales(m)
+			+ std::max(0.f, state.world.market_get_export_cut(m));
+		auto& ema = trade_income_ema[i];
+		ema = ema > 0.f ? ema * 0.9f + income * 0.1f : income;
+		trade_import_used[i] = 0.f;
+		trade_outstanding[i] = std::max(0.f, -state.world.market_get_stockpile(m, economy::money));
+	});
+	auto const ymd = state.current_date.to_ymd(state.start_date);
+	if(ymd.day != 1)
+		return;
+	char datebuf[16];
+	std::snprintf(datebuf, sizeof(datebuf), "%04d-%02d-%02d", ymd.year, ymd.month, ymd.day);
+	if(last_trade_finance_date == datebuf)
+		return;
+	last_trade_finance_date = datebuf;
+	if(!trade_finance_file_init) {
+		trade_finance_file_init = true;
+		auto const path = std::getenv("ALICE_TRADE_FINANCE_FILE");
+		if(path) {
+			trade_finance_file = fopen(path, "w");
+			if(trade_finance_file)
+				fprintf(trade_finance_file, "date,market,owner_index,income_ema,flow_budget,credit_limit,outstanding,import_month\n");
+		}
+	}
+	if(!trade_finance_file)
+		return;
+	for(size_t i = 0; i < n; ++i) {
+		auto const m = dcon::market_id{dcon::market_id::value_base_t(i)};
+		auto const zone = state.world.market_get_zone_from_local_market(m);
+		auto const owner = state.world.state_instance_get_nation_from_state_ownership(zone);
+		fprintf(trade_finance_file, "%s,%d,%d,%.6g,%.6g,%.6g,%.6g,%.6g\n",
+			datebuf, int(i), owner.index(), double(trade_income_ema[i]), double(0.5f * trade_income_ema[i]),
+			double(60.f * trade_income_ema[i]), double(trade_outstanding[i]), double(trade_import_month[i]));
+	}
+	fflush(trade_finance_file);
+	std::fill(trade_import_month.begin(), trade_import_month.end(), 0.f);
+}
 
 /*
 New model of trade update:
@@ -795,6 +863,8 @@ void update_trade_routes_volume(
 	ve::vectorizable_buffer<float, dcon::state_instance_id>& state_port_is_occupied
 ) {
 
+	update_trade_finance_daily(state);
+
 	state.world.execute_parallel_over_trade_route([&](auto trade_route) {
 		auto origin = state.world.trade_route_get_origin(trade_route);
 		auto target = state.world.trade_route_get_target(trade_route);
@@ -897,6 +967,43 @@ void update_trade_routes_volume(
 			state.world.trade_route_set_volume(trade_route, c, next);
 		}
 	});
+
+	if(trade_finance) {
+		state.world.for_each_trade_route([&](dcon::trade_route_id route) {
+			if(!state.world.trade_route_is_valid(route))
+				return;
+			auto const origin = state.world.trade_route_get_origin(route);
+			auto const target = state.world.trade_route_get_target(route);
+			auto const ti = size_t(target.index());
+			if(ti >= trade_income_ema.size())
+				return;
+			auto const income = trade_income_ema[ti];
+			auto remaining_value = std::max(0.f, 0.5f * income - trade_import_used[ti]);
+			auto const credit_limit = 60.f * income;
+			auto const outstanding = std::max(0.f, -state.world.market_get_stockpile(target, economy::money));
+			remaining_value = std::min(remaining_value, std::max(0.f, credit_limit - outstanding));
+			state.world.for_each_commodity([&](dcon::commodity_id cid) {
+				if(state.world.commodity_get_money_rgo(cid) || state.world.commodity_get_is_local(cid))
+					return;
+				auto volume = state.world.trade_route_get_volume(route, cid);
+				if(!(volume > 0.f) || !std::isfinite(volume))
+					return;
+				auto const price = state.world.market_get_price(target, cid);
+				if(price > 0.f)
+					volume = std::min(volume, remaining_value / price);
+				volume = std::min(volume, std::max(0.f, state.world.market_get_stockpile(origin, cid)));
+				if(!std::isfinite(volume) || !(volume > 0.f)) {
+					state.world.trade_route_set_volume(route, cid, 0.f);
+					return;
+				}
+				state.world.trade_route_set_volume(route, cid, volume);
+				auto const value = volume * price;
+				trade_import_used[ti] += value;
+				trade_import_month[ti] += value;
+				remaining_value = std::max(0.f, remaining_value - value);
+			});
+		});
+	}
 }
 
 
