@@ -18,6 +18,13 @@
 namespace economy {
 namespace pops {
 
+// LOCAL EXPERIMENT (ALICE_EXP_DIRECT_FACTORY_WAGE=1): credit the direct factory wage bill to the
+// factory worker pop type, so producer-bank debit and household credit are the same money.
+static bool const direct_factory_wage = []() {
+	auto s = std::getenv("ALICE_EXP_DIRECT_FACTORY_WAGE");
+	return s && std::atoi(s) != 0;
+}();
+
 static std::vector<float> market_life_spending;
 static std::vector<float> market_disposable;
 static std::vector<float> pop_income_before;
@@ -1926,6 +1933,23 @@ void update_income_wages(sys::state& state){
 	static auto buffer_high_not_accepted_workers_wage = state.world.province_make_vectorizable_float_buffer();
 	static auto buffer_high_accepted_workers_wage = state.world.province_make_vectorizable_float_buffer();
 
+	// LOCAL EXPERIMENT: province direct factory wage bill (sum over factories).
+	static ve::vectorizable_buffer<float, dcon::province_id> direct_factory_wage_bill(uint32_t(1));
+	static uint32_t direct_factory_wage_provinces = 1;
+	if(direct_factory_wage) {
+		if(state.world.province_size() > direct_factory_wage_provinces) {
+			direct_factory_wage_bill = state.world.province_make_vectorizable_float_buffer();
+			direct_factory_wage_provinces = state.world.province_size();
+		}
+		state.world.for_each_province([&](dcon::province_id p) {
+			double total = 0.0;
+			for(auto fl : state.world.province_get_factory_location(p)) {
+				total += double(get_total_wage(state, fl.get_factory()));
+			}
+			direct_factory_wage_bill.set(p, std::isfinite(total) ? float(total) : 0.f);
+		});
+	}
+
 	province::ve_parallel_for_each_land_province(state, [&](auto pid) {
 		auto no_education_wage =
 			state.world.province_get_labor_price(pid, labor::no_education)
@@ -1984,6 +2008,17 @@ void update_income_wages(sys::state& state){
 			* high_education_and_accepted_wage;
 
 		buffer_high_accepted_workers_wage.set(pid, high_accepted_workers_wage);
+
+		if(direct_factory_wage) {
+			auto const wage_bill = direct_factory_wage_bill.get(pid);
+			auto const craftsmen = state.world.province_get_demographics(pid,
+				demographics::to_key(state, state.culture_definitions.primary_factory_worker));
+			auto const per_worker = ve::select(craftsmen > 0.f, wage_bill / ve::max(craftsmen, ve::fp_vector{ 1.f }), ve::fp_vector{ 0.f });
+			buffer_primary_workers_wage.set(pid, per_worker);
+			// the direct bill is fully credited to the primary factory worker pop; avoid double payment
+			buffer_high_not_accepted_workers_wage.set(pid, ve::fp_vector{ 0.f });
+			buffer_high_accepted_workers_wage.set(pid, ve::fp_vector{ 0.f });
+		}
 
 		// RGOS and slaves cashback
 		auto profit_from_slaves = ve::apply([&](dcon::province_id province, float earning_per_slave) {

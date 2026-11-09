@@ -30,6 +30,17 @@ uint32_t size(sys::state const& state) {
 
 namespace economy {
 
+// LOCAL EXPERIMENT (ALICE_EXP_DIRECT_FACTORY_WAGE=1): pay factories a labour share of value added
+// (output value - input cost) instead of labour_price x employment. Default 0 = upstream.
+static bool const direct_factory_wage = []() {
+	auto s = std::getenv("ALICE_EXP_DIRECT_FACTORY_WAGE");
+	return s && std::atoi(s) != 0;
+}();
+static float const direct_factory_wage_share = []() {
+	auto s = std::getenv("ALICE_VALUE_ADDED_LABOR_SHARE");
+	return s ? std::max(0.f, std::min(1.f, float(std::atof(s)))) : 0.5f;
+}();
+
 // LOCAL EXPERIMENT (ALICE_EXP_RGO_HARVEST_UTILIZATION=1): part of the RGO harvest is seed,
 // feed, on-farm consumption and field loss; only the remainder is marketed. The fraction is
 // per-commodity calibration (prototype: Grain 0.30, other RGO 0), not a uniform cut. Gross
@@ -1111,6 +1122,19 @@ float factory_throughput_additional_multiplier(sys::state const& state, dcon::fa
 }
 
 float get_total_wage(const sys::state& state, dcon::factory_id f) {
+	if(direct_factory_wage) {
+		auto location = state.world.factory_get_province_from_factory_location(f);
+		auto zone = state.world.province_get_state_membership(location);
+		auto market = state.world.state_instance_get_market_from_local_market(zone);
+		auto ftid = state.world.factory_get_building_type(f);
+		auto output_commodity = state.world.factory_type_get_output(ftid);
+		auto const output_value = state.world.factory_get_output(f)
+			* state.world.market_get_price(market, output_commodity)
+			* state.world.market_get_actual_probability_to_sell(market, output_commodity);
+		auto const value_added = std::max(0.f, output_value - state.world.factory_get_input_cost(f));
+		auto const wage = direct_factory_wage_share * value_added;
+		return std::isfinite(wage) ? wage : 0.f;
+	}
 	auto labor_market = state.world.factory_get_province_from_factory_location(f);
 	return state.world.province_get_labor_price(labor_market, labor::no_education)
 		* state.world.province_get_labor_demand_satisfaction(labor_market, labor::no_education)
