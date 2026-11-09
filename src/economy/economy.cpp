@@ -190,6 +190,14 @@ static bool const trace_grain_flow = []() {
 	auto s = std::getenv("ALICE_TRACE_GRAIN_FLOW");
 	return s && std::atoi(s) != 0;
 }();
+// LOCAL TRACE (ALICE_TRACE_NEEDS_CALIB=1): monthly per-commodity comparison of the full need
+// (weight = 1) with registered demand and production. Read-only; no economic effect.
+static bool const trace_needs_calib = []() {
+	auto s = std::getenv("ALICE_TRACE_NEEDS_CALIB");
+	return s && std::atoi(s) != 0;
+}();
+static FILE* needs_calib_file = nullptr;
+static bool needs_calib_init = false;
 static FILE* grain_flow_file = nullptr;
 static bool grain_flow_file_init = false;
 static std::string last_grain_flow_date;
@@ -205,6 +213,14 @@ static bool const target_price = []() {
 static float const target_price_speed = []() {
 	auto s = std::getenv("ALICE_TARGET_PRICE_SPEED");
 	return s ? std::clamp(float(std::atof(s)), 0.0001f, 0.1f) : 0.005f;
+}();
+// LOCAL EXPERIMENT (ALICE_EXP_PRICE_FLOW_SUPPLY=1): the price update sees flow supply
+// (production and imports) instead of supply that includes the merchant stockpile offer.
+// With the offer included, a large inventory permanently depresses its own price, which makes
+// the inventory worthless and prevents it from ever being sold. Default 0 = upstream.
+static bool const price_flow_supply = []() {
+	auto s = std::getenv("ALICE_EXP_PRICE_FLOW_SUPPLY");
+	return s && std::atoi(s) != 0;
 }();
 // LOCAL EXPERIMENT (ALICE_EXP_COST_PLUS_PRICE=1): price converges to cost x (1 + markup)
 // instead of reacting to supply and demand. Quantities then clear through inventory and
@@ -671,6 +687,84 @@ static void dump_grain_flow_trace(sys::state& state, sys::year_month_day const& 
 			double(state.world.market_get_actual_probability_to_buy(m, grain)), double(state.world.market_get_actual_probability_to_sell(m, grain)));
 	});
 	fflush(grain_flow_file);
+}
+
+static void dump_needs_calib_trace(sys::state& state, sys::year_month_day const& ymd) {
+	if(!trace_needs_calib || ymd.day != 1)
+		return;
+	if(!needs_calib_init) {
+		needs_calib_init = true;
+		auto const path = std::getenv("ALICE_NEEDS_CALIB_FILE");
+		if(path)
+			needs_calib_file = fopen(path, "w");
+		if(needs_calib_file)
+			fprintf(needs_calib_file, "date,cid,good,need_life_full,need_other_full,need_life_weighted,demand,supply,rgo_output,factory_output,consumption,stockpile,price,cost\n");
+	}
+	if(!needs_calib_file)
+		return;
+	auto const n = state.world.commodity_size();
+	std::vector<double> life_full(n, 0.0), other_full(n, 0.0), life_weighted(n, 0.0);
+	auto const scaling = double(state.defines.alice_needs_scaling_factor);
+	state.world.for_each_pop([&](dcon::pop_id p) {
+		auto const pt = state.world.pop_get_poptype(p);
+		auto const size = double(state.world.pop_get_size(p));
+		auto const prov = state.world.pop_get_province_from_pop_location(p);
+		auto const sid = state.world.province_get_state_membership(prov);
+		auto const mid = state.world.state_instance_get_market_from_local_market(sid);
+		if(!mid)
+			return;
+		auto const m = double(size) / scaling;
+		for(uint32_t k = 1; k < n; ++k) {
+			dcon::commodity_id c{ dcon::commodity_id::value_base_t(k) };
+			auto const lf = double(state.world.pop_type_get_life_needs(pt, c));
+			auto const ev = double(state.world.pop_type_get_everyday_needs(pt, c));
+			auto const lx = double(state.world.pop_type_get_luxury_needs(pt, c));
+			if(lf == 0.0 && ev == 0.0 && lx == 0.0)
+				continue;
+			life_full[k] += m * lf;
+			other_full[k] += m * (ev + lx);
+			life_weighted[k] += m * lf * double(state.world.market_get_life_needs_weights(mid, c));
+		}
+	});
+	std::vector<double> demand(n, 0.0), supply(n, 0.0), consumption(n, 0.0), stockpile(n, 0.0), price(n, 0.0);
+	state.world.for_each_market([&](dcon::market_id mk) {
+		for(uint32_t k = 1; k < n; ++k) {
+			dcon::commodity_id c{ dcon::commodity_id::value_base_t(k) };
+			demand[k] += double(state.world.market_get_demand(mk, c));
+			supply[k] += double(state.world.market_get_supply(mk, c));
+			consumption[k] += double(state.world.market_get_consumption(mk, c));
+			stockpile[k] += double(state.world.market_get_stockpile(mk, c));
+			price[k] += double(state.world.market_get_price(mk, c));
+		}
+	});
+	std::vector<double> rgo(n, 0.0), fac(n, 0.0);
+	state.world.for_each_province([&](dcon::province_id p) {
+		for(uint32_t k = 1; k < n; ++k) {
+			dcon::commodity_id c{ dcon::commodity_id::value_base_t(k) };
+			rgo[k] += double(state.world.province_get_rgo_output(p, c));
+		}
+	});
+	state.world.for_each_factory([&](dcon::factory_id f) {
+		auto const ftid = state.world.factory_get_building_type(f);
+		auto const c = state.world.factory_type_get_output(ftid);
+		if(c)
+			fac[c.id.index()] += double(state.world.factory_get_output(f));
+	});
+	char datebuf[16];
+	std::snprintf(datebuf, sizeof(datebuf), "%04d-%02d-%02d", ymd.year, ymd.month, ymd.day);
+	auto const market_count = double(state.world.market_size());
+	state.world.for_each_commodity([&](dcon::commodity_id c) {
+		if(c.index() == 0)
+			return;
+		auto const cost = double(state.world.commodity_get_cost(c));
+		auto const avg_price = market_count > 0.0 ? price[c.index()] / market_count : 0.0;
+		fprintf(needs_calib_file, "%s,%u,%s,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g\n",
+			datebuf, unsigned(c.index()), text::produce_simple_string(state, state.world.commodity_get_name(c)).c_str(),
+			life_full[c.index()], other_full[c.index()], life_weighted[c.index()],
+			demand[c.index()], supply[c.index()], rgo[c.index()], fac[c.index()],
+			consumption[c.index()], stockpile[c.index()], avg_price, cost);
+	});
+	fflush(needs_calib_file);
 }
 
 static void dump_joint_clear_probe(sys::state& state, sys::year_month_day const& ymd) {
@@ -5466,6 +5560,7 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 	dump_market_flow_trace(state, trace_ymd);
 	dump_grain_trace(state, trace_ymd);
 	dump_grain_flow_trace(state, trace_ymd);
+	dump_needs_calib_trace(state, trace_ymd);
 	dump_joint_clear_probe(state, trace_ymd);
 	dump_price_decomp_trace(state, trace_ymd);
 	dump_pop_demand_probe(state, trace_ymd);
@@ -7624,6 +7719,10 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 		state.world.execute_serial_over_market([&](auto ids) {
 			ve::fp_vector supply = state.world.market_get_aggregated_supply_history(ids, cid);
 			ve::fp_vector demand = state.world.market_get_aggregated_demand_history(ids, cid);
+			if(price_flow_supply) {
+				auto const offer = state.world.market_get_stockpile_sales(ids, cid);
+				supply = ve::max(ve::fp_vector{ 0.f }, supply - offer);
+			}
 			auto current_price = ve_price(state, ids, cid);
 			auto next_price = current_price;
 			if(presimulation) {
