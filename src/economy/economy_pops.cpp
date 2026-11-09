@@ -26,6 +26,15 @@ static bool pop_budget_file_init = false;
 static double trace_daily_wage_income = 0.0;
 static double trace_daily_property_income = 0.0;
 
+// LOCAL TRACE (ALICE_TRACE_DEMAND_FORMATION=1): decomposition of the demand registered for one
+// probe commodity: base_life x scale_life(market,poptype) x life_mul x life_weight x lf_scale.
+static bool const demand_formation_trace = []() {
+	auto env = std::getenv("ALICE_TRACE_DEMAND_FORMATION");
+	return env && std::atoi(env) != 0;
+}();
+static FILE* demand_formation_file = nullptr;
+static bool demand_formation_file_init = false;
+
 namespace economy {
 namespace pops {
 
@@ -1160,6 +1169,57 @@ void update_consumption(
 				ratio_w_den > 0.0 ? below50 / ratio_w_den : 0.0,
 				ratio_w_den > 0.0 ? below100 / ratio_w_den : 0.0);
 			fflush(pop_budget_file);
+		}
+	}
+
+	if(demand_formation_trace) {
+		dcon::commodity_id probe{};
+		state.world.for_each_commodity([&](dcon::commodity_id c) {
+			if(!probe && text::produce_simple_string(state, state.world.commodity_get_name(c)) == "Grain")
+				probe = c;
+		});
+		if(probe) {
+			if(!demand_formation_file_init) {
+				demand_formation_file_init = true;
+				auto const path = std::getenv("ALICE_DEMAND_FORMATION_FILE");
+				if(path)
+					demand_formation_file = fopen(path, "w");
+				if(demand_formation_file)
+					fprintf(demand_formation_file, "date,market,poptype,scale_life,base_life,life_mul,life_weight,lf_scale,demand_g,market_demand,market_supply\n");
+			}
+			auto const ymd = state.current_date.to_ymd(state.start_date);
+			if(demand_formation_file && ymd.day == 1) {
+				char datebuf[16];
+				std::snprintf(datebuf, sizeof(datebuf), "%04d-%02d-%02d", ymd.year, ymd.month, ymd.day);
+				auto const lf_scale = state.defines.alice_lf_needs_scale;
+				state.world.for_each_market([&](dcon::market_id m) {
+					auto const zone = state.world.market_get_zone_from_local_market(m);
+					auto const nation = state.world.state_instance_get_nation_from_state_ownership(zone);
+					double const life_mul[3] = {
+						nation ? double(state.world.nation_get_modifier_values(nation, sys::national_mod_offsets::poor_life_needs)) + 1.0 : 1.0,
+						nation ? double(state.world.nation_get_modifier_values(nation, sys::national_mod_offsets::middle_life_needs)) + 1.0 : 1.0,
+						nation ? double(state.world.nation_get_modifier_values(nation, sys::national_mod_offsets::rich_life_needs)) + 1.0 : 1.0
+					};
+					auto const weight = double(state.world.market_get_life_needs_weights(m, probe));
+					auto const total_demand = double(state.world.market_get_demand(m, probe));
+					auto const total_supply = double(state.world.market_get_supply(m, probe));
+					double computed = 0.0;
+					state.world.for_each_pop_type([&](dcon::pop_type_id t) {
+						auto const base_life = double(state.world.pop_type_get_life_needs(t, probe));
+						if(base_life <= 0.0)
+							return;
+						auto const strata = state.world.pop_type_get_strata(t);
+						auto const scale_life = double(state.world.market_get_life_needs_scale(m, t));
+						auto const demand = base_life * scale_life * life_mul[strata] * weight * double(lf_scale);
+						computed += demand;
+						fprintf(demand_formation_file, "%s,%u,%u,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g\n",
+							datebuf, unsigned(m.index()), unsigned(t.index()), scale_life, base_life,
+							life_mul[strata], weight, double(lf_scale), demand, total_demand, total_supply);
+					});
+					(void)computed;
+				});
+				fflush(demand_formation_file);
+			}
 		}
 	}
 }
