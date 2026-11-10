@@ -7448,70 +7448,70 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 			state.world.province_set_pop_labor_distribution(
 				ids,
 				pop_labor::rgo_worker_no_education,
-				no_education / (no_education + target_wage + price_properties::labor::min) * 0.1f
+				ve::select((no_education + target_wage ) > 0.f, no_education / (no_education + target_wage ), ve::fp_vector{0.f}) * 0.1f
 				+ state.world.province_get_pop_labor_distribution(ids, pop_labor::rgo_worker_no_education) * 0.9f
 			);
 
 			state.world.province_set_pop_labor_distribution(
 				ids,
 				pop_labor::primary_no_education,
-				no_education / (no_education + basic_education + target_wage + price_properties::labor::min) * 0.1f
+				ve::select((no_education + basic_education + target_wage ) > 0.f, no_education / (no_education + basic_education + target_wage ), ve::fp_vector{0.f}) * 0.1f
 				+ state.world.province_get_pop_labor_distribution(ids, pop_labor::primary_no_education) * 0.9f
 			);
 
 			state.world.province_set_pop_labor_distribution(
 				ids,
 				pop_labor::high_education_accepted_no_education,
-				no_education / (no_education + basic_education + high_education + high_education_and_accepted + target_wage + price_properties::labor::min) * 0.1f
+				ve::select((no_education + basic_education + high_education + high_education_and_accepted + target_wage ) > 0.f, no_education / (no_education + basic_education + high_education + high_education_and_accepted + target_wage ), ve::fp_vector{0.f}) * 0.1f
 				+ state.world.province_get_pop_labor_distribution(ids, pop_labor::high_education_accepted_no_education) * 0.9f
 			);
 
 			state.world.province_set_pop_labor_distribution(
 				ids,
 				pop_labor::high_education_not_accepted_no_education,
-				no_education / (no_education + basic_education + high_education + target_wage + price_properties::labor::min) * 0.1f
+				ve::select((no_education + basic_education + high_education + target_wage ) > 0.f, no_education / (no_education + basic_education + high_education + target_wage ), ve::fp_vector{0.f}) * 0.1f
 				+ state.world.province_get_pop_labor_distribution(ids, pop_labor::high_education_not_accepted_no_education) * 0.9f
 			);
 
 			state.world.province_set_pop_labor_distribution(
 				ids,
 				pop_labor::primary_basic_education,
-				basic_education / (no_education + basic_education + target_wage + price_properties::labor::min) * 0.1f
+				ve::select((no_education + basic_education + target_wage ) > 0.f, basic_education / (no_education + basic_education + target_wage ), ve::fp_vector{0.f}) * 0.1f
 				+ state.world.province_get_pop_labor_distribution(ids, pop_labor::primary_basic_education) * 0.9f
 			);
 
 			state.world.province_set_pop_labor_distribution(
 				ids,
 				pop_labor::high_education_accepted_basic_education,
-				basic_education / (no_education + basic_education + high_education + high_education_and_accepted + target_wage + price_properties::labor::min) * 0.1f
+				ve::select((no_education + basic_education + high_education + high_education_and_accepted + target_wage ) > 0.f, basic_education / (no_education + basic_education + high_education + high_education_and_accepted + target_wage ), ve::fp_vector{0.f}) * 0.1f
 				+ state.world.province_get_pop_labor_distribution(ids, pop_labor::high_education_accepted_basic_education) * 0.9f
 			);
 
 			state.world.province_set_pop_labor_distribution(
 				ids,
 				pop_labor::high_education_not_accepted_basic_education,
-				basic_education / (no_education + basic_education + high_education + target_wage + price_properties::labor::min) * 0.1f
+				ve::select((no_education + basic_education + high_education + target_wage ) > 0.f, basic_education / (no_education + basic_education + high_education + target_wage ), ve::fp_vector{0.f}) * 0.1f
 				+ state.world.province_get_pop_labor_distribution(ids, pop_labor::high_education_not_accepted_basic_education) * 0.9f
 			);
 
 			state.world.province_set_pop_labor_distribution(
 				ids,
 				pop_labor::high_education_accepted_high_education,
-				high_education / (no_education + basic_education + high_education + high_education_and_accepted + target_wage + price_properties::labor::min) * 0.1f
+				ve::select((no_education + basic_education + high_education + high_education_and_accepted + target_wage ) > 0.f, high_education / (no_education + basic_education + high_education + high_education_and_accepted + target_wage ), ve::fp_vector{0.f}) * 0.1f
 				+ state.world.province_get_pop_labor_distribution(ids, pop_labor::high_education_accepted_high_education) * 0.9f
 			);
 
 			state.world.province_set_pop_labor_distribution(
 				ids,
 				pop_labor::high_education_not_accepted_high_education,
-				high_education / (no_education + basic_education + high_education + target_wage + price_properties::labor::min) * 0.1f
+				ve::select((no_education + basic_education + high_education + target_wage ) > 0.f, high_education / (no_education + basic_education + high_education + target_wage ), ve::fp_vector{0.f}) * 0.1f
 				+ state.world.province_get_pop_labor_distribution(ids, pop_labor::high_education_not_accepted_high_education) * 0.9f
 			);
 
 			state.world.province_set_pop_labor_distribution(
 				ids,
 				pop_labor::high_education_accepted_high_education_accepted,
-				high_education_and_accepted / (no_education + basic_education + high_education + high_education_and_accepted + target_wage + price_properties::labor::min) * 0.1f
+				ve::select((no_education + basic_education + high_education + high_education_and_accepted + target_wage ) > 0.f, high_education_and_accepted / (no_education + basic_education + high_education + high_education_and_accepted + target_wage ), ve::fp_vector{0.f}) * 0.1f
 				+ state.world.province_get_pop_labor_distribution(ids, pop_labor::high_education_accepted_high_education_accepted) * 0.9f
 			);
 
