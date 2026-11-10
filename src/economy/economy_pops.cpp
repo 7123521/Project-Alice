@@ -24,6 +24,7 @@ static bool const pop_budget_trace = []() {
 static FILE* pop_budget_file = nullptr;
 static bool pop_budget_file_init = false;
 static double trace_daily_wage_income = 0.0;
+static double trace_daily_natural_wage_credit = 0.0;
 static double trace_daily_property_income = 0.0;
 
 // LOCAL TRACE (ALICE_TRACE_DEMAND_FORMATION=1): decomposition of the demand registered for one
@@ -2334,6 +2335,10 @@ void update_income_wages(sys::state& state){
 			ve::apply([&](float v) { sum += double(v); }, pop_wage_income.get(ids));
 		});
 		trace_daily_wage_income = sum;
+		{
+			auto const sc = economy::wage_credit_payout_scale();
+			trace_daily_natural_wage_credit = (std::isfinite(sc) && sc > 1e-9f) ? (sum / double(sc)) : sum;
+		}
 	}
 
 	market_poptype_wage_stride = int(state.world.pop_type_size());
@@ -2661,5 +2666,11 @@ float estimate_pops_consumption(sys::state const& state, dcon::commodity_id c, d
 namespace economy {
 double daily_wage_credit() {
 	return ::trace_daily_wage_income;
+}
+}
+
+namespace economy {
+double daily_natural_wage_credit() {
+	return ::trace_daily_natural_wage_credit;
 }
 }

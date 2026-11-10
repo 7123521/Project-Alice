@@ -7753,17 +7753,17 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 		}
 
 		{
+			auto rgo_wage_bill = 0.f;
+			if(!rgo_factor_income) {
+				state.world.for_each_commodity([&](dcon::commodity_id c) {
+					if(c == economy::money)
+						return;
+					rgo_wage_bill += economy::rgo_cost_wage(state, c, pid);
+				});
+			}
+			if(wage_conservation && size_t(pid.index()) < province_wage_debit_cache.size())
+				province_wage_debit_cache[size_t(pid.index())] = province_factory_wage_bill + rgo_wage_bill;
 			if(seller_payout) {
-				auto rgo_wage_bill = 0.f;
-				if(!rgo_factor_income) {
-					state.world.for_each_commodity([&](dcon::commodity_id c) {
-						if(c == economy::money)
-							return;
-						rgo_wage_bill += economy::rgo_cost_wage(state, c, pid);
-					});
-				}
-				if(wage_conservation && size_t(pid.index()) < province_wage_debit_cache.size())
-					province_wage_debit_cache[size_t(pid.index())] = province_factory_wage_bill + rgo_wage_bill;
 				if(wage_conservation && wage_scale != 1.f)
 					rgo_wage_bill *= wage_scale;
 				auto current_bank = state.world.province_get_rgo_bank(pid);
@@ -7791,7 +7791,7 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 		for(auto v : province_wage_debit_cache)
 			total += double(v);
 		wage_debit_prev = total;
-		wage_payout_scale = total > 1e-9 ? float(wage_actual_day / total) : 1.f;
+		wage_payout_scale = (seller_payout && total > 1e-9) ? float(wage_actual_day / total) : 1.f;
 	}
 
 	set_profile_point(state, "rgo/factory banks");
@@ -7814,7 +7814,7 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 	pops::update_income_wages(state);
 
 	if(wage_conservation)
-		wage_credit_prev = economy::daily_wage_credit();
+		wage_credit_prev = economy::daily_natural_wage_credit();
 
 	set_profile_point(state, "wages");
 
