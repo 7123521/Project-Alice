@@ -2299,7 +2299,7 @@ void update_income_wages(sys::state& state){
 #endif // !NDEBUG
 	});
 
-	if(pop_budget_trace) {
+	{
 		double sum = 0.0;
 		state.world.execute_serial_over_pop([&](auto ids) {
 			ve::apply([&](float v) { sum += double(v); }, pop_wage_income.get(ids));
@@ -2626,5 +2626,11 @@ float estimate_pops_consumption(sys::state const& state, dcon::commodity_id c, d
 	});
 
 	return total * satisfaction;
+}
+}
+
+namespace economy {
+double daily_wage_credit() {
+	return ::trace_daily_wage_income;
 }
 }

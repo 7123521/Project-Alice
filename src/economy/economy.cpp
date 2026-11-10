@@ -4422,8 +4422,70 @@ static void nan_watch_scan(sys::state& state, char const* tag) {
 	});
 }
 
+// LOCAL TRACE (ALICE_TRACE_MONEY_LEDGER=1): sum every money pool after each stage and report the
+// stages that create or destroy money. Read-only; no economic effect.
+static bool const money_ledger_trace = []() {
+	auto s = std::getenv("ALICE_TRACE_MONEY_LEDGER");
+	return s && std::atoi(s) != 0;
+}();
+static double money_pool_total(sys::state& state) {
+	double total = 0.0;
+	state.world.for_each_market([&](dcon::market_id m) {
+		total += double(state.world.market_get_stockpile(m, economy::money));
+		total += double(state.world.market_get_pop_investments(m));
+		total += double(state.world.market_get_pop_dividends(m));
+	});
+	state.world.for_each_pop([&](dcon::pop_id p) {
+		total += double(state.world.pop_get_savings(p));
+	});
+	state.world.for_each_nation([&](dcon::nation_id n) {
+		if(!state.world.nation_is_valid(n))
+			return;
+		total += double(state.world.nation_get_treasury(n));
+		total += double(state.world.nation_get_national_bank(n));
+		total += double(state.world.nation_get_private_investment(n));
+	});
+	state.world.for_each_province([&](dcon::province_id p) {
+		total += double(state.world.province_get_rgo_bank(p));
+		total += double(state.world.province_get_factory_bank(p));
+		total += double(state.world.province_get_artisan_bank(p));
+		for(int32_t i = 0; i < advanced_province_buildings::list::total; ++i)
+			total += double(state.world.province_get_advanced_province_building_private_savings(p, i));
+	});
+	return total;
+}
+// LOCAL TRACE (ALICE_TRACE_WAGE_CONSERVATION=1): compare the wage credits paid to pops with the
+// wage debits taken from producer banks on the same day.
+static bool const wage_conservation_trace = []() {
+	auto s = std::getenv("ALICE_TRACE_WAGE_CONSERVATION");
+	return s && std::atoi(s) != 0;
+}();
+static double wage_credit_day = 0.0;
+static double wage_debit_day = 0.0;
+
+static void money_ledger_mark(sys::state& state, char const* tag) {
+	if(!money_ledger_trace)
+		return;
+	static double prev = 0.0;
+	static bool has_prev = false;
+	auto const now = money_pool_total(state);
+	if(!has_prev) {
+		has_prev = true;
+		prev = now;
+		return;
+	}
+	auto const delta = now - prev;
+	if(std::abs(delta) > 1.0) {
+		auto const ymd = state.current_date.to_ymd(state.start_date);
+		fprintf(stderr, "MONEYLEDGER %04d-%02d-%02d %-34s total=%.6f delta=%+.6f\n",
+			ymd.year, ymd.month, ymd.day, tag, now, delta);
+	}
+	prev = now;
+}
+
 static void set_profile_point(sys::state& state, std::string name) {
 	nan_watch_scan(state, name.c_str());
+	money_ledger_mark(state, name.c_str());
 	/*
 	nation_monetary_breakdown data{};
 	state.world.for_each_nation([&](auto n) {
@@ -4548,6 +4610,9 @@ void decay_government_stockpiles(sys::state& state) {
 
 void daily_update(sys::state& state, bool presimulation, float presimulation_stage, int date_offset) {
 	sanity_check(state);
+
+	wage_credit_day = 0.0;
+	wage_debit_day = 0.0;
 
 	set_profile_point(state, "start");
 
@@ -7479,6 +7544,8 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 				total_wage_bill += profit.wages;
 			}
 
+			if(wage_conservation_trace)
+				wage_debit_day += double(total_wage_bill);
 			auto current_bank = state.world.province_get_factory_bank(pid);
 			if(seller_payout) {
 				// gross sales were credited at settlement; pay inputs and wages out of that revenue
@@ -7505,6 +7572,8 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 						rgo_wage_bill += economy::rgo_cost_wage(state, c, pid);
 					});
 				}
+				if(wage_conservation_trace)
+					wage_debit_day += double(rgo_wage_bill);
 				auto current_bank = state.world.province_get_rgo_bank(pid);
 				state.world.province_set_rgo_bank(pid, current_bank - rgo_wage_bill);
 			} else {
@@ -7542,6 +7611,16 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 	});
 
 	set_profile_point(state, "update income buffer");
+
+	if(wage_conservation_trace) {
+		auto const credit = economy::daily_wage_credit();
+		auto const ymd = state.current_date.to_ymd(state.start_date);
+		if(ymd.day == 1) {
+			fprintf(stderr, "WAGELEDGER %04d-%02d-%02d credit=%.6f debit=%.6f diff=%+.6f\n",
+				ymd.year, ymd.month, ymd.day, credit, wage_debit_day, credit - wage_debit_day);
+			fflush(stderr);
+		}
+	}
 
 	// #####################
 	// # TAXES AND TARIFFS #

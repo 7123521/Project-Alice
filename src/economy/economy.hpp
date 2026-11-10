@@ -10,6 +10,10 @@
 
 namespace economy {
 
+// LOCAL TRACE: today's total wage credited to pops (pops::update_income_wages).
+double daily_wage_credit();
+
+
 // LOCAL EXPERIMENT: previous-day factory bank balance, used by the financed wage.
 float get_factory_bank_start(sys::state const& state, dcon::province_id p);
 // LOCAL EXPERIMENT: day's financed factory wage bill per province (set by the producer block).
