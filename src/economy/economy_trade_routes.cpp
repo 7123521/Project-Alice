@@ -148,6 +148,16 @@ constexpr term::fetch_trade_owner<left_t> trade_route_get_owner(sys::state const
 
 namespace economy {
 
+// LOCAL EXPERIMENT (ALICE_EXP_TRADE_PHYSICAL_FLOW=1): for grain, guarantee a physical flow from
+// markets with a production surplus to markets with an unmet deficit, independent of the price
+// differential (which collapses to ~1e-8 everywhere and zeroes price-driven volume). The floor is
+// split across the origin's outgoing and the target's incoming grain routes. Default off.
+static bool const trade_physical_flow = []() {
+	auto e = std::getenv("ALICE_EXP_TRADE_PHYSICAL_FLOW");
+	return e && std::atoi(e) != 0;
+}();
+
+
 // LOCAL EXPERIMENT (ALICE_EXP_TRADE_BY_SCARCITY=1): after the price-based volume update, add a
 // stock/demand-days routing term, so goods move from high-stock-days to low-stock-days markets.
 static bool const trade_by_scarcity = []() {
@@ -1046,6 +1056,51 @@ void update_trade_routes_volume(
 				state.world.trade_route_set_volume(route, cid, next);
 			});
 		});
+	}
+
+	if(trade_physical_flow) {
+		static dcon::commodity_id grain_id{};
+		if(!grain_id) {
+			state.world.for_each_commodity([&](dcon::commodity_id c) {
+				if(text::produce_simple_string(state, state.world.commodity_get_name(c)) == "Grain")
+					grain_id = c;
+			});
+		}
+		if(grain_id) {
+			auto const n = size_t(state.world.market_size());
+			std::vector<float> surplus(n, 0.f), deficit(n, 0.f);
+			std::vector<int32_t> out_routes(n, 0), in_routes(n, 0);
+			state.world.for_each_market([&](dcon::market_id m) {
+				auto const s = state.world.market_get_supply(m, grain_id);
+				auto const c = state.world.market_get_consumption(m, grain_id);
+				auto const d = state.world.market_get_demand(m, grain_id);
+				auto const im = state.world.market_get_import(m, grain_id);
+				if(std::isfinite(s) && std::isfinite(c))
+					surplus[size_t(m.index())] = std::max(0.f, s - c);
+				if(std::isfinite(d) && std::isfinite(im))
+					deficit[size_t(m.index())] = std::max(0.f, d - im);
+			});
+			state.world.for_each_trade_route([&](dcon::trade_route_id r) {
+				if(!state.world.trade_route_is_valid(r) || state.world.trade_route_get_is_trade_forbidden(r))
+					return;
+				out_routes[size_t(state.world.trade_route_get_origin(r).index())]++;
+				in_routes[size_t(state.world.trade_route_get_target(r).index())]++;
+			});
+			state.world.for_each_trade_route([&](dcon::trade_route_id r) {
+				if(!state.world.trade_route_is_valid(r) || state.world.trade_route_get_is_trade_forbidden(r))
+					return;
+				auto const o = state.world.trade_route_get_origin(r);
+				auto const t = state.world.trade_route_get_target(r);
+				auto const so = surplus[size_t(o.index())] / float(std::max(1, out_routes[size_t(o.index())]));
+				auto const dt = deficit[size_t(t.index())] / float(std::max(1, in_routes[size_t(t.index())]));
+				auto const floor = std::min(so, dt);
+				if(floor > 0.f) {
+					auto const cur = state.world.trade_route_get_volume(r, grain_id);
+					if(std::isfinite(cur) && floor > cur)
+						state.world.trade_route_set_volume(r, grain_id, floor);
+				}
+			});
+		}
 	}
 }
 
