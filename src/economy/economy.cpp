@@ -35,6 +35,22 @@
 
 namespace economy {
 
+// LOCAL EXPERIMENT (ALICE_EXP_SPOILAGE=1): replace the engine's global stockpile decay constant
+// (1/3650 per day, about 9.5pct per year) with ALICE_SPOILAGE_ANNUAL. The mod main data has no
+// per-commodity spoilage field, so this is the single lever to test storage-loss levels.
+static bool const spoilage_override = []() {
+	auto e = std::getenv("ALICE_EXP_SPOILAGE");
+	return e && std::atoi(e) != 0;
+}();
+static float const spoilage_annual = []() {
+	auto e = std::getenv("ALICE_SPOILAGE_ANNUAL");
+	return e ? std::clamp(float(std::atof(e)), 0.f, 1.f) : 0.01f;
+}();
+static float daily_spoilage() {
+	return spoilage_override ? (spoilage_annual / 365.f) : stockpile_spoilage;
+}
+
+
 // LOCAL EXPERIMENT (ALICE_EXP_NEEDS_SCALE=1): multiply every life/everyday/luxury need quantity by
 // ALICE_NEEDS_SCALE_FACTOR. Used to test whether the need/production/price calibration is the
 // binding constraint. Default off = factor 1.
@@ -6549,7 +6565,7 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 				))
 			);
 
-			state.world.market_set_stockpile(ids, c, state.world.market_get_stockpile(ids, c) *(1.f - stockpile_spoilage));
+			state.world.market_set_stockpile(ids, c, state.world.market_get_stockpile(ids, c) *(1.f - daily_spoilage()));
 
 			//if(presimulation) {
 				//state.world.market_set_stockpile(ids, c, state.world.market_get_stockpile(ids, c) + 5.f * production_and_merchants_supply);
