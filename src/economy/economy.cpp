@@ -35,6 +35,15 @@
 
 namespace economy {
 
+// LOCAL EXPERIMENT (ALICE_EXP_REFUND_PAID_ONLY=1): the consumption stage debits pops only for what
+// they actually spent, but the satisfaction stage refunds "required minus spent" -- money that was
+// never debited. Refund only the paid-but-undelivered part: paid_ratio * (1 - bought_ratio).
+static bool const refund_paid_only = []() {
+	auto e = std::getenv("ALICE_EXP_REFUND_PAID_ONLY");
+	return e && std::atoi(e) != 0;
+}();
+
+
 // LOCAL EXPERIMENT (ALICE_EXP_SPOILAGE=1): replace the engine's global stockpile decay constant
 // (1/3650 per day, about 9.5pct per year) with ALICE_SPOILAGE_ANNUAL. The mod main data has no
 // per-commodity spoilage field, so this is the single lever to test storage-loss levels.
@@ -7150,9 +7159,13 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 
 				auto pop_size = state.world.pop_get_size(ids);
 				auto unspent_money =
-					ln_cost * (1.f - ln_spent) * demand_life.get(ids)
-					+ en_cost * (1.f - en_spent) * demand_everyday.get(ids)
-					+ lx_cost * (1.f - lx_spent) * demand_luxury.get(ids);
+					refund_paid_only
+					? ln_cost * ln_spent * (1.f - ln_satisfaction) * demand_life.get(ids)
+						+ en_cost * en_spent * (1.f - en_satisfaction) * demand_everyday.get(ids)
+						+ lx_cost * lx_spent * (1.f - lx_satisfaction) * demand_luxury.get(ids)
+					: ln_cost * (1.f - ln_spent) * demand_life.get(ids)
+						+ en_cost * (1.f - en_spent) * demand_everyday.get(ids)
+						+ lx_cost * (1.f - lx_spent) * demand_luxury.get(ids);
 
 				auto savings = state.world.pop_get_savings(ids);
 				state.world.pop_set_savings(ids, savings + unspent_money);
@@ -7171,7 +7184,7 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 				auto cost = state.world.market_get_cost_per_consumption_category(local_market, cat_id);
 				auto actually_bought = state.world.market_get_satisfied_demand_ratio_per_consumption_category(local_market, cat_id);
 				auto demanded = demand_consumption_category[cat_id.index()].get(ids);
-				auto refund = (1.f - actually_bought) * cost * demanded;
+				auto refund = refund_paid_only ? 0.f : (1.f - actually_bought) * cost * demanded;
 				auto savings = state.world.pop_get_savings(ids);
 				state.world.pop_set_savings(ids, savings + refund);
 				total_satisfaction_from_categories = total_satisfaction_from_categories + actually_bought * demanded * state.world.consumption_category_get_satisfaction_score(cat_id);
@@ -7210,14 +7223,14 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 
 			{
 				// education
-				auto paid_back = demand_paid_education.get(ids) * (1.f - literacy_sat_paid) * state.world.province_get_service_price(province, services::list::education);
+				auto paid_back = refund_paid_only ? 0.f : demand_paid_education.get(ids) * (1.f - literacy_sat_paid) * state.world.province_get_service_price(province, services::list::education);
 				auto savings = state.world.pop_get_savings(ids);
 				state.world.pop_set_savings(ids, savings + paid_back);
 			}
 
 			{
 				// housing
-				auto paid_back = demand_housing.get(ids) * (1.f - housing_sat) * state.world.province_get_service_price(province, services::list::urban_housing);
+				auto paid_back = refund_paid_only ? 0.f : demand_housing.get(ids) * (1.f - housing_sat) * state.world.province_get_service_price(province, services::list::urban_housing);
 				auto savings = state.world.pop_get_savings(ids);
 				state.world.pop_set_savings(ids, savings + paid_back);
 			}

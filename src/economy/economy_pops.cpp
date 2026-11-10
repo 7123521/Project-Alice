@@ -2341,6 +2341,40 @@ void update_income_wages(sys::state& state){
 		}
 	}
 
+	// LOCAL TRACE (ALICE_TRACE_WAGE_HELPER=1): compare the wage credited to pops with the
+	// employment-based wage bill of the same day, price_tier * labour_demand * satisfaction,
+	// summed over every province and labour tier. Read-only; no economic effect.
+	{
+		static bool const wage_helper_trace = []() {
+			auto e = std::getenv("ALICE_TRACE_WAGE_HELPER");
+			return e && std::atoi(e) != 0;
+		}();
+		if(wage_helper_trace) {
+			auto const ymd = state.current_date.to_ymd(state.start_date);
+			if(ymd.day == 1) {
+				double helper = 0.0;
+				double tier_helper[labor::total] = {};
+				state.world.for_each_province([&](dcon::province_id p) {
+					for(int32_t i = 0; i < labor::total; ++i) {
+						auto const d = double(state.world.province_get_labor_demand(p, i));
+						auto const s = double(state.world.province_get_labor_demand_satisfaction(p, i));
+						auto const pr = double(state.world.province_get_labor_price(p, i));
+						if(std::isfinite(d) && std::isfinite(s) && std::isfinite(pr)) {
+							helper += pr * d * s;
+							if(i >= 0 && i < labor::total)
+								tier_helper[i] += pr * d * s;
+						}
+					}
+				});
+				auto const credit = trace_daily_wage_income;
+				fprintf(stderr, "WAGEHELPER %04d-%02d-%02d credit=%.6f helper=%.6f ratio=%.6f tiers=%.4g,%.4g,%.4g,%.4g,%.4g\n",
+					ymd.year, ymd.month, ymd.day, credit, helper, credit > 1e-9 ? helper / credit : 0.0,
+					tier_helper[0], tier_helper[1], tier_helper[2], tier_helper[3], tier_helper[4]);
+				fflush(stderr);
+			}
+		}
+	}
+
 	market_poptype_wage_stride = int(state.world.pop_type_size());
 	market_poptype_wage.assign(size_t(state.world.market_size()) * size_t(market_poptype_wage_stride), 0.f);
 	state.world.execute_serial_over_pop([&](auto p) {
