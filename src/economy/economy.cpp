@@ -35,6 +35,18 @@
 
 namespace economy {
 
+// LOCAL EXPERIMENT (ALICE_EXP_PRICE_FLOW_MIX=1): price sees flow supply plus ALICE_PRICE_FLOW_ALPHA
+// of the merchant stockpile offer (the full-offer removal is ALICE_EXP_PRICE_FLOW_SUPPLY).
+static bool const price_flow_mix = []() {
+	auto e = std::getenv("ALICE_EXP_PRICE_FLOW_MIX");
+	return e && std::atoi(e) != 0;
+}();
+static float const price_flow_alpha = []() {
+	auto e = std::getenv("ALICE_PRICE_FLOW_ALPHA");
+	return e ? std::clamp(float(std::atof(e)), 0.f, 1.f) : 0.2f;
+}();
+
+
 // LOCAL EXPERIMENT (ALICE_EXP_PRESIM_STOCKPILE=1): normalize RGO market stockpiles during
 // presimulation to a band of days of demand. The upstream rule only enforces a floor, so a
 // persistent presim surplus accumulates into a multi-year overhang. Default 0 keeps upstream.
@@ -7962,6 +7974,9 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 			if(price_flow_supply) {
 				auto const offer = state.world.market_get_stockpile_sales(ids, cid);
 				supply = ve::max(ve::fp_vector{ 0.f }, supply - offer);
+			} else if(price_flow_mix) {
+				auto const offer = state.world.market_get_stockpile_sales(ids, cid);
+				supply = ve::max(ve::fp_vector{ 0.f }, supply - (1.f - price_flow_alpha) * offer);
 			}
 			auto current_price = ve_price(state, ids, cid);
 			auto next_price = current_price;
