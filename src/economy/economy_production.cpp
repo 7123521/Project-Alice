@@ -63,6 +63,16 @@ static bool const rgo_supply_response = []() {
 	auto s = std::getenv("ALICE_EXP_RGO_SUPPLY_RESPONSE");
 	return s && std::atoi(s) != 0;
 }();
+// LOCAL EXPERIMENT (ALICE_EXP_RGO_SELL_RESPONSE=1): scale RGO output by the market's expected
+// probability to sell, clamped to [floor, 1]. Only genuinely unsellable production is cut.
+static bool const rgo_sell_response = []() {
+	auto s = std::getenv("ALICE_EXP_RGO_SELL_RESPONSE");
+	return s && std::atoi(s) != 0;
+}();
+static float const rgo_sell_floor = []() {
+	auto s = std::getenv("ALICE_RGO_SELL_FLOOR");
+	return s ? std::clamp(float(std::atof(s)), 0.1f, 1.f) : 0.7f;
+}();
 // LOCAL EXPERIMENT (ALICE_EXP_RGO_COST_WAGE=1): pay RGO labour a share of the cost-valued RGO
 // output of the province instead of labour_price x employment. Default 0 = upstream.
 static bool const rgo_cost_wage_enabled = []() {
@@ -1991,6 +2001,13 @@ void update_rgo_production(sys::state& state) {
 				auto const factor = ve::max(ve::fp_vector{rgo_supply_floor}, ve::min(ve::fp_vector{1.f}, price / std::max(cost, 0.000001f)));
 				amount = amount * factor;
 			}
+			if(rgo_sell_response) {
+				auto const sid = state.world.province_get_state_membership(p);
+				auto const mid = state.world.state_instance_get_market_from_local_market(sid);
+				auto const ps = state.world.market_get_expected_probability_to_sell(mid, c);
+				auto const factor = ve::max(ve::fp_vector{rgo_sell_floor}, ve::min(ve::fp_vector{1.f}, ps));
+				amount = amount * factor;
+			}
 			state.world.province_set_rgo_output(p, c, amount);
 		});
 	});
@@ -2366,6 +2383,13 @@ void update_employment(sys::state& state, bool ignore_reality, float presim_empl
 			if(rgo_supply_response) {
 				auto const cost = state.world.commodity_get_cost(c);
 				auto const factor = ve::max(ve::fp_vector{rgo_supply_floor}, ve::min(ve::fp_vector{1.f}, current_price / std::max(cost, 0.000001f)));
+				provisional_output = provisional_output * factor;
+			}
+			if(rgo_sell_response) {
+				auto const sid = state.world.province_get_state_membership(pids);
+				auto const mid = state.world.state_instance_get_market_from_local_market(sid);
+				auto const ps = state.world.market_get_expected_probability_to_sell(mid, c);
+				auto const factor = ve::max(ve::fp_vector{rgo_sell_floor}, ve::min(ve::fp_vector{1.f}, ps));
 				provisional_output = provisional_output * factor;
 			}
 			state.world.province_set_rgo_output(pids, c, provisional_output);
