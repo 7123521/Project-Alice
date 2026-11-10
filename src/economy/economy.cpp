@@ -4463,6 +4463,17 @@ static bool const wage_conservation_trace = []() {
 static double wage_credit_day = 0.0;
 static double wage_debit_day = 0.0;
 
+// LOCAL EXPERIMENT (ALICE_EXP_WAGE_CONSERVATION=1): make the wage debited from producer banks follow
+// the wage credited to pops. Yesterday's credit/debit ratio scales today's producer wage bill, so the
+// two flows stay within one day of each other instead of differing by 3-4 orders of magnitude.
+static bool const wage_conservation = []() {
+	auto s = std::getenv("ALICE_EXP_WAGE_CONSERVATION");
+	return s && std::atoi(s) != 0;
+}();
+static double wage_credit_prev = 0.0;
+static double wage_debit_prev = 0.0;
+static std::vector<float> province_wage_debit_cache;
+
 static void money_ledger_mark(sys::state& state, char const* tag) {
 	if(!money_ledger_trace)
 		return;
@@ -7529,7 +7540,14 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 		}
 	}
 
+	float wage_scale = 1.f;
+	if(wage_conservation && wage_debit_prev > 1e-9 && wage_credit_prev > 0.0)
+		wage_scale = float(wage_credit_prev / wage_debit_prev);
+	if(wage_conservation && province_wage_debit_cache.size() < size_t(state.world.province_size()))
+		province_wage_debit_cache.assign(size_t(state.world.province_size()), 0.f);
+
 	province::for_each_market_province_parallel_over_market(state, [&](dcon::market_id mid, dcon::state_instance_id sid, dcon::province_id pid){
+		auto province_factory_wage_bill = 0.f;
 		{
 			auto total_factory_profit = 0.f;
 			auto total_input_cost = 0.f;
@@ -7546,6 +7564,9 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 
 			if(wage_conservation_trace)
 				wage_debit_day += double(total_wage_bill);
+			if(wage_conservation && wage_scale != 1.f)
+				total_wage_bill *= wage_scale;
+			province_factory_wage_bill = total_wage_bill;
 			auto current_bank = state.world.province_get_factory_bank(pid);
 			if(seller_payout) {
 				// gross sales were credited at settlement; pay inputs and wages out of that revenue
@@ -7572,6 +7593,10 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 						rgo_wage_bill += economy::rgo_cost_wage(state, c, pid);
 					});
 				}
+				if(wage_conservation && wage_scale != 1.f)
+					rgo_wage_bill *= wage_scale;
+				if(wage_conservation && size_t(pid.index()) < province_wage_debit_cache.size())
+					province_wage_debit_cache[size_t(pid.index())] = province_factory_wage_bill + rgo_wage_bill;
 				if(wage_conservation_trace)
 					wage_debit_day += double(rgo_wage_bill);
 				auto current_bank = state.world.province_get_rgo_bank(pid);
@@ -7584,6 +7609,13 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 		}
 	});
 
+
+	if(wage_conservation) {
+		double total = 0.0;
+		for(auto v : province_wage_debit_cache)
+			total += double(v);
+		wage_debit_prev = total;
+	}
 
 	set_profile_point(state, "rgo/factory banks");
 
@@ -7603,6 +7635,9 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 	set_profile_point(state, "artisans");
 
 	pops::update_income_wages(state);
+
+	if(wage_conservation)
+		wage_credit_prev = economy::daily_wage_credit();
 
 	set_profile_point(state, "wages");
 
