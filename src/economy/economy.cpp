@@ -4586,28 +4586,20 @@ static bool const money_ledger_trace = []() {
 	return s && std::atoi(s) != 0;
 }();
 static double money_pool_total(sys::state& state) {
+	// LOCAL: match headless_run's net_money definition exactly: market money + pop savings +
+	// treasury + national bank (the clean upstream has no trade-house debt pool).
 	double total = 0.0;
 	state.world.for_each_market([&](dcon::market_id m) {
 		total += double(state.world.market_get_stockpile(m, economy::money));
-		total += double(state.world.market_get_pop_investments(m));
-		total += double(state.world.market_get_pop_dividends(m));
 	});
 	state.world.for_each_pop([&](dcon::pop_id p) {
 		total += double(state.world.pop_get_savings(p));
 	});
 	state.world.for_each_nation([&](dcon::nation_id n) {
-		if(!state.world.nation_is_valid(n))
+		if(state.world.nation_get_owned_province_count(n) == 0)
 			return;
 		total += double(state.world.nation_get_treasury(n));
 		total += double(state.world.nation_get_national_bank(n));
-		total += double(state.world.nation_get_private_investment(n));
-	});
-	state.world.for_each_province([&](dcon::province_id p) {
-		total += double(state.world.province_get_rgo_bank(p));
-		total += double(state.world.province_get_factory_bank(p));
-		total += double(state.world.province_get_artisan_bank(p));
-		for(int32_t i = 0; i < advanced_province_buildings::list::total; ++i)
-			total += double(state.world.province_get_advanced_province_building_private_savings(p, i));
 	});
 	return total;
 }
@@ -4655,8 +4647,20 @@ static void money_ledger_mark(sys::state& state, char const* tag) {
 		return;
 	}
 	auto const delta = now - prev;
+	auto const ymd = state.current_date.to_ymd(state.start_date);
+	static int32_t prev_day_key = -1;
+	static double day_open = 0.0;
+	int32_t const day_key = int32_t(ymd.year) * 10000 + int32_t(ymd.month) * 100 + int32_t(ymd.day);
+	if(prev_day_key >= 0 && day_key != prev_day_key) {
+		fprintf(stderr, "MONEYDAY %04d-%02d-%02d net=%+.6f close=%.6f\n",
+			ymd.year, ymd.month, ymd.day, now - day_open, now);
+		fflush(stderr);
+	}
+	if(day_key != prev_day_key) {
+		prev_day_key = day_key;
+		day_open = now;
+	}
 	if(std::abs(delta) > 1.0) {
-		auto const ymd = state.current_date.to_ymd(state.start_date);
 		fprintf(stderr, "MONEYLEDGER %04d-%02d-%02d %-34s total=%.6f delta=%+.6f\n",
 			ymd.year, ymd.month, ymd.day, tag, now, delta);
 	}

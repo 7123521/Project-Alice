@@ -220,6 +220,23 @@ inline void dump_month(sys::state& state, FILE* nations_csv, FILE* prices_csv, F
 		});
 		double const trade_house_debt_value = 0.0; // clean upstream: no local trade-house debt pool
 		double const net_money = market_money + pop_savings_total + treasury + government_bank - trade_house_debt_value;
+		// LOCAL DIAGNOSTIC: daily money audit with two pool definitions. net_money matches the summary
+		// column; wide adds the producer/investment pools so creation can be separated from transfers.
+		double audit_market = market_money;
+		double audit_savings = pop_savings_total;
+		double audit_treasury = treasury;
+		double audit_bank = government_bank;
+		double audit_rgo = rgo_bank;
+		double audit_factory = factory_bank;
+		double audit_rent = rent_bank;
+		double audit_pop_inv = pop_investments;
+		double audit_pop_div = pop_dividends;
+		double audit_private_inv = private_inv;
+		double const audit_wide = audit_market + audit_savings + audit_treasury + audit_bank
+			+ audit_rgo + audit_factory + audit_rent + audit_pop_inv + audit_pop_div + audit_private_inv;
+		fprintf(stderr, "MONEYAUDIT %s net_money=%.6f wide=%.6f market=%.6f savings=%.6f treasury=%.6f bank=%.6f rgo=%.6f factory=%.6f rent=%.6f popinv=%.6f popdiv=%.6f private=%.6f\n",
+			date.c_str(), net_money, audit_wide, audit_market, audit_savings, audit_treasury, audit_bank,
+			audit_rgo, audit_factory, audit_rent, audit_pop_inv, audit_pop_div, audit_private_inv);
 		state.world.for_each_province([&](dcon::province_id p) {
 			// Only land provinces carry labour data: the engine initialises and updates labour supply
 			// through ve_for_each_land_province, so a sea province holds an uninitialised (NaN) value
