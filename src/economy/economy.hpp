@@ -12,6 +12,7 @@ namespace economy {
 
 // LOCAL TRACE: today's total wage credited to pops (pops::update_income_wages).
 double daily_wage_credit();
+float food_relief_score(sys::state const& state, dcon::province_id p);
 double daily_natural_wage_credit();
 float wage_credit_payout_scale();
 

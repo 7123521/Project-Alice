@@ -8,6 +8,9 @@
 
 namespace economy {
 
+// LOCAL (ALICE_EXP_FOOD_RELIEF): free subsistence score provided by the food relief programme.
+float food_relief_score(sys::state const& state, dcon::province_id p);
+
 namespace pops {
 
 vectorized_pops_budget<float> prepare_pop_budget(const sys::state& state, dcon::pop_id ids);

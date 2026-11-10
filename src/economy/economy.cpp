@@ -82,6 +82,87 @@ static float const needs_scale_factor = []() {
 	return e ? std::clamp(float(std::atof(e)), 0.0001f, 100.f) : 0.01f;
 }();
 
+// LOCAL EXPERIMENT (ALICE_EXP_FOOD_RELIEF=1): when grain stock exceeds a target number of days,
+// the state buys the excess from the market (treasury -> market money, conserved) and distributes
+// it free to pops as subsistence, raising their free life-needs ratio. Default off.
+static bool const food_relief = []() {
+	auto e = std::getenv("ALICE_EXP_FOOD_RELIEF");
+	return e && std::atoi(e) != 0;
+}();
+static float const food_relief_share = []() {
+	auto e = std::getenv("ALICE_FOOD_RELIEF_SHARE");
+	return e ? std::clamp(float(std::atof(e)), 0.f, 1.f) : 0.8f;
+}();
+static float const food_relief_target_days = []() {
+	auto e = std::getenv("ALICE_FOOD_RELIEF_TARGET_DAYS");
+	return e ? std::clamp(float(std::atof(e)), 180.f, 720.f) : 450.f;
+}();
+static ve::vectorizable_buffer<float, dcon::province_id> food_relief_buf(uint32_t(1));
+static uint32_t food_relief_provinces = 1;
+
+// LOCAL: free subsistence score provided by the food relief programme (0..subsistence_score_life).
+float food_relief_score(sys::state const& state, dcon::province_id p) {
+	if(!food_relief || p.index() < 0 || size_t(p.index()) >= food_relief_provinces)
+		return 0.f;
+	return food_relief_buf.get(p);
+}
+
+static void update_food_relief(sys::state& state) {
+	if(!food_relief)
+		return;
+	static dcon::commodity_id relief_grain{};
+	if(!relief_grain) {
+		state.world.for_each_commodity([&](dcon::commodity_id c) {
+			if(relief_grain || c == economy::money)
+				return;
+			auto const name = text::produce_simple_string(state, state.world.commodity_get_name(c));
+			std::string lower = name;
+			std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char ch) { return char(std::tolower(ch)); });
+			if(lower.find("grain") != std::string::npos)
+				relief_grain = c;
+		});
+	}
+	if(!relief_grain)
+		return;
+	if(state.world.province_size() > food_relief_provinces) {
+		food_relief_buf = state.world.province_make_vectorizable_float_buffer();
+		food_relief_provinces = state.world.province_size();
+	}
+	state.world.for_each_province([&](dcon::province_id p) { food_relief_buf.set(p, 0.f); });
+	state.world.for_each_market([&](dcon::market_id m) {
+		auto const stock = state.world.market_get_stockpile(m, relief_grain);
+		auto const demand = state.world.market_get_demand(m, relief_grain);
+		auto const price = state.world.market_get_price(m, relief_grain);
+		if(!(stock > 0.f) || !(demand > 0.f) || !(price > 0.f) || !std::isfinite(stock) || !std::isfinite(demand) || !std::isfinite(price))
+			return;
+		auto const days = stock / demand;
+		if(days <= food_relief_target_days)
+			return;
+		auto const qty = std::min(std::max(0.f, stock - food_relief_target_days * demand), food_relief_share * demand);
+		if(!(qty > 0.f) || !std::isfinite(qty))
+			return;
+		auto const pay = qty * price;
+		if(!std::isfinite(pay))
+			return;
+		auto const sid = state.world.market_get_zone_from_local_market(m);
+		auto const n = state.world.state_instance_get_nation_from_state_ownership(sid);
+		if(n) {
+			auto const treasury = state.world.nation_get_treasury(n);
+			if(std::isfinite(treasury))
+				state.world.nation_set_treasury(n, treasury - pay);
+		}
+		state.world.market_set_stockpile(m, relief_grain, stock - qty);
+		auto const cash = state.world.market_get_stockpile(m, economy::money);
+		if(std::isfinite(cash))
+			state.world.market_set_stockpile(m, economy::money, cash + pay);
+		auto const ratio = std::clamp(qty / demand, 0.f, 1.f);
+		province::for_each_province_in_state_instance(state, sid, [&](dcon::province_id pid) {
+			if(size_t(pid.index()) < food_relief_provinces)
+				food_relief_buf.set(pid, ratio * economy::subsistence_score_life);
+		});
+	});
+}
+
 
 // LOCAL EXPERIMENT (ALICE_EXP_MONEY_ANCHOR=1): monthly money-supply rule. If the total money stock
 // exceeds ALICE_MONEY_ANCHOR_RATIO days of cost-valued GDP, the excess is removed from market cash
@@ -5674,6 +5755,8 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 		demand_consumption_category.emplace_back(ve::vectorizable_buffer<float, dcon::pop_id>(state.world.pop_size()));
 	});
 	auto satisfaction_from_subsistence = state.world.pop_make_vectorizable_float_buffer();
+
+	update_food_relief(state);
 
 	pops::update_consumption(
 		state,

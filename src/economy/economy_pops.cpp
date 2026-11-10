@@ -497,6 +497,7 @@ auto prepare_pop_budget_templated(
 	VALUE subsistence = adjusted_subsistence_score<VALUE, decltype(provs)>(state, provs);
 	BOOL_VALUE rgo_worker = state.world.pop_type_get_is_paid_rgo_worker(pop_type);
 	subsistence = adaptive_ve::select<BOOL_VALUE, VALUE>(rgo_worker, subsistence, 0.f);
+	subsistence = subsistence + ve::apply([&](dcon::province_id p) { return economy::food_relief_score(state, p); }, provs);
 	VALUE available_subsistence = adaptive_ve::min<VALUE>(subsistence_score_life, subsistence);
 	subsistence = subsistence - available_subsistence;
 	VALUE qol_from_subsistence = available_subsistence / subsistence_score_life;
