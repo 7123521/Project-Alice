@@ -7564,9 +7564,9 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 
 			if(wage_conservation_trace)
 				wage_debit_day += double(total_wage_bill);
+			province_factory_wage_bill = total_wage_bill;
 			if(wage_conservation && wage_scale != 1.f)
 				total_wage_bill *= wage_scale;
-			province_factory_wage_bill = total_wage_bill;
 			auto current_bank = state.world.province_get_factory_bank(pid);
 			if(seller_payout) {
 				// gross sales were credited at settlement; pay inputs and wages out of that revenue
@@ -7593,10 +7593,10 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 						rgo_wage_bill += economy::rgo_cost_wage(state, c, pid);
 					});
 				}
-				if(wage_conservation && wage_scale != 1.f)
-					rgo_wage_bill *= wage_scale;
 				if(wage_conservation && size_t(pid.index()) < province_wage_debit_cache.size())
 					province_wage_debit_cache[size_t(pid.index())] = province_factory_wage_bill + rgo_wage_bill;
+				if(wage_conservation && wage_scale != 1.f)
+					rgo_wage_bill *= wage_scale;
 				if(wage_conservation_trace)
 					wage_debit_day += double(rgo_wage_bill);
 				auto current_bank = state.world.province_get_rgo_bank(pid);
