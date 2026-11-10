@@ -91,6 +91,22 @@ static float const grain_output_mult = []() {
 	auto s = std::getenv("ALICE_EXP_GRAIN_OUTPUT_MULT");
 	return s ? std::clamp(float(std::atof(s)), 0.05f, 1.f) : 1.f;
 }();
+// LOCAL EXPERIMENT (ALICE_EXP_GRAIN_DEMAND_ALLOC=1): scale grain rgo_size toward the quantity
+// implied by consumption plus a stock-days target, so the aggregate surplus is removed without a
+// price floor. The adjustment is a slow daily move (ALICE_GRAIN_ALLOC_SPEED, default 2pct).
+static bool const grain_demand_alloc = []() {
+	auto e = std::getenv("ALICE_EXP_GRAIN_DEMAND_ALLOC");
+	return e && std::atoi(e) != 0;
+}();
+static float const grain_alloc_target_days = []() {
+	auto e = std::getenv("ALICE_GRAIN_ALLOC_TARGET_DAYS");
+	return e ? std::clamp(float(std::atof(e)), 180.f, 720.f) : 450.f;
+}();
+static float const grain_alloc_speed = []() {
+	auto e = std::getenv("ALICE_GRAIN_ALLOC_SPEED");
+	return e ? std::clamp(float(std::atof(e)), 0.001f, 0.2f) : 0.02f;
+}();
+
 static dcon::commodity_id rgo_grain_commodity{};
 static bool rgo_grain_commodity_init = false;
 
@@ -2308,6 +2324,35 @@ void update_employment(sys::state& state, bool ignore_reality, float presim_empl
 	// so we can execute in parallel over nations but not over provinces
 
 	auto workers_optimism = 0.01f;
+
+	if(grain_demand_alloc) {
+		init_rgo_grain_commodity(state);
+		if(rgo_grain_commodity) {
+			double supply = 0.0, consumption = 0.0, demand = 0.0, stock = 0.0;
+			state.world.for_each_market([&](dcon::market_id m) {
+				supply += double(state.world.market_get_supply(m, rgo_grain_commodity));
+				consumption += double(state.world.market_get_consumption(m, rgo_grain_commodity));
+				demand += double(state.world.market_get_demand(m, rgo_grain_commodity));
+				stock += double(state.world.market_get_stockpile(m, rgo_grain_commodity));
+			});
+			if(supply > 1e-6 && demand > 1e-6 && stock > 0.0) {
+				auto const days = stock / demand;
+				if(days > double(grain_alloc_target_days)) {
+					auto const target_stock = double(grain_alloc_target_days) * demand;
+					auto const desired = std::max(0.0, consumption + (target_stock - stock) / 365.0);
+					auto const target_factor = std::clamp(float(desired / supply), 0.1f, 1.f);
+					auto const scale = 1.f + (target_factor - 1.f) * grain_alloc_speed;
+					if(scale < 1.f && std::isfinite(scale)) {
+						state.world.for_each_province([&](dcon::province_id p) {
+							auto const sz = state.world.province_get_rgo_size(p, rgo_grain_commodity);
+							if(sz > 0.f && std::isfinite(sz))
+								state.world.province_set_rgo_size(p, rgo_grain_commodity, sz * scale);
+						});
+					}
+				}
+			}
+		}
+	}
 
 	concurrency::parallel_for(uint32_t(0), state.world.commodity_size(), [&](uint32_t k) {
 		dcon::commodity_id c{ dcon::commodity_id::value_base_t(k) };
