@@ -35,6 +35,19 @@
 
 namespace economy {
 
+// LOCAL EXPERIMENT (ALICE_EXP_NEEDS_SCALE=1): multiply every life/everyday/luxury need quantity by
+// ALICE_NEEDS_SCALE_FACTOR. Used to test whether the need/production/price calibration is the
+// binding constraint. Default off = factor 1.
+static bool const needs_scale_enabled = []() {
+	auto e = std::getenv("ALICE_EXP_NEEDS_SCALE");
+	return e && std::atoi(e) != 0;
+}();
+static float const needs_scale_factor = []() {
+	auto e = std::getenv("ALICE_NEEDS_SCALE_FACTOR");
+	return e ? std::clamp(float(std::atof(e)), 0.0001f, 100.f) : 0.01f;
+}();
+
+
 // LOCAL EXPERIMENT (ALICE_EXP_MONEY_ANCHOR=1): monthly money-supply rule. If the total money stock
 // exceeds ALICE_MONEY_ANCHOR_RATIO days of cost-valued GDP, the excess is removed from market cash
 // and then from national banks. Diagnostic for the nominal anchor question; default off.
@@ -5271,9 +5284,9 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 						return;
 					}
 
-					auto life_base = state.world.pop_type_get_life_needs(pop_type, c);
-					auto everyday_base = state.world.pop_type_get_everyday_needs(pop_type, c);
-					auto luxury_base = state.world.pop_type_get_luxury_needs(pop_type, c);
+					auto life_base = state.world.pop_type_get_life_needs(pop_type, c) * (needs_scale_enabled ? needs_scale_factor : 1.f);
+					auto everyday_base = state.world.pop_type_get_everyday_needs(pop_type, c) * (needs_scale_enabled ? needs_scale_factor : 1.f);
+					auto luxury_base = state.world.pop_type_get_luxury_needs(pop_type, c) * (needs_scale_enabled ? needs_scale_factor : 1.f);
 
 					auto life_costs = prices * life_base * life_needs_mult * (needs_share ? ve::fp_vector{ 1.f } : life_weights);
 					auto everyday_costs = prices * everyday_base * everyday_needs_mult * everyday_weights * invention_factor;
@@ -5349,9 +5362,9 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 						return;
 					}
 
-					auto life_base = state.world.pop_type_get_life_needs(pop_type, c);
-					auto everyday_base = state.world.pop_type_get_everyday_needs(pop_type, c);
-					auto luxury_base = state.world.pop_type_get_luxury_needs(pop_type, c);
+					auto life_base = state.world.pop_type_get_life_needs(pop_type, c) * (needs_scale_enabled ? needs_scale_factor : 1.f);
+					auto everyday_base = state.world.pop_type_get_everyday_needs(pop_type, c) * (needs_scale_enabled ? needs_scale_factor : 1.f);
+					auto luxury_base = state.world.pop_type_get_luxury_needs(pop_type, c) * (needs_scale_enabled ? needs_scale_factor : 1.f);
 
 					auto life_costs = prices * life_base * life_needs_mult * (needs_share ? ve::fp_vector{ 1.f } : life_weights);
 					auto everyday_costs = prices * everyday_base * everyday_needs_mult * everyday_weights * invention_factor;
@@ -5426,9 +5439,9 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 						return;
 					}
 
-					auto life_base = state.world.pop_type_get_life_needs(pop_type, c);
-					auto everyday_base = state.world.pop_type_get_everyday_needs(pop_type, c);
-					auto luxury_base = state.world.pop_type_get_luxury_needs(pop_type, c);
+					auto life_base = state.world.pop_type_get_life_needs(pop_type, c) * (needs_scale_enabled ? needs_scale_factor : 1.f);
+					auto everyday_base = state.world.pop_type_get_everyday_needs(pop_type, c) * (needs_scale_enabled ? needs_scale_factor : 1.f);
+					auto luxury_base = state.world.pop_type_get_luxury_needs(pop_type, c) * (needs_scale_enabled ? needs_scale_factor : 1.f);
 
 					auto life_costs = prices * life_base * life_needs_mult * (needs_share ? ve::fp_vector{ 1.f } : life_weights);
 					auto everyday_costs = prices * everyday_base * everyday_needs_mult * everyday_weights * invention_factor;

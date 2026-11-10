@@ -38,6 +38,16 @@ static bool demand_formation_file_init = false;
 namespace economy {
 namespace pops {
 
+static bool const needs_scale_enabled = []() {
+	auto e = std::getenv("ALICE_EXP_NEEDS_SCALE");
+	return e && std::atoi(e) != 0;
+}();
+static float const needs_scale_factor = []() {
+	auto e = std::getenv("ALICE_NEEDS_SCALE_FACTOR");
+	return e ? std::clamp(float(std::atof(e)), 0.0001f, 100.f) : 0.01f;
+}();
+
+
 // LOCAL EXPERIMENT (ALICE_EXP_DIRECT_FACTORY_WAGE=1): credit the direct factory wage bill to the
 // factory worker pop type, so producer-bank debit and household credit are the same money.
 static bool const direct_factory_wage = []() {
@@ -1003,12 +1013,13 @@ void update_consumption(
 					state.world.market_get_everyday_needs_weights(ids, cid);
 				auto luxury_weight =
 					state.world.market_get_luxury_needs_weights(ids, cid);
+				auto const needs_scale = needs_scale_enabled ? needs_scale_factor : 1.f;
 				auto base_life =
-					state.world.pop_type_get_life_needs(t, cid);
+					state.world.pop_type_get_life_needs(t, cid) * needs_scale;
 				auto base_everyday =
-					state.world.pop_type_get_everyday_needs(t, cid);
+					state.world.pop_type_get_everyday_needs(t, cid) * needs_scale;
 				auto base_luxury =
-					state.world.pop_type_get_luxury_needs(t, cid);
+					state.world.pop_type_get_luxury_needs(t, cid) * needs_scale;
 
 				auto demand_life =
 					base_life
