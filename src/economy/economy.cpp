@@ -42,6 +42,16 @@ static bool const refund_paid_only = []() {
 	auto e = std::getenv("ALICE_EXP_REFUND_PAID_ONLY");
 	return e && std::atoi(e) != 0;
 }();
+// LOCAL EXPERIMENT (ALICE_EXP_REFUND_FROM_ESCROW=1): pay pop refunds by transferring money back
+// from the market's money pool (where the consumption payment went) instead of creating it.
+// REJECTED: the payment is already distributed to producers at settlement, so this drives the
+// market money pool negative (ESC2_1234: market -355M, total M -333M, GDP -13pct, factory -68pct).
+// Kept default-off as a diagnostic; the correct long-term fix is on the producer-payout side.
+static bool const refund_from_escrow = []() {
+	auto e = std::getenv("ALICE_EXP_REFUND_FROM_ESCROW");
+	return e && std::atoi(e) != 0;
+}();
+static bool const refund_zeroed = refund_paid_only && !refund_from_escrow;
 
 
 // LOCAL EXPERIMENT (ALICE_EXP_SPOILAGE=1): replace the engine's global stockpile decay constant
@@ -6738,6 +6748,8 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 		}
 
 		// finally, pay back refund:
+		if(refund_zeroed)
+			refund = 0.0f;
 		assert(std::isfinite(refund) && std::isfinite(state.world.nation_get_treasury(n) + refund) && refund >= 0.0f);
 		state.world.nation_set_treasury(n, state.world.nation_get_treasury(n) + refund);
 	});
@@ -7116,6 +7128,7 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 
 	// update needs satisfaction depending on actually available goods and services:
 
+	auto refund_escrow_buffer = state.world.pop_make_vectorizable_float_buffer();
 	state.world.execute_parallel_over_pop([&](auto ids) {
 		auto province = state.world.pop_get_province_from_pop_location(ids);
 		auto local_state = state.world.province_get_state_membership(province);
@@ -7123,6 +7136,8 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 		auto local_nation = state.world.province_get_nation_from_province_ownership(province);
 		auto invalid = local_nation == dcon::nation_id {};
 		auto pop_type = state.world.pop_get_poptype(ids);
+		if(refund_from_escrow)
+			refund_escrow_buffer.set(ids, ve::fp_vector{ 0.f });
 
 		if (state.world.consumption_category_size() == 0) {
 			auto ln_satisfaction = ve::apply([&](auto market, auto pt) {
@@ -7169,6 +7184,8 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 
 				auto savings = state.world.pop_get_savings(ids);
 				state.world.pop_set_savings(ids, savings + unspent_money);
+				if(refund_from_escrow)
+					refund_escrow_buffer.set(ids, refund_escrow_buffer.get(ids) + unspent_money);
 			}
 			auto satisfaction = state.world.pop_get_satisfaction(ids);
 			auto satisfaction_gain =
@@ -7184,9 +7201,11 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 				auto cost = state.world.market_get_cost_per_consumption_category(local_market, cat_id);
 				auto actually_bought = state.world.market_get_satisfied_demand_ratio_per_consumption_category(local_market, cat_id);
 				auto demanded = demand_consumption_category[cat_id.index()].get(ids);
-				auto refund = refund_paid_only ? 0.f : (1.f - actually_bought) * cost * demanded;
+				auto refund = refund_zeroed ? 0.f : (1.f - actually_bought) * cost * demanded;
 				auto savings = state.world.pop_get_savings(ids);
 				state.world.pop_set_savings(ids, savings + refund);
+				if(refund_from_escrow)
+					refund_escrow_buffer.set(ids, refund_escrow_buffer.get(ids) + refund);
 				total_satisfaction_from_categories = total_satisfaction_from_categories + actually_bought * demanded * state.world.consumption_category_get_satisfaction_score(cat_id);
 			});
 			auto satisfaction = state.world.pop_get_satisfaction(ids);
@@ -7223,19 +7242,44 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 
 			{
 				// education
-				auto paid_back = refund_paid_only ? 0.f : demand_paid_education.get(ids) * (1.f - literacy_sat_paid) * state.world.province_get_service_price(province, services::list::education);
+				auto paid_back = refund_zeroed ? 0.f : demand_paid_education.get(ids) * (1.f - literacy_sat_paid) * state.world.province_get_service_price(province, services::list::education);
 				auto savings = state.world.pop_get_savings(ids);
 				state.world.pop_set_savings(ids, savings + paid_back);
+				if(refund_from_escrow)
+					refund_escrow_buffer.set(ids, refund_escrow_buffer.get(ids) + paid_back);
 			}
 
 			{
 				// housing
-				auto paid_back = refund_paid_only ? 0.f : demand_housing.get(ids) * (1.f - housing_sat) * state.world.province_get_service_price(province, services::list::urban_housing);
+				auto paid_back = refund_zeroed ? 0.f : demand_housing.get(ids) * (1.f - housing_sat) * state.world.province_get_service_price(province, services::list::urban_housing);
 				auto savings = state.world.pop_get_savings(ids);
 				state.world.pop_set_savings(ids, savings + paid_back);
+				if(refund_from_escrow)
+					refund_escrow_buffer.set(ids, refund_escrow_buffer.get(ids) + paid_back);
 			}
 		}
 	});
+
+	if(refund_from_escrow) {
+		std::vector<double> market_refund(size_t(state.world.market_size()), 0.0);
+		state.world.execute_serial_over_pop([&](auto ids) {
+			auto province = state.world.pop_get_province_from_pop_location(ids);
+			auto local_state = state.world.province_get_state_membership(province);
+			auto market = state.world.state_instance_get_market_from_local_market(local_state);
+			auto size = state.world.pop_get_size(ids);
+			ve::apply([&](float sz, float r, dcon::market_id m) {
+				if(sz > 0.f && std::isfinite(r) && r > 0.f && m.index() >= 0 && size_t(m.index()) < market_refund.size())
+					market_refund[size_t(m.index())] += double(r);
+			}, size, refund_escrow_buffer.get(ids), market);
+		});
+		state.world.for_each_market([&](dcon::market_id m) {
+			auto const red = market_refund[size_t(m.index())];
+			if(red > 0.0) {
+				auto const cur = double(state.world.market_get_stockpile(m, economy::money));
+				state.world.market_set_stockpile(m, economy::money, float(cur - red));
+			}
+		});
+	}
 
 	set_profile_point(state, "satisfaction_update");
 
