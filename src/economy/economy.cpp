@@ -35,6 +35,96 @@
 
 namespace economy {
 
+// LOCAL EXPERIMENT (ALICE_EXP_MONEY_ANCHOR=1): monthly money-supply rule. If the total money stock
+// exceeds ALICE_MONEY_ANCHOR_RATIO days of cost-valued GDP, the excess is removed from market cash
+// and then from national banks. Diagnostic for the nominal anchor question; default off.
+static bool const money_anchor = []() {
+	auto e = std::getenv("ALICE_EXP_MONEY_ANCHOR");
+	return e && std::atoi(e) != 0;
+}();
+static float const money_anchor_ratio = []() {
+	auto e = std::getenv("ALICE_MONEY_ANCHOR_RATIO");
+	return e ? std::clamp(float(std::atof(e)), 1.f, 1000.f) : 40.f;
+}();
+
+static void apply_money_anchor(sys::state& state) {
+	if(!money_anchor)
+		return;
+	auto const ymd = state.current_date.to_ymd(state.start_date);
+	if(ymd.day != 1)
+		return;
+	double Y = 0.0;
+	state.world.for_each_market([&](dcon::market_id m) {
+		for(uint32_t k = 1; k < state.world.commodity_size(); ++k) {
+			dcon::commodity_id c{ dcon::commodity_id::value_base_t(k) };
+			if(c == economy::money)
+				continue;
+			auto const sup = double(state.world.market_get_supply(m, c));
+			auto const cost = double(state.world.commodity_get_cost(c));
+			if(sup > 0.0 && cost > 0.0 && std::isfinite(sup))
+				Y += sup * cost;
+		}
+	});
+	double M = 0.0;
+	double market_total = 0.0;
+	state.world.for_each_market([&](dcon::market_id m) {
+		auto const mm = double(state.world.market_get_stockpile(m, economy::money));
+		M += mm;
+		if(mm > 0.0)
+			market_total += mm;
+		M += double(state.world.market_get_pop_investments(m));
+		M += double(state.world.market_get_pop_dividends(m));
+	});
+	state.world.for_each_pop([&](dcon::pop_id p) { M += double(state.world.pop_get_savings(p)); });
+	state.world.for_each_nation([&](dcon::nation_id n) {
+		if(!state.world.nation_is_valid(n))
+			return;
+		M += double(state.world.nation_get_treasury(n));
+		M += double(state.world.nation_get_national_bank(n));
+		M += double(state.world.nation_get_private_investment(n));
+	});
+	state.world.for_each_province([&](dcon::province_id p) {
+		M += double(state.world.province_get_rgo_bank(p));
+		M += double(state.world.province_get_factory_bank(p));
+		M += double(state.world.province_get_artisan_bank(p));
+		for(int32_t i = 0; i < advanced_province_buildings::list::total; ++i)
+			M += double(state.world.province_get_advanced_province_building_private_savings(p, i));
+	});
+	if(!(Y > 0.0) || !std::isfinite(Y) || !std::isfinite(M))
+		return;
+	auto const target = double(money_anchor_ratio) * Y;
+	if(M <= target)
+		return;
+	double excess = M - target;
+	if(market_total > 0.0) {
+		auto const take = std::min(excess, market_total);
+		state.world.for_each_market([&](dcon::market_id m) {
+			auto const mm = double(state.world.market_get_stockpile(m, economy::money));
+			if(mm > 0.0)
+				state.world.market_set_stockpile(m, economy::money, float(mm - take * mm / market_total));
+		});
+		excess -= take;
+	}
+	if(excess > 0.0) {
+		double bank_total = 0.0;
+		state.world.for_each_nation([&](dcon::nation_id n) {
+			if(state.world.nation_is_valid(n))
+				bank_total += std::max(0.f, state.world.nation_get_national_bank(n));
+		});
+		if(bank_total > 0.0) {
+			auto const take = std::min(excess, bank_total);
+			state.world.for_each_nation([&](dcon::nation_id n) {
+				if(!state.world.nation_is_valid(n))
+					return;
+				auto const b = double(state.world.nation_get_national_bank(n));
+				if(b > 0.0)
+					state.world.nation_set_national_bank(n, float(b - take * b / bank_total));
+			});
+		}
+	}
+}
+
+
 // LOCAL EXPERIMENT (ALICE_EXP_PRICE_FLOW_MIX=1): price sees flow supply plus ALICE_PRICE_FLOW_ALPHA
 // of the merchant stockpile offer (the full-offer removal is ALICE_EXP_PRICE_FLOW_SUPPLY).
 static bool const price_flow_mix = []() {
@@ -8261,6 +8351,8 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 		}
 		*/
 	}
+
+	apply_money_anchor(state);
 
 	set_profile_point(state, "random data");
 
