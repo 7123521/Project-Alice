@@ -237,6 +237,12 @@ static float const cost_plus_speed = []() {
 	auto s = std::getenv("ALICE_COST_PLUS_SPEED");
 	return s ? std::clamp(float(std::atof(s)), 0.0001f, 1.f) : 0.02f;
 }();
+// LOCAL EXPERIMENT: apply cost-plus pricing during presimulation as well, so the 730-day presim
+// does not run at 1pct-of-cost prices while cost-valued wages are already at cost level.
+static bool const cost_plus_presim = []() {
+	auto s = std::getenv("ALICE_COST_PLUS_PRESIM");
+	return s && std::atoi(s) != 0;
+}();
 // LOCAL EXPERIMENT (ALICE_EXP_HOUSEHOLD_TRANSFER=1): the state redistributes a share of daily
 // cost-valued GDP from its cash balances to households, in proportion to population. Prices and
 // wages keep upstream behaviour; the transfer only monetises households so industrial sales can
@@ -7961,6 +7967,10 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 			if(presimulation) {
 				next_price = current_price + price_properties::commodity::change_fast<ve::fp_vector>(current_price, supply, demand) / (1.f + 100.f * presimulation_stage) ;				
 				next_price = ve::select(demand <= supply, next_price * (demand + 0.000'001f) / (supply + 0.000'002f), next_price);
+				if(cost_plus_price && cost_plus_presim) {
+					auto const target = state.world.commodity_get_cost(cid) * (1.f + cost_plus_markup);
+					next_price = current_price + (target - current_price) * cost_plus_speed;
+				}
 			} else {
 				next_price = current_price + price_properties::commodity::change<ve::fp_vector>(current_price, supply, demand);
 				if(cost_plus_price) {
