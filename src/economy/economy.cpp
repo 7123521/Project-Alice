@@ -4600,6 +4600,8 @@ static bool const wage_conservation_trace = []() {
 }();
 static double wage_credit_day = 0.0;
 static double wage_debit_day = 0.0;
+static double wage_actual_day = 0.0;
+static float wage_payout_scale = 1.f;
 
 // LOCAL EXPERIMENT (ALICE_EXP_WAGE_CONSERVATION=1): make the wage debited from producer banks follow
 // the wage credited to pops. Yesterday's credit/debit ratio scales today's producer wage bill, so the
@@ -4772,6 +4774,7 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 
 	wage_credit_day = 0.0;
 	wage_debit_day = 0.0;
+	wage_actual_day = 0.0;
 
 	set_profile_point(state, "start");
 
@@ -7721,6 +7724,10 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 				if(total_wage_bill > allowed)
 					total_wage_bill = std::max(0.f, allowed);
 			}
+			if(wage_conservation)
+				wage_actual_day += double(total_wage_bill);
+			if(wage_conservation_trace)
+				wage_debit_day += double(total_wage_bill);
 			if(seller_payout) {
 				// gross sales were credited at settlement; pay inputs and wages out of that revenue
 				state.world.province_set_factory_bank(pid, current_bank - total_input_cost - total_wage_bill);
@@ -7756,6 +7763,8 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 					if(rgo_wage_bill > allowed)
 						rgo_wage_bill = std::max(0.f, allowed);
 				}
+				if(wage_conservation)
+					wage_actual_day += double(rgo_wage_bill);
 				if(wage_conservation_trace)
 					wage_debit_day += double(rgo_wage_bill);
 				state.world.province_set_rgo_bank(pid, current_bank - rgo_wage_bill);
@@ -7773,6 +7782,7 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 		for(auto v : province_wage_debit_cache)
 			total += double(v);
 		wage_debit_prev = total;
+		wage_payout_scale = total > 1e-9 ? float(wage_actual_day / total) : 1.f;
 	}
 
 	set_profile_point(state, "rgo/factory banks");
@@ -9335,3 +9345,9 @@ bool do_resource_potentials_allow_refit(sys::state& state, [[maybe_unused]] dcon
 }
 
 } // namespace economy
+
+namespace economy {
+float wage_credit_payout_scale() {
+	return wage_payout_scale;
+}
+}

@@ -2271,6 +2271,24 @@ void update_income_wages(sys::state& state){
 		state.world.province_set_rgo_bank(pid, old_rgo_cash + profit_from_slaves);
 	});
 
+	{
+		static bool const wage_conservation_pops = []() {
+			auto e = std::getenv("ALICE_EXP_WAGE_CONSERVATION");
+			return e && std::atoi(e) != 0;
+		}();
+		if(wage_conservation_pops) {
+			auto const sc = economy::wage_credit_payout_scale();
+			if(std::isfinite(sc) && sc >= 0.f && sc != 1.f) {
+				province::ve_for_each_land_province(state, [&](auto ids) {
+					buffer_rgo_workers_wage.set(ids, buffer_rgo_workers_wage.get(ids) * sc);
+					buffer_primary_workers_wage.set(ids, buffer_primary_workers_wage.get(ids) * sc);
+					buffer_high_not_accepted_workers_wage.set(ids, buffer_high_not_accepted_workers_wage.get(ids) * sc);
+					buffer_high_accepted_workers_wage.set(ids, buffer_high_accepted_workers_wage.get(ids) * sc);
+				});
+			}
+		}
+	}
+
 	auto pop_wage_income = state.world.pop_make_vectorizable_float_buffer();
 	state.world.execute_parallel_over_pop([&](auto pops) {
 		auto savings = state.world.pop_get_savings(pops);
