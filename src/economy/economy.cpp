@@ -4610,6 +4610,16 @@ static bool const wage_conservation = []() {
 }();
 static double wage_credit_prev = 0.0;
 static double wage_debit_prev = 0.0;
+// LOCAL EXPERIMENT: explicit bounded producer credit. When wage conservation would push a producer
+// bank below -limit, the wage payment is capped at the limit instead of creating unbounded debt.
+static bool const wage_credit_bound = []() {
+	auto e = std::getenv("ALICE_EXP_WAGE_CREDIT_LIMIT");
+	return e && std::atoi(e) != 0;
+}();
+static float const wage_credit_limit = []() {
+	auto e = std::getenv("ALICE_WAGE_CREDIT_LIMIT");
+	return e ? std::clamp(float(std::atof(e)), 0.f, 1e9f) : 5000000.f;
+}();
 static std::vector<float> province_wage_debit_cache;
 
 static void money_ledger_mark(sys::state& state, char const* tag) {
@@ -7706,6 +7716,11 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 			if(wage_conservation && wage_scale != 1.f)
 				total_wage_bill *= wage_scale;
 			auto current_bank = state.world.province_get_factory_bank(pid);
+			if(wage_conservation && wage_credit_bound) {
+				auto const allowed = current_bank - total_input_cost + wage_credit_limit;
+				if(total_wage_bill > allowed)
+					total_wage_bill = std::max(0.f, allowed);
+			}
 			if(seller_payout) {
 				// gross sales were credited at settlement; pay inputs and wages out of that revenue
 				state.world.province_set_factory_bank(pid, current_bank - total_input_cost - total_wage_bill);
@@ -7735,9 +7750,14 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 					province_wage_debit_cache[size_t(pid.index())] = province_factory_wage_bill + rgo_wage_bill;
 				if(wage_conservation && wage_scale != 1.f)
 					rgo_wage_bill *= wage_scale;
+				auto current_bank = state.world.province_get_rgo_bank(pid);
+				if(wage_conservation && wage_credit_bound) {
+					auto const allowed = current_bank + wage_credit_limit;
+					if(rgo_wage_bill > allowed)
+						rgo_wage_bill = std::max(0.f, allowed);
+				}
 				if(wage_conservation_trace)
 					wage_debit_day += double(rgo_wage_bill);
-				auto current_bank = state.world.province_get_rgo_bank(pid);
 				state.world.province_set_rgo_bank(pid, current_bank - rgo_wage_bill);
 			} else {
 				auto total_rgo_profit = state.world.province_get_rgo_profit(pid);
