@@ -209,6 +209,18 @@ static bool const seller_payout = []() {
 	auto s = std::getenv("ALICE_EXP_SELLER_PAYOUT");
 	return s && std::atoi(s) != 0;
 }();
+// LOCAL EXPERIMENT (ALICE_EXP_CLEARING_LOOP=1): with seller payout on, let the market clearing
+// account pay the full sales value to producers and carry the unfunded part as a bounded negative
+// balance (trade credit) instead of capping the payout at the current cash. The transfer itself is
+// money-conserving: market money falls by exactly what the producer banks gain.
+static bool const clearing_loop = []() {
+	auto e = std::getenv("ALICE_EXP_CLEARING_LOOP");
+	return e && std::atoi(e) != 0;
+}();
+static float const clearing_credit_limit = []() {
+	auto e = std::getenv("ALICE_CLEARING_CREDIT_LIMIT");
+	return e ? std::clamp(float(std::atof(e)), 0.f, 1e9f) : 5000000.f;
+}();
 // LOCAL EXPERIMENT (ALICE_EXP_INVENTORY_FINANCE=1): credit producers with the value of unsold
 // output (inventory investment) from the national bank, so factor income is paid on output value
 // (realised sales + inventory change) rather than realised sales only. Default 0 = upstream.
@@ -6093,8 +6105,11 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 				auto const money = state.world.market_get_stockpile(m, economy::money);
 				if(!std::isfinite(money))
 					return;
-				// cash-in-advance: the market can only pay out what it holds
-				auto const pay = std::min(sold, std::max(0.f, money));
+				// cash-in-advance: the market can only pay out what it holds; the clearing loop
+				// allows a bounded overdraft so producers are paid the full sales value
+				auto const pay = clearing_loop
+					? std::min(sold, std::max(0.f, money) + clearing_credit_limit)
+					: std::min(sold, std::max(0.f, money));
 				if(!(pay > 0.f))
 					return;
 				state.world.market_set_stockpile(m, economy::money, money - pay);
