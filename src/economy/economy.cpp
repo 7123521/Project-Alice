@@ -7694,6 +7694,15 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 	float wage_scale = 1.f;
 	if(wage_conservation && wage_debit_prev > 1e-9 && wage_credit_prev > 0.0)
 		wage_scale = float(wage_credit_prev / wage_debit_prev);
+	if(wage_conservation) {
+		static bool dbg_once = false;
+		auto const ymd = state.current_date.to_ymd(state.start_date);
+		if(ymd.day == 1) {
+			fprintf(stderr, "WAGEDBG %04d-%02d-%02d cons=%d credit_prev=%.6g debit_prev=%.6g scale=%.6g\n",
+				ymd.year, ymd.month, ymd.day, wage_conservation ? 1 : 0, wage_credit_prev, wage_debit_prev, wage_scale);
+			fflush(stderr);
+		}
+	}
 	if(wage_conservation && province_wage_debit_cache.size() < size_t(state.world.province_size()))
 		province_wage_debit_cache.assign(size_t(state.world.province_size()), 0.f);
 
