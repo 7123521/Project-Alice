@@ -125,7 +125,12 @@ static float const direct_factory_wage_share = []() {
 	auto s = std::getenv("ALICE_VALUE_ADDED_LABOR_SHARE");
 	return s ? std::max(0.f, std::min(1.f, float(std::atof(s)))) : 0.5f;
 }();
-static bool const financed_wage = []() {
+// Renamed from `financed_wage`: economy.cpp defines a static of that name for the same
+// switch (both added in c3200616b). Two file-local statics with the same name are legal
+// separately but collide in a unity build, which is how the Alice (GUI) target compiles
+// this file -- the GUI binary failed to build with "redefinition of 'financed_wage'".
+// Behaviour is unchanged; the same environment variable is read.
+static bool const financed_wage_prod = []() {
 	auto s = std::getenv("ALICE_EXP_FINANCED_WAGE");
 	return s && std::atoi(s) != 0;
 }();
@@ -1281,7 +1286,7 @@ float factory_throughput_additional_multiplier(sys::state const& state, dcon::fa
 float get_total_wage(const sys::state& state, dcon::factory_id f) {
 	if(direct_factory_wage) {
 		auto location = state.world.factory_get_province_from_factory_location(f);
-		if(financed_wage) {
+		if(financed_wage_prod) {
 			auto const bank = state.world.province_get_factory_bank(location);
 			auto const start = economy::get_factory_bank_start(state, location);
 			auto const inflow = std::max(0.f, bank - start);

@@ -14,11 +14,15 @@
 #include <cstdlib>
 #include <cmath>
 #include <execinfo.h>
+#include <dlfcn.h>
 
 // LOCAL DIAGNOSTIC (ALICE_NAN_WATCH=1): catch a negative or non-finite demand registration and
 // report the calling symbol, which is where the bad amount is produced.
-extern "C" int dladdr(void const* addr, void* info);
-struct nan_dl_info { char const* dli_fname; void* dli_fbase; char const* dli_sname; void* dli_saddr; };
+// Use the system declaration instead of hand-writing one. A local
+// `extern "C" int dladdr(void const*, void*)` is not compatible with glibc's
+// `int dladdr(const void*, Dl_info*) __THROW`, and the mismatch only shows up when both
+// end up in the same translation unit -- which a unity build does. That is how the
+// Alice (GUI) target failed: "conflicting types for 'dladdr'".
 static bool const nan_watch_demand = []() {
 	auto env = std::getenv("ALICE_NAN_WATCH");
 	return env && std::atoi(env) != 0;
@@ -28,7 +32,7 @@ static void check_demand_amount(dcon::market_id m, dcon::commodity_id c, float a
 		return;
 	if(std::isfinite(amount) && amount >= 0.f)
 		return;
-	nan_dl_info info{};
+	Dl_info info{};
 	dladdr(__builtin_return_address(0), &info);
 	std::fprintf(stderr, "NANWATCH bad_register_demand market=%u commodity=%u amount=%g caller=%s\n",
 		m.index(), c.index(), amount, info.dli_sname ? info.dli_sname : "?");
