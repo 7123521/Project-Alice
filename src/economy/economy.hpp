@@ -10,6 +10,8 @@
 
 namespace economy {
 
+bool is_presimulation_update();
+
 // LOCAL TRACE: today's total wage credited to pops (pops::update_income_wages).
 double daily_wage_credit();
 float food_relief_score(sys::state const& state, dcon::province_id p);
@@ -114,6 +116,26 @@ dcon::unilateral_relationship_id nation_gives_direct_free_trade_rights(sys::stat
 
 void initialize(sys::state& state);
 float total_foreign_settlement();
+// LOCAL EXPERIMENT: government purchase escrow is money already debited from the treasury and
+// waiting for same-day seller settlement. It is zero when the experiment is disabled.
+double government_purchase_escrow_total();
+bool government_purchase_settlement_enabled();
+bool household_batch_settlement_enabled();
+bool factory_input_settlement_enabled();
+// LOCAL EXPERIMENT (ALICE_EXP_TRADE_ESCROW=1): importer trade credit outstanding, and the
+// seller-settlement helper used by the route-level payment split. Both are zero/inert when the
+// experiment is disabled.
+bool trade_escrow_enabled();
+double trade_credit_total();
+double trade_credit_lender_balance();
+double trade_repay_credit(sys::state& state, dcon::market_id market, double available);
+double settle_trade_seller_payment(
+	sys::state& state,
+	dcon::market_id market,
+	dcon::commodity_id commodity,
+	double payment,
+	double& unmatched
+);
 void regenerate_unsaved_values(sys::state& state);
 
 float pop_min_wage_factor(sys::state& state, dcon::nation_id n);

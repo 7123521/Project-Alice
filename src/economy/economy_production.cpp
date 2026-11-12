@@ -30,6 +30,91 @@ uint32_t size(sys::state const& state) {
 
 namespace economy {
 
+// ===== LOCAL FORK (not upstream) =====
+// LOCAL TRACE (ALICE_TRACE_RGO_EMPLOYMENT=1): read-only decomposition of the RGO employment
+// target update. ALICE_RGO_TRACE_GOODS is a comma-separated list of commodity-name substrings;
+// ALICE_RGO_TRACE_PROVINCES optionally limits the trace to province indices. The trace is
+// monthly, post-presimulation, and never changes simulation state.
+static bool const trace_rgo_employment = []() {
+	auto s = std::getenv("ALICE_TRACE_RGO_EMPLOYMENT");
+	return s && std::atoi(s) != 0;
+}();
+static FILE* rgo_employment_file = nullptr;
+static bool rgo_employment_file_init = false;
+static bool rgo_employment_goods_init = false;
+static std::vector<dcon::commodity_id> rgo_employment_goods;
+static std::vector<int> rgo_employment_provinces;
+
+static void init_rgo_employment_trace(sys::state const& state) {
+	if(!trace_rgo_employment)
+		return;
+	if(!rgo_employment_goods_init) {
+		rgo_employment_goods_init = true;
+		auto const list = std::getenv("ALICE_RGO_TRACE_GOODS");
+		if(list) {
+			std::string names(list);
+			size_t start = 0;
+			while(start < names.size()) {
+				auto const end = names.find(',', start);
+				auto token = names.substr(start, end == std::string::npos ? std::string::npos : end - start);
+				std::string lower = token;
+				std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char ch) { return char(std::tolower(ch)); });
+				while(!lower.empty() && lower.front() == ' ')
+					lower.erase(lower.begin());
+				while(!lower.empty() && lower.back() == ' ')
+					lower.pop_back();
+				if(!lower.empty()) {
+					state.world.for_each_commodity([&](dcon::commodity_id c) {
+						if(c == economy::money)
+							return;
+						auto const name = text::produce_simple_string(state, state.world.commodity_get_name(c));
+						std::string n = name;
+						std::transform(n.begin(), n.end(), n.begin(), [](unsigned char ch) { return char(std::tolower(ch)); });
+						if(n.find(lower) != std::string::npos
+							&& std::find(rgo_employment_goods.begin(), rgo_employment_goods.end(), c) == rgo_employment_goods.end())
+							rgo_employment_goods.push_back(c);
+					});
+				}
+				if(end == std::string::npos)
+					break;
+				start = end + 1;
+			}
+		}
+		auto const provs = std::getenv("ALICE_RGO_TRACE_PROVINCES");
+		if(provs) {
+			std::string names(provs);
+			size_t start = 0;
+			while(start < names.size()) {
+				auto const end = names.find(',', start);
+				auto const token = names.substr(start, end == std::string::npos ? std::string::npos : end - start);
+				char* parse_end = nullptr;
+				long const value = std::strtol(token.c_str(), &parse_end, 10);
+				if(parse_end != token.c_str() && value >= 0 && value <= std::numeric_limits<int>::max())
+					rgo_employment_provinces.push_back(int(value));
+				if(end == std::string::npos)
+					break;
+				start = end + 1;
+			}
+		}
+	}
+	if(rgo_employment_file_init)
+		return;
+	rgo_employment_file_init = true;
+	auto const path = std::getenv("ALICE_RGO_TRACE_FILE");
+	if(path) {
+		rgo_employment_file = fopen(path, "w");
+		if(rgo_employment_file)
+			fprintf(rgo_employment_file, "date,province,nation,good,price,cost,price_over_cost,size,target_before,actual_before,workers_availability,expected_sell,output_per_worker,wage,spending_per_worker,gradient,employment_change,profit_to_wage_bound,new_target,output,labor_supply,labor_demand,labor_satisfaction\n");
+		if(rgo_employment_file)
+			fflush(rgo_employment_file);
+	}
+}
+
+static bool rgo_employment_province_selected(dcon::province_id p) {
+	return rgo_employment_provinces.empty()
+		|| std::find(rgo_employment_provinces.begin(), rgo_employment_provinces.end(), int(p.index())) != rgo_employment_provinces.end();
+}
+
 // LOCAL EXPERIMENT (ALICE_EXP_DIRECT_FACTORY_WAGE=1): pay factories a labour share of value added
 // (output value - input cost) instead of labour_price x employment. Default 0 = upstream.
 static bool const direct_factory_wage = []() {
@@ -82,6 +167,19 @@ static bool const rgo_cost_wage_enabled = []() {
 static float const rgo_supply_floor = []() {
 	auto s = std::getenv("ALICE_RGO_SUPPLY_FLOOR");
 	return s ? std::max(0.1f, std::min(1.f, float(std::atof(s)))) : 0.3f;
+}();
+// LOCAL EXPERIMENT (ALICE_EXP_RGO_REAL_WAGE=1): a money_rgo commodity has its market price reset to the
+// constant commodity cost every day, so its revenue per worker is a frozen absolute number while the
+// labour price it has to pay is nominal. When the general price level moves, that RGO's earn/spend term
+// collapses although its physical productivity is unchanged, its employment gradient saturates at the
+// negative bound, and its employment target is clamped to zero and stays there. With this switch on,
+// such a commodity is valued at the consumer basket index that already anchors the labour price floor
+// instead of at the frozen constant. No new constant, target or bound is introduced: the index is the
+// one the wage floor is itself defined from. Commodities that are not money_rgo keep the market price.
+// Default 0 leaves every expression byte-identical.
+static bool const rgo_real_wage = []() {
+	auto s = std::getenv("ALICE_EXP_RGO_REAL_WAGE");
+	return s && std::atoi(s) != 0;
 }();
 static bool const grain_output_mult_enabled = []() {
 	auto s = std::getenv("ALICE_EXP_GRAIN_OUTPUT_MULT");
@@ -181,6 +279,13 @@ ve::fp_vector ve_artisan_min_wage(sys::state& state, T markets) {
 	auto life = state.world.market_get_life_needs_costs(markets, state.culture_definitions.artisans);
 	auto everyday = state.world.market_get_everyday_needs_costs(markets, state.culture_definitions.artisans);
 	return (life + everyday) * 0.001f;
+}
+// Same basket the labour price floor is built from, but for the pop type whose needs that floor uses.
+template<typename T>
+ve::fp_vector ve_rgo_wage_basket_index(sys::state& state, T markets) {
+	auto life = state.world.market_get_life_needs_costs(markets, state.culture_definitions.secondary_factory_worker);
+	auto everyday = state.world.market_get_everyday_needs_costs(markets, state.culture_definitions.secondary_factory_worker);
+	return life + everyday;
 }
 template<typename T>
 auto artisan_output_multiplier(
@@ -1912,7 +2017,7 @@ void update_artisan_production(sys::state& state) {
 				return;
 			}
 			auto mid = state.world.state_instance_get_market_from_local_market(sid);
-			register_domestic_supply(state, mid, cid, production, economy_reason::artisan);
+			register_domestic_supply(state, mid, cid, production, economy_reason::artisan, ids);
 		});
 	}
 }
@@ -1928,7 +2033,7 @@ void update_factories_production(
 		auto production = state.world.factory_get_output(factory);
 		auto factory_type = state.world.factory_get_building_type(factory);
 		auto cid = state.world.factory_type_get_output(factory_type);
-		register_domestic_supply(state, local_market, cid, production, economy_reason::factory);
+		register_domestic_supply(state, local_market, cid, production, economy_reason::factory, province);
 	});
 }
 
@@ -2063,7 +2168,7 @@ void update_rgo_production(sys::state& state) {
 					auto const median_price = state.world.commodity_get_median_price(commodity);
 					state.world.market_set_gdp(local_market, state.world.market_get_gdp(local_market) + on_farm * median_price);
 				}
-				register_domestic_supply(state, local_market, commodity, amount, economy_reason::rgo);
+				register_domestic_supply(state, local_market, commodity, amount, economy_reason::rgo, province);
 			});
 		});
 	});
@@ -2330,6 +2435,10 @@ void update_employment(sys::state& state, bool ignore_reality, float presim_empl
 	// so we can execute in parallel over nations but not over provinces
 
 	auto workers_optimism = 0.01f;
+	auto const trace_ymd = state.current_date.to_ymd(state.start_date);
+	bool const trace_rgo_today = trace_rgo_employment && !ignore_reality && trace_ymd.day == 1;
+	if(trace_rgo_today)
+		init_rgo_employment_trace(state);
 
 	if(grain_demand_alloc) {
 		init_rgo_grain_commodity(state);
@@ -2446,6 +2555,11 @@ void update_employment(sys::state& state, bool ignore_reality, float presim_empl
 			auto supply = state.world.market_get_aggregated_supply_history(m, c);
 			auto demand = state.world.market_get_aggregated_demand_history(m, c);
 			auto current_price = ve_price(state, m, c) + subsidy;
+			auto effective_output_price = current_price;
+			if(rgo_real_wage && state.world.commodity_get_money_rgo(c)) {
+				auto const basket_index = ve_rgo_wage_basket_index(state, m);
+				effective_output_price = ve::max(basket_index, 0.000001f);
+			}
 
 			auto sales_expected_rate = state.world.market_get_expected_probability_to_sell(m, c);
 			if(ignore_reality || state.world.commodity_get_money_rgo(c)) {
@@ -2455,7 +2569,7 @@ void update_employment(sys::state& state, bool ignore_reality, float presim_empl
 			auto gradient = gradient_employment_i<ve::fp_vector>(
 				(workers_optimism + (1.f - workers_optimism) * workers_availability)
 				* output_per_worker
-				* current_price
+				* effective_output_price
 				* sales_expected_rate,
 				0.f,
 				1.f,
@@ -2473,11 +2587,10 @@ void update_employment(sys::state& state, bool ignore_reality, float presim_empl
 			
 			// we don't want wages to rise way too high relatively to profits
 			// as we do not have actual budgets, we  consider that our workers budget is as follows
-			new_employment = ve::min(
-				rgo_profit_to_wage_bound * output_per_worker * current_price * current_size // budget
-				/ wage_per_worker,
-				new_employment
-			);
+			auto const profit_to_wage_bound =
+				rgo_profit_to_wage_bound * output_per_worker * effective_output_price * current_size // budget
+				/ wage_per_worker;
+			new_employment = ve::min(profit_to_wage_bound, new_employment);
 
 			new_employment = ve::max(ve::fp_vector{0.f}, ve::min(new_employment, current_size));
 			state.world.province_set_rgo_target_employment(pids, c, new_employment);
@@ -2495,6 +2608,35 @@ void update_employment(sys::state& state, bool ignore_reality, float presim_empl
 				provisional_output = provisional_output * factor;
 			}
 			state.world.province_set_rgo_output(pids, c, provisional_output);
+
+			bool const rgo_good_selected = rgo_employment_goods.empty()
+				|| std::find(rgo_employment_goods.begin(), rgo_employment_goods.end(), c) != rgo_employment_goods.end();
+			if(trace_rgo_today && rgo_employment_file && rgo_good_selected) {
+				char datebuf[16];
+				std::snprintf(datebuf, sizeof(datebuf), "%04d-%02d-%02d", trace_ymd.year, trace_ymd.month, trace_ymd.day);
+				auto const cost = state.world.commodity_get_cost(c);
+				auto const good_name = text::produce_simple_string(state, state.world.commodity_get_name(c));
+				ve::apply([&](dcon::province_id p, dcon::nation_id n, float size_v, float target_v, float actual_v,
+					float availability_v, float expected_sell_v, float output_per_worker_v, float price_v,
+					float wage_v, float spending_v, float gradient_v, float change_v, float bound_v,
+					float new_target_v, float output_v) {
+					if(!(size_v > 0.f) || !rgo_employment_province_selected(p))
+						return;
+					auto const supply = state.world.province_get_labor_supply(p, labor::no_education);
+					auto const demand = state.world.province_get_labor_demand(p, labor::no_education);
+					auto const satisfaction = state.world.province_get_labor_demand_satisfaction(p, labor::no_education);
+					fprintf(rgo_employment_file, "%s,%d,%d,%s,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g\n",
+						datebuf, int(p.index()), int(n.index()), good_name.c_str(), double(price_v), double(cost),
+						double(price_v / std::max(1e-12f, cost)), double(size_v), double(target_v), double(actual_v),
+						double(availability_v), double(expected_sell_v), double(output_per_worker_v), double(wage_v),
+						double(spending_v), double(gradient_v), double(change_v), double(bound_v), double(new_target_v),
+						double(output_v), double(supply), double(demand), double(satisfaction));
+				}, pids, n, current_size, current_employment_target, current_employment, workers_availability,
+					sales_expected_rate, output_per_worker, current_price, wage_per_worker,
+					spending_per_worker_perception, gradient, employment_change, profit_to_wage_bound,
+					new_employment, provisional_output);
+				fflush(rgo_employment_file);
+			}
 		});
 	});
 

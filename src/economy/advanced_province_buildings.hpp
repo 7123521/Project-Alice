@@ -60,4 +60,13 @@ void update_national_size(sys::state& state);
 void update_production(sys::state& state);
 void update_profit_and_refund(sys::state& state);
 
+// ===== LOCAL FORK (not upstream) =====
+// LOCAL EXPERIMENT (ALICE_EXP_PROPERTY_INCOME_FLOW=1): the daily profit computed by
+// update_profit_and_refund(), retained separately from the accumulated private savings.
+// The default path does not populate this buffer and callers must not rely on it.
+float get_daily_private_profit(dcon::province_id pid, int32_t building);
+
+// LOCAL TRACE (ALICE_TRACE_APB=1): read-only monthly accounting snapshot. No economic effect.
+void trace_apb_state(sys::state& state, char const* tag);
+
 }

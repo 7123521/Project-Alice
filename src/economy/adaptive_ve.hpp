@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cmath>
+
 #ifdef NDEBUG
 #ifdef _MSC_VER
 #define RELEASE_INLINE __forceinline
@@ -82,6 +84,16 @@ RELEASE_INLINE VALUE abs(const VALUE a) {
 template<typename VALUE>
 RELEASE_INLINE VALUE abs(const VALUE a) {
 	return ve::abs(a);
+}
+
+template<typename VALUE> requires std::floating_point<VALUE>
+RELEASE_INLINE VALUE exp(const VALUE a) {
+	return std::exp(a);
+}
+
+template<typename VALUE> requires is_vector<VALUE>
+RELEASE_INLINE VALUE exp(const VALUE a) {
+	return ve::apply([](float x) { return std::exp(x); }, a);
 }
 
 template<typename MASK, typename VALUE> requires is_vector<MASK> && is_vector<VALUE>

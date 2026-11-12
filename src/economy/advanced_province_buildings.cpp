@@ -6,6 +6,11 @@
 #include "province_templates.hpp"
 #include "money.hpp"
 #include "economy_production.hpp"
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
 
 namespace services {
 
@@ -93,7 +98,93 @@ void match_supply_and_demand(sys::state& state) {
 
 }
 
+namespace economy {
+bool is_presimulation_update();
+}
+
 namespace advanced_province_buildings {
+
+// ===== LOCAL FORK (not upstream) =====
+// LOCAL EXPERIMENT (ALICE_EXP_PROPERTY_INCOME_FLOW=1): retain the profit computed for each
+// private advanced building this day. The default path leaves this buffer empty.
+static bool const property_income_flow_enabled = []() {
+	auto e = std::getenv("ALICE_EXP_PROPERTY_INCOME_FLOW");
+	return e && std::atoi(e) != 0;
+}();
+static std::vector<float> daily_private_profit;
+
+// LOCAL TRACE (ALICE_TRACE_APB=1): read-only monthly snapshot of the private APB sector.
+// It reports the bank stock separately from the daily service revenue and labour cost, so a
+// stock-based rent payout can be distinguished from a flow-backed profit distribution.
+static bool const apb_trace = []() {
+	auto e = std::getenv("ALICE_TRACE_APB");
+	return e && std::atoi(e) != 0;
+}();
+
+void trace_apb_state(sys::state& state, char const* tag) {
+	if(!apb_trace)
+		return;
+	if(economy::is_presimulation_update())
+		return;
+	auto const ymd = state.current_date.to_ymd(state.start_date);
+	if(ymd.day != 1)
+		return;
+
+	double bank[list::total] = {};
+	double revenue[list::total] = {};
+	double matched[list::total] = {};
+	double labor_cost[list::total] = {};
+	double profit[list::total] = {};
+	double private_size[list::total] = {};
+	double private_output[list::total] = {};
+	double demand[list::total] = {};
+	double supply[list::total] = {};
+	double sold[list::total] = {};
+	double satisfaction[list::total] = {};
+	double service_price[list::total] = {};
+
+	state.world.for_each_province([&](dcon::province_id pid) {
+		for(int32_t i = 0; i < list::total; ++i) {
+			auto const& def = definitions[i];
+			auto const size = state.world.province_get_advanced_province_building_private_size(pid, i);
+			auto const out = state.world.province_get_advanced_province_building_private_output(pid, i);
+			auto const price = state.world.province_get_service_price(pid, def.output);
+			auto const sold_ratio = state.world.province_get_service_sold(pid, def.output);
+			auto const labor_price = def.requires_labor ? state.world.province_get_labor_price(pid, def.throughput_labour_type) : 0.f;
+			auto const labor_sat = def.requires_labor ? state.world.province_get_labor_demand_satisfaction(pid, def.throughput_labour_type) : 1.f;
+			auto const local_demand = state.world.province_get_service_demand_forbidden_public_supply(pid, def.output);
+			auto const local_supply = state.world.province_get_service_supply_private(pid, def.output);
+
+			bank[i] += double(state.world.province_get_advanced_province_building_private_savings(pid, i));
+			revenue[i] += double(out * sold_ratio * price);
+			matched[i] += double(std::min(local_demand, local_supply) * price);
+			labor_cost[i] += double(size * labor_price * labor_sat);
+			profit[i] += double(out * sold_ratio * price - size * labor_price * labor_sat);
+			private_size[i] += double(size);
+			private_output[i] += double(out);
+			demand[i] += double(local_demand);
+			supply[i] += double(local_supply);
+			sold[i] += double(sold_ratio);
+			satisfaction[i] += double(state.world.province_get_service_satisfaction(pid, def.output));
+			service_price[i] += double(price);
+		}
+	});
+
+	for(int32_t i = 0; i < list::total; ++i) {
+		fprintf(stderr,
+			"APB %04d-%02d-%02d tag=%s building=%d bank=%.6f bank5=%.6f revenue=%.6f matched=%.6f labor=%.6f profit=%.6f size=%.6f output=%.6f demand=%.6f supply=%.6f sold=%.6f sat=%.6f price_sum=%.6f\n",
+			ymd.year, ymd.month, ymd.day, tag, i, bank[i], bank[i] * 0.05, revenue[i], matched[i], labor_cost[i], profit[i],
+			private_size[i], private_output[i], demand[i], supply[i], sold[i], satisfaction[i], service_price[i]);
+	}
+	fflush(stderr);
+}
+
+float get_daily_private_profit(dcon::province_id pid, int32_t building) {
+	if(!property_income_flow_enabled || building < 0 || building >= list::total)
+		return 0.f;
+	auto const index = size_t(pid.index()) * size_t(list::total) + size_t(building);
+	return index < daily_private_profit.size() ? daily_private_profit[index] : 0.f;
+}
 
 // could be expanded by 1000 per 1 years
 constexpr float max_port_expansion_speed = 1000.f / 365.f;
@@ -300,6 +391,14 @@ void update_profit_and_refund(sys::state& state) {
 	// can't be vectorised directly
 	// TODO: add refund buffer to execute in serial way and then sum it up in parallel over nation/market
 
+	if(property_income_flow_enabled) {
+		auto const count = size_t(state.world.province_size()) * size_t(list::total);
+		if(daily_private_profit.size() < count)
+			daily_private_profit.assign(count, 0.f);
+		else
+			std::fill_n(daily_private_profit.begin(), count, 0.f);
+	}
+
 	// refund to nation:
 	for(int32_t i = 0; i < list::total; i++) {
 		auto& def = definitions[i];
@@ -335,6 +434,11 @@ void update_profit_and_refund(sys::state& state) {
 			auto actually_sold = state.world.province_get_service_sold(pid, def.output);
 
 			auto profit = output * actually_sold * cost_of_output - private_size * cost_of_input * actually_bought;
+
+			if(property_income_flow_enabled) {
+				auto const profit_value = std::isfinite(profit) ? profit : 0.f;
+				daily_private_profit[size_t(pid.index()) * size_t(list::total) + size_t(i)] = profit_value;
+			}
 
 			auto current_money = state.world.province_get_advanced_province_building_private_savings(pid, i);
 			state.world.province_set_advanced_province_building_private_savings(pid, i, current_money + profit);
@@ -484,6 +588,8 @@ void update_profit_and_refund(sys::state& state) {
 			state.world.province_set_advanced_province_building_private_savings(pid, id, current_money - spendings);
 		}
 	});
+
+	trace_apb_state(state, "pre_rent");
 }
 
 void update_private_size(sys::state& state) {

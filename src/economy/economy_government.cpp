@@ -48,6 +48,53 @@ static bool administration_has_supply(sys::state const& state, dcon::province_id
 	return std::isfinite(supply) && supply > 0.f;
 }
 
+// LOCAL EXPERIMENT (ALICE_EXP_ADMIN_DEMAND_CAP=1): bound the administration's labour demand by a
+// population constraint. demand = budget_per_administration / wage is a money-to-heads conversion;
+// when the local high-education-and-accepted supply is denormal, budget / supply overflows to +inf,
+// the overflow guard above hands the wage back to the near-zero market price, and the conversion
+// yields about budget * 1e12 heads. The physical ceiling is the same total factor that economy.cpp
+// multiplies by pop_labor_distribution to build labor_supply, i.e. the accepted-culture craftsmen,
+// bureaucrats and clergy of the province: supply = total * distribution <= total, so this bound is
+// inactive wherever the segmented wage keeps demand <= supply. Default 0 = upstream behaviour.
+static bool const admin_demand_cap = []() {
+	auto e = std::getenv("ALICE_EXP_ADMIN_DEMAND_CAP");
+	return e && std::atoi(e) != 0;
+}();
+
+// Mirrors the total_high_education_and_accepted sum of economy.cpp:10250-10267: same pop types, same
+// accepted-culture test, and the same ownership-based nation (not the controller), so this is exactly
+// the factor that is multiplied by pop_labor_distribution at economy.cpp:10294-10296.
+static float accepted_high_education_population(sys::state& state, dcon::province_id p) {
+	auto const owner = state.world.province_get_nation_from_province_ownership(p);
+	auto total = 0.f;
+	for(auto pl : state.world.province_get_pop_location(p)) {
+		auto const accepted =
+			state.world.nation_get_accepted_cultures(owner, pl.get_pop().get_culture())
+			|| state.world.nation_get_primary_culture(owner) == pl.get_pop().get_culture().id;
+		if(!accepted)
+			continue;
+		if(state.culture_definitions.secondary_factory_worker == pl.get_pop().get_poptype()
+		|| pl.get_pop().get_poptype() == state.culture_definitions.bureaucrat
+		|| pl.get_pop().get_poptype() == state.culture_definitions.clergy) {
+			total += pl.get_pop().get_size();
+		}
+	}
+	return total;
+}
+
+// demand <= supply already implies demand <= total (supply = total * distribution, distribution in
+// [0,1]), so the population total is summed only when demand exceeds the available supply. That keeps
+// the enabled path free of the pop loop in every province where the segmented wage works.
+static float capped_admin_demand(sys::state& state, dcon::province_id p, float demand) {
+	auto const supply = state.world.province_get_labor_supply(p, labor::high_education_and_accepted);
+	if(std::isfinite(supply) && supply > 0.f && demand <= supply)
+		return demand;
+	auto const cap = accepted_high_education_population(state, p);
+	if(std::isfinite(cap) && cap >= 0.f && demand > cap)
+		return cap;
+	return demand;
+}
+
 // imperial administration generates demand on accepted high educated labor in capital market
 //
 // employed people in administration influence the maximum amount of taxes the nation can collect
@@ -242,6 +289,8 @@ void update_consumption_administration(sys::state& state, dcon::nation_id n, flo
 			auto demand = (admin_segmented_wage && !administration_has_supply(state, capital_of_capital_state))
 				? 0.f : budget_per_administration / wage;
 			assert(std::isfinite(demand) && demand >= 0.f);
+			if(admin_demand_cap)
+				demand = capped_admin_demand(state, capital_of_capital_state, demand);
 			state.world.nation_set_administration_employment_target_in_capital(n, demand);
 			auto& cur_labor_demand = state.world.province_get_labor_demand(capital_of_capital_state, economy::labor::high_education_and_accepted);
 			state.world.province_set_labor_demand(capital_of_capital_state, economy::labor::high_education_and_accepted, cur_labor_demand + demand);
@@ -266,6 +315,8 @@ void update_consumption_administration(sys::state& state, dcon::nation_id n, flo
 		auto demand = (admin_segmented_wage && !administration_has_supply(state, capital_of_capital_state))
 			? 0.f : budget_per_administration / wage;
 		assert(std::isfinite(demand) && demand >= 0.f);
+		if(admin_demand_cap)
+			demand = capped_admin_demand(state, capital_of_capital_state, demand);
 		state.world.province_set_administration_employment_target(capital_of_capital_state, demand);
 		auto& cur_labor_demand = state.world.province_get_labor_demand(capital_of_capital_state, economy::labor::high_education_and_accepted);
 		state.world.province_set_labor_demand(capital_of_capital_state, economy::labor::high_education_and_accepted, cur_labor_demand + demand);

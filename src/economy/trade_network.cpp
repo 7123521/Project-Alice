@@ -1,8 +1,17 @@
 #include "trade_network.hpp"
+#include "economy_constants.hpp"
 #include "province.hpp"
 #include "province_templates.hpp"
 #include "system_state.hpp"
+#include "economy_trade_routes.hpp"
+#include <algorithm>
+#include <array>
+#include <bit>
+#include <cmath>
+#include <cstdint>
+#include <cstdlib>
 #include <set>
+#include <vector>
 
 namespace trade_network {
 
@@ -51,6 +60,78 @@ constexpr float havana_pop = 250'000.f;
 constexpr float pac_pop = 160'000.f;
 constexpr float CLASSIFIER_SMALL = std::max(pac_pop, havana_pop);
 
+// ===== LOCAL FORK (not upstream) =====
+// LOCAL EXPERIMENT (ALICE_EXP_TRADE_OPPORTUNITY=1): create a sea route when a coastal market has a
+// real export surplus and another coastal market has a real import deficit in the same commodity,
+// and the landed price gap is positive after freight, loss and merchant margin. Upstream route
+// creation sees population, distance and naval bases; price differences only affect volume after a
+// route exists. This experiment derives the route from the same economic quantities used by the
+// volume update. Default 0 keeps upstream route creation unchanged.
+static bool const trade_opportunity_routes = []() {
+	auto s = std::getenv("ALICE_EXP_TRADE_OPPORTUNITY");
+	return s && std::atoi(s) != 0;
+}();
+static float const trade_opportunity_min_value = []() {
+	auto s = std::getenv("ALICE_TRADE_OPPORTUNITY_MIN_VALUE");
+	return s ? std::clamp(float(std::atof(s)), 0.f, 1'000'000.f) : 0.f;
+}();
+// LOCAL EXPERIMENT (ALICE_EXP_TRADE_OPPORTUNITY_SEED=1): the opportunity scan already knows the
+// physical surplus/deficit and the commodity that clears it. Seed only the newly created forward
+// route with that observed quantity. The forecast is not a settlement: stock, seller matching,
+// buyer cash/credit and transport still decide how much actually moves, and normal volume decay
+// can reduce it. Default 0 keeps the route volume at zero, as before this experiment.
+static bool const trade_opportunity_seed_volume = []() {
+	auto s = std::getenv("ALICE_EXP_TRADE_OPPORTUNITY_SEED");
+	return s && std::atoi(s) != 0;
+}();
+// ===== LOCAL EXPERIMENT (ALICE_EXP_ROUTE_CREATION_GAP=1): create routes from a price gap =======
+// Upstream never lets a price enter route creation: the committed scoring is population x naval base
+// x distance (process_trade_partner_candidate, trade_network.cpp:250-323), land routes are created
+// from map adjacency alone (:954) and the major-node pass only looks at population (:819).
+// `git -S "net_gap"` over this file has no history and HEAD contains no occurrence of it, so the
+// committed engine has never had a price-based creation rule. The fork's opportunity scan does use a
+// price gap, but it additionally requires a physical surplus in the origin AND a physical deficit in
+// the target for the same commodity (the surplus_mask/deficit_mask intersection at :635), which
+// fires rarely: 692 routes in 20 years in PBF_1234_20y. This switch adds a second annual pass that
+// keeps the price gap and drops the physical mask - that single removal is the whole experiment.
+//
+// CRITERION (value 1, "pure gap"):
+//   gap(o,t,c) = import_price * loss - export_price * (1 + cut) - distance * transport_price
+//   with export_price = p_o / conf_o, import_price = p_t * conf_t, conf clamped to >= 0.5,
+//        loss = 1 - economy::trade_goods_lost_per_km * distance,
+//        cut = economy::merchant_cut_domestic if both ends share an owner else
+//              economy::merchant_cut_foreign,
+//        transport_price = the owner market's naval transportation price.
+//   Create o -> t when max over c of gap > 0. No quantity is needed because no mask supplies one;
+//   ranking is by gap itself. Everything else keeps the existing structure: at most one new route
+//   per target market per year (the best_gap array is indexed by target), both directions are
+//   created with owner = origin market, and the created volume stays 0 (no seed).
+//   No anchor, floor, cap or quota is added: the only change is dropping a precondition.
+//
+// WHY DEFAULT IS BIT-IDENTICAL: the flag is read once at static initialisation and the whole pass is
+// guarded by `if(route_creation_gap != 0)`. With 0 the block is not entered, so no state is read,
+// written or reordered and no floating-point operation is executed; every dump stays identical.
+//
+// PRE-REGISTERED (5 y, seed 1234, baseline PBF_1234_20y @1856): routes +17..33% (600..790 new per
+//   year, capped by the one-per-target rule), sea_routes +600..790/year, trade_volume +8..23%,
+//   cross-continent share 2.3% -> 3.5..5.5%, grain cross-market CV -10..30% but NOT down to
+//   0.25..0.50 (each edge carries only 5..22 units/day; cross edges currently average 5.2),
+//   factories +/-5% with no predictable sign, satisfaction +1..3% with the origin side offsetting.
+//
+// FALSIFICATION: (a) fewer than ~2%/year new routes means the price gap fires as rarely as the
+//   masked scan and the price data holds no exploitable arbitrage; (b) routes grow but trade_volume
+//   does not means created edges never trade and creation is not the binding constraint; (c) the
+//   cross-continent share stays below 3% means the largest gaps are intra-continental; (d) a CV
+//   change under 10% means 10k-80k units/day do not move prices and creation cannot fix dispersion;
+//   (e) factories moving >15% one way or satisfaction falling >2% means the origin is being drained;
+//   (f) any dump differing with the switch off means the equivalence claim is broken.
+// =============================================================================================
+static int const route_creation_gap = []() {
+	auto s = std::getenv("ALICE_EXP_ROUTE_CREATION_GAP");
+	if(!s)
+		return 0;
+	return std::clamp(std::atoi(s), 0, 1);
+}();
 struct parent_link {
 	dcon::market_id leaf;
 	dcon::market_id parent;
@@ -291,11 +372,142 @@ trade_candidate_information process_trade_partner_candidate(
 }
 
 
+// ===== LOCAL EXPERIMENT (ALICE_EXP_ROUTE_EXIT=1): give trade routes an exit ===============
+// Upstream removes a trade route only when one of its ends loses its coastal capital
+// (trade_network.cpp:172-175), so a route that never clears its first trade stays in the network
+// forever. Measured on PBF_1234_20y (routes.csv.zst, 1856-01-01): 966 of 11 570 routes carry zero
+// volume (8.35%) - 594/5 418 sea (11.0%), 372/6 152 land (6.0%); every route created after 1836
+// (692, all sea) had zero volume on the day it first appeared and 169 of them never traded at all.
+//
+// (1) WHAT "ZERO VOLUME" MEANS HERE
+//     A route is eligible when the sum of volume[route, c] over every commodity except money is
+//     exactly 0.0 at the annual check. Not "<= eps": the volume update already clips its result to
+//     max(0, ...) (economy_trade_routes.cpp:579-585), so 0 is a value the engine produces on its
+//     own, and any positive epsilon would be an artificial floor.
+//     The check runs once a year, on the January pass, BEFORE new routes are created (this function
+//     is called from system_state.cpp:5423 and, at start-up, from generate_initial_trade_routes:862).
+//     Creation happens later in the same call, so a freshly created route can never be retired at
+//     birth, and a route retired here has survived at least 365 daily volume updates since it last
+//     appeared. That is the answer to "how many days": one full year, observed once.
+//     Second condition: no commodity may show positive predicted profit
+//     (predict_trade_route_volume_change().profit_score > 0 - the same net_gap test the volume
+//     update uses at economy_trade_routes.cpp:1043). Zero volume has two causes: the route is truly
+//     dead, or it is blockaded/banned, in which case reset_route zeroes it every day
+//     (economy_trade_routes.cpp:1149-1151). Without this condition one war would permanently delete
+//     whole sea corridors. Both conditions must hold to retire a route.
+//     No quota, no cap, no floor: how many routes go is whatever the state says.
+//
+// (2) WHAT MUST BE CLEANED WHEN A ROUTE IS DELETED
+//     delete_trade_route() (src/gamestate/dcon_generated.hpp:133689-133750) already does every
+//     object-level cleanup: it unlinks the route from both markets' route lists
+//     (internal_trade_route_set_origin/target), moves the last route into the freed slot copying
+//     every property including the volume array (m_volume.copy_value), zeroes the vacated slot and
+//     decrements size_used. A route holds a daily rate, not a stock, so no cargo or money is
+//     returned.
+//     The hazard is not a dangling pointer but ID COMPRESSION: after any deletion, every id above
+//     the erased one shifts down by one, so a trade_route_id held across the deletion silently names
+//     a different route. This patch therefore (a) collects the ids to retire first and deletes
+//     nothing while iterating, and (b) erases from the highest id down, which keeps every id below
+//     the erased one stable.
+//     Checked and NOT needed: market-level route counts (markets.csv recomputes its `routes` column
+//     per dump, headless_run.hpp:882), trade_credit_outstanding (indexed by market, not by route,
+//     economy_trade_routes.cpp:258), the seller-share cache and the province banks (indexed by
+//     province x commodity, economy.cpp:2452), and the static to_delete buffer inside
+//     recalculate_markets_distance (trade_network.cpp:149-151), which is resized on every call and
+//     whose call site (system_state.cpp:5424) runs after this one (5423).
+//
+// (3) WHY SWITCHING IT OFF IS BIT-IDENTICAL
+//     The flag is read once during static initialisation. With it off, retire_dead_trade_routes()
+//     returns at its first statement and reads or writes no state; the call site still runs, but it
+//     calls a function whose body is a single comparison. The patch adds no write, no reordering of
+//     existing writes and no floating-point operation on shared state. The only residual effect is
+//     a function-local `static bool route_exit_primed` flipping to true on the first call: nothing
+//     else reads it and it never enters a branch that changes state, so the simulated state and
+//     every dump stay identical to the unpatched binary.
+// =========================================================================================
+static bool const route_exit = []() {
+	auto s = std::getenv("ALICE_EXP_ROUTE_EXIT");
+	return s && std::atoi(s) != 0;
+}();
+
+static void retire_dead_trade_routes(sys::state& state) {
+	if(!route_exit)
+		return;
+	std::vector<dcon::trade_route_id> retire;
+	state.world.for_each_trade_route([&](dcon::trade_route_id route) {
+		if(!state.world.trade_route_is_valid(route))
+			return;
+		if(!state.world.trade_route_get_origin(route) || !state.world.trade_route_get_target(route))
+			return;
+		auto carried = 0.0;
+		for(uint32_t k = 1; k < state.world.commodity_size(); ++k) {
+			dcon::commodity_id cid{ dcon::commodity_id::value_base_t(k) };
+			if(state.world.commodity_get_money_rgo(cid))
+				continue;
+			carried += double(state.world.trade_route_get_volume(route, cid));
+		}
+		if(carried > 0.0)
+			return;
+		bool profitable_somewhere = false;
+		for(uint32_t k = 1; k < state.world.commodity_size() && !profitable_somewhere; ++k) {
+			dcon::commodity_id cid{ dcon::commodity_id::value_base_t(k) };
+			if(state.world.commodity_get_money_rgo(cid) || state.world.commodity_get_is_local(cid))
+				continue;
+			auto const prediction = economy::predict_trade_route_volume_change(state, route, cid);
+			if(prediction.profit_score > 0.f)
+				profitable_somewhere = true;
+		}
+		if(!profitable_somewhere)
+			retire.push_back(route);
+	});
+	// erase from the highest id down: see (2) above - delete_trade_route() compresses ids
+	for(auto i = retire.size(); i-- > 0;) {
+		state.world.delete_trade_route(retire[i]);
+	}
+}
+
 void generate_sea_trade_routes(sys::state& state) {
+	// The first call comes from generate_initial_trade_routes, where every route was created moments
+	// ago and therefore still has no volume; only retire on later (annual) passes.
+	static bool route_exit_primed = false;
+	if(route_exit_primed)
+		retire_dead_trade_routes(state);
+	route_exit_primed = true;
 	// buffer for "capitals" of connected regions:
 	std::array<dcon::state_instance_id, 4000> capital_of_region = {};
 	std::array<float, 10000> population_of_region = { };
 	std::vector<sea_trade_candidate_data> candidates { };
+	struct market_flow_data {
+		std::vector<float> surplus;
+		std::vector<float> deficit;
+		std::vector<float> price;
+		std::vector<float> confidence;
+		std::vector<uint64_t> surplus_mask;
+		std::vector<uint64_t> deficit_mask;
+	};
+	struct trade_opportunity {
+		bool found = false;
+		float value = 0.f;
+		float quantity = 0.f;
+		float net_gap = 0.f;
+		dcon::commodity_id commodity{};
+	};
+	struct best_trade_route {
+		bool found = false;
+		sea_trade_candidate_data origin {};
+		sea_trade_candidate_data target {};
+		dcon::market_id owner {};
+		float value = 0.f;
+		float quantity = 0.f;
+		float net_gap = 0.f;
+		dcon::commodity_id commodity{};
+	};
+	std::vector<market_flow_data> market_flows;
+	std::vector<sea_trade_candidate_data> market_candidates;
+	std::vector<best_trade_route> best_trade_routes;
+	if(trade_opportunity_routes) {
+		best_trade_routes.resize(state.world.market_size());
+	}
 
 	state.world.for_each_state_instance([&](auto candidate) {
 		// auto capital = state.world.state_instance_get_capital(candidate);
@@ -374,16 +586,351 @@ void generate_sea_trade_routes(sys::state& state) {
 			must_connect = must_connect || score.score >= 1.f || score.big_score >= 1.f;
 
 			if(must_connect && score.potentially_valid) {
+				auto route_owner = origin.market;
 				{
 					auto new_route = state.world.force_create_trade_route(origin.market, target.market);
 					state.world.trade_route_set_is_sea_route(new_route, true);
-					state.world.trade_route_set_owner(new_route, origin.market);
+					state.world.trade_route_set_owner(new_route, route_owner);
 				}
 				{
 					auto opposite_route = state.world.force_create_trade_route(target.market, origin.market);
 					state.world.trade_route_set_is_sea_route(opposite_route, true);
-					state.world.trade_route_set_owner(opposite_route, origin.market);
+					state.world.trade_route_set_owner(opposite_route, route_owner);
 				}
+			}
+		}
+	}
+
+	if(trade_opportunity_routes) {
+		auto choose_route_owner = [](sea_trade_candidate_data const& a, sea_trade_candidate_data const& b) {
+			if(a.naval_base_level != b.naval_base_level)
+				return a.naval_base_level > b.naval_base_level ? a.market : b.market;
+			return a.population >= b.population ? a.market : b.market;
+		};
+
+		std::vector<int32_t> market_candidate_index(state.world.market_size(), -1);
+		for(auto const& candidate : candidates) {
+			auto const mi = candidate.market.index();
+			if(mi < 0 || size_t(mi) >= market_candidate_index.size())
+				continue;
+			auto const index = market_candidate_index[mi];
+			if(index < 0) {
+				market_candidate_index[mi] = int32_t(market_candidates.size());
+				market_candidates.push_back(candidate);
+			} else {
+				auto& previous = market_candidates[size_t(index)];
+				if(candidate.population > previous.population
+					|| (candidate.population == previous.population && candidate.naval_base_level > previous.naval_base_level)) {
+					previous = candidate;
+				}
+			}
+		}
+
+		uint32_t const commodity_count = state.world.commodity_size();
+		uint32_t const mask_word_count = (commodity_count + 63u) / 64u;
+		market_flows.resize(state.world.market_size());
+		for(auto& flow : market_flows) {
+			flow.surplus.assign(commodity_count, 0.f);
+			flow.deficit.assign(commodity_count, 0.f);
+			flow.price.assign(commodity_count, 0.f);
+			flow.confidence.assign(commodity_count, 1.f);
+			flow.surplus_mask.assign(mask_word_count, 0);
+			flow.deficit_mask.assign(mask_word_count, 0);
+		}
+
+		auto set_mask_bit = [](std::vector<uint64_t>& mask, uint32_t bit) {
+			mask[size_t(bit >> 6)] |= uint64_t(1) << (bit & 63u);
+		};
+
+		state.world.for_each_market([&](dcon::market_id market) {
+			auto& flow = market_flows[market.index()];
+			for(uint32_t i = 1; i < commodity_count; ++i) {
+				dcon::commodity_id commodity{ dcon::commodity_id::value_base_t(i) };
+				if(state.world.commodity_get_money_rgo(commodity) || state.world.commodity_get_is_local(commodity))
+					continue;
+				if(state.world.commodity_get_rgo_amount(commodity) > 0.f
+					&& !state.world.commodity_get_actually_exists_in_nature(commodity)) {
+					continue;
+				}
+				auto supply = state.world.market_get_aggregated_supply_history(market, commodity);
+				auto demand = state.world.market_get_aggregated_demand_history(market, commodity);
+				auto price = state.world.market_get_price(market, commodity);
+				auto confidence = state.world.market_get_price_confidence(market, commodity);
+				if(!std::isfinite(supply) || !std::isfinite(demand) || !std::isfinite(price) || !std::isfinite(confidence))
+					continue;
+				if(!(price > 0.f))
+					continue;
+				supply = std::max(0.f, supply);
+				demand = std::max(0.f, demand);
+				flow.price[i] = price;
+				flow.confidence[i] = std::max(0.5f, confidence);
+				if(supply > demand + 0.0001f) {
+					flow.surplus[i] = supply - demand;
+					set_mask_bit(flow.surplus_mask, i);
+				}
+				if(demand > supply + 0.0001f) {
+					flow.deficit[i] = demand - supply;
+					set_mask_bit(flow.deficit_mask, i);
+				}
+			}
+		});
+
+		auto evaluate_opportunity = [&](sea_trade_candidate_data const& origin, sea_trade_candidate_data const& target, float distance, float transport_price) {
+			trade_opportunity best{};
+			auto const& origin_flow = market_flows[origin.market.index()];
+			auto const& target_flow = market_flows[target.market.index()];
+			for(uint32_t word = 0; word < mask_word_count; ++word) {
+				auto bits = origin_flow.surplus_mask[word] & target_flow.deficit_mask[word];
+				while(bits != 0) {
+					auto const bit = uint32_t(std::countr_zero(bits));
+					bits &= bits - 1;
+					auto const i = word * 64u + bit;
+					if(i >= commodity_count)
+						continue;
+
+					auto const quantity = std::min(origin_flow.surplus[i], target_flow.deficit[i]);
+					if(!(quantity > 0.0001f))
+						continue;
+
+					auto const loss = std::max(0.f, 1.f - economy::trade_goods_lost_per_km * distance);
+					if(!(loss > 0.f))
+						continue;
+
+					auto const export_price = origin_flow.price[i] / origin_flow.confidence[i];
+					auto const import_price = target_flow.price[i] * target_flow.confidence[i];
+					auto const merchant_cut = origin.owner == target.owner ? economy::merchant_cut_domestic : economy::merchant_cut_foreign;
+					auto const net_gap = import_price * loss - export_price * (1.f + merchant_cut) - distance * transport_price;
+					if(!(net_gap > 0.f) || !std::isfinite(net_gap))
+						continue;
+
+					auto const value = quantity * net_gap;
+					if(value > best.value) {
+						best.found = true;
+						best.value = value;
+						best.quantity = quantity;
+						best.net_gap = net_gap;
+						best.commodity = dcon::commodity_id{ dcon::commodity_id::value_base_t(i) };
+					}
+				}
+			}
+			return best;
+		};
+
+		auto consider_opportunity = [&](trade_opportunity const& opportunity, sea_trade_candidate_data const& origin, sea_trade_candidate_data const& target, dcon::market_id owner) {
+			if(!opportunity.found)
+				return;
+			auto& best = best_trade_routes[target.market.index()];
+			if(opportunity.value > best.value) {
+				best.found = true;
+				best.origin = origin;
+				best.target = target;
+				best.owner = owner;
+				best.value = opportunity.value;
+				best.quantity = opportunity.quantity;
+				best.net_gap = opportunity.net_gap;
+				best.commodity = opportunity.commodity;
+			}
+		};
+
+		for(size_t i = 0; i < market_candidates.size(); ++i) {
+			auto const& origin = market_candidates[i];
+			for(size_t j = i + 1; j < market_candidates.size(); ++j) {
+				auto const& target = market_candidates[j];
+				if(origin.market == target.market)
+					continue;
+
+				auto const owner = choose_route_owner(origin, target);
+				auto transport_price = state.world.market_get_naval_transportation_price(owner);
+				if(!std::isfinite(transport_price))
+					continue;
+				transport_price = std::max(0.f, transport_price);
+
+				auto const direct_distance = province::direct_distance_km(state, origin.coast, target.coast) + 1.f;
+				if(!(direct_distance > 0.f) || !std::isfinite(direct_distance))
+					continue;
+
+				auto const forward_near = evaluate_opportunity(origin, target, direct_distance, transport_price);
+				auto const backward_near = evaluate_opportunity(target, origin, direct_distance, transport_price);
+				if(!forward_near.found && !backward_near.found)
+					continue;
+
+				auto const distance = sea_trade_route_distance(state, origin.coast, target.coast);
+				if(!(distance > 0.f) || !std::isfinite(distance))
+					continue;
+
+				consider_opportunity(evaluate_opportunity(origin, target, distance, transport_price), origin, target, owner);
+				consider_opportunity(evaluate_opportunity(target, origin, distance, transport_price), target, origin, owner);
+			}
+		}
+
+		for(auto const& best : best_trade_routes) {
+			if(!best.found || best.value < trade_opportunity_min_value || best.origin.market == best.target.market)
+				continue;
+
+			bool route_exists = false;
+			state.world.market_for_each_trade_route_as_origin(best.origin.market, [&](auto route) {
+				if(state.world.trade_route_get_target(route) == best.target.market && state.world.trade_route_get_is_sea_route(route))
+					route_exists = true;
+			});
+			state.world.market_for_each_trade_route_as_origin(best.target.market, [&](auto route) {
+				if(state.world.trade_route_get_target(route) == best.origin.market && state.world.trade_route_get_is_sea_route(route))
+					route_exists = true;
+			});
+			if(route_exists)
+				continue;
+
+			auto new_route = state.world.force_create_trade_route(best.origin.market, best.target.market);
+			state.world.trade_route_set_is_sea_route(new_route, true);
+			state.world.trade_route_set_owner(new_route, best.owner);
+			if(trade_opportunity_seed_volume && best.commodity && !state.world.commodity_get_money_rgo(best.commodity)
+				&& std::isfinite(best.quantity) && best.quantity > 0.f) {
+				state.world.trade_route_set_volume(new_route, best.commodity, best.quantity);
+			}
+			auto opposite_route = state.world.force_create_trade_route(best.target.market, best.origin.market);
+			state.world.trade_route_set_is_sea_route(opposite_route, true);
+			state.world.trade_route_set_owner(opposite_route, best.owner);
+		}
+	}
+
+	if(route_creation_gap != 0) {
+		auto const gap_market_count = uint32_t(state.world.market_size());
+		auto const gap_commodity_count = uint32_t(state.world.commodity_size());
+
+		// price and confidence per market x commodity; money-like and local goods are excluded
+		std::vector<float> gap_price(size_t(gap_market_count) * size_t(gap_commodity_count), 0.f);
+		std::vector<float> gap_confidence(size_t(gap_market_count) * size_t(gap_commodity_count), 1.f);
+		state.world.for_each_market([&](dcon::market_id market) {
+			auto const base = size_t(market.index()) * size_t(gap_commodity_count);
+			for(uint32_t k = 1; k < gap_commodity_count; ++k) {
+				dcon::commodity_id cid{ dcon::commodity_id::value_base_t(k) };
+				if(state.world.commodity_get_money_rgo(cid) || state.world.commodity_get_is_local(cid))
+					continue;
+				auto const price = state.world.market_get_price(market, cid);
+				if(!(price > 0.f) || !std::isfinite(price))
+					continue;
+				gap_price[base + k] = price;
+				gap_confidence[base + k] = std::max(0.5f, state.world.market_get_price_confidence(market, cid));
+			}
+		});
+
+		struct gap_candidate {
+			dcon::market_id market{};
+			dcon::province_id coast{};
+			dcon::nation_id owner{};
+		};
+		std::vector<gap_candidate> coastal;
+		state.world.for_each_market([&](dcon::market_id market) {
+			auto const sid = state.world.market_get_zone_from_local_market(market);
+			if(!sid)
+				return;
+			auto const coast = province::state_get_coastal_capital(state, sid);
+			if(!coast)
+				return;
+			gap_candidate candidate{};
+			candidate.market = market;
+			candidate.coast = coast;
+			candidate.owner = state.world.state_instance_get_nation_from_state_ownership(sid);
+			coastal.push_back(candidate);
+		});
+
+		struct gap_best_route {
+			bool found = false;
+			size_t origin = 0;
+			size_t target = 0;
+			float value = 0.f;
+		};
+		if(coastal.size() >= 2) {
+			auto sea_route_exists = [&](dcon::market_id a, dcon::market_id b) {
+				bool found = false;
+				state.world.market_for_each_trade_route_as_origin(a, [&](auto route) {
+					if(!found && state.world.trade_route_get_target(route) == b
+						&& state.world.trade_route_get_is_sea_route(route))
+						found = true;
+				});
+				return found;
+			};
+			auto evaluate_gap = [&](gap_candidate const& from, gap_candidate const& to, float distance, float transport_price) {
+				trade_opportunity best{};
+				auto const from_base = size_t(from.market.index()) * size_t(gap_commodity_count);
+				auto const to_base = size_t(to.market.index()) * size_t(gap_commodity_count);
+				auto const loss = std::max(0.f, 1.f - economy::trade_goods_lost_per_km * distance);
+				if(!(loss > 0.f))
+					return best;
+				auto const cut = from.owner == to.owner ? economy::merchant_cut_domestic : economy::merchant_cut_foreign;
+				for(uint32_t k = 1; k < gap_commodity_count; ++k) {
+					auto const price_from = gap_price[from_base + k];
+					auto const price_to = gap_price[to_base + k];
+					if(!(price_from > 0.f) || !(price_to > 0.f))
+						continue;
+					auto const export_price = price_from / gap_confidence[from_base + k];
+					auto const import_price = price_to * gap_confidence[to_base + k];
+					auto const gap = import_price * loss - export_price * (1.f + cut) - distance * transport_price;
+					if(std::isfinite(gap) && gap > best.value) {
+						best.found = true;
+						best.value = gap;
+						best.net_gap = gap;
+						best.commodity = dcon::commodity_id{ dcon::commodity_id::value_base_t(k) };
+					}
+				}
+				return best;
+			};
+
+			// static_cast, not size_t(...): the parenthesised form is a declarator, so the line
+			// would be parsed as a function declaration taking size_t (most vexing parse) and every
+			// later best_gap[i] becomes a subscript on a function pointer.
+			std::vector<gap_best_route> best_gap(static_cast<std::size_t>(gap_market_count));
+			for(size_t i = 0; i < coastal.size(); ++i) {
+				for(size_t j = i + 1; j < coastal.size(); ++j) {
+					auto const& forward_from = coastal[i];
+					auto const& forward_to = coastal[j];
+					if(forward_from.market == forward_to.market || sea_route_exists(forward_from.market, forward_to.market))
+						continue;
+					auto const transport_price = std::max(0.f, state.world.market_get_naval_transportation_price(forward_from.market));
+					if(!std::isfinite(transport_price))
+						continue;
+					auto const direct = province::direct_distance_km(state, forward_from.coast, forward_to.coast) + 1.f;
+					if(!(direct > 0.f) || !std::isfinite(direct))
+						continue;
+					// cheap pre-filter on the straight-line distance, as the opportunity scan does
+					if(!evaluate_gap(forward_from, forward_to, direct, transport_price).found
+						&& !evaluate_gap(forward_to, forward_from, direct, transport_price).found)
+						continue;
+					auto const distance = sea_trade_route_distance(state, forward_from.coast, forward_to.coast);
+					if(!(distance > 0.f) || !std::isfinite(distance))
+						continue;
+					auto const forward = evaluate_gap(forward_from, forward_to, distance, transport_price);
+					if(forward.found) {
+						auto& best = best_gap[size_t(forward_to.market.index())];
+						if(forward.value > best.value) {
+							best.found = true;
+							best.origin = i;
+							best.target = j;
+							best.value = forward.value;
+						}
+					}
+					auto const backward = evaluate_gap(forward_to, forward_from, distance, transport_price);
+					if(backward.found) {
+						auto& best = best_gap[size_t(forward_from.market.index())];
+						if(backward.value > best.value) {
+							best.found = true;
+							best.origin = j;
+							best.target = i;
+							best.value = backward.value;
+						}
+					}
+				}
+			}
+			for(auto const& best : best_gap) {
+				if(!best.found)
+					continue;
+				auto const& from = coastal[best.origin];
+				auto const& to = coastal[best.target];
+				auto const new_route = state.world.force_create_trade_route(from.market, to.market);
+				state.world.trade_route_set_is_sea_route(new_route, true);
+				state.world.trade_route_set_owner(new_route, from.market);
+				auto const opposite_route = state.world.force_create_trade_route(to.market, from.market);
+				state.world.trade_route_set_is_sea_route(opposite_route, true);
+				state.world.trade_route_set_owner(opposite_route, from.market);
 			}
 		}
 	}

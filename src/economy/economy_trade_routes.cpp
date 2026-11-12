@@ -14,7 +14,10 @@
 #include "terms.hpp"
 #include <cstdio>
 #include <cstdlib>
+#include <cmath>
+#include <algorithm>
 #include <string>
+#include <vector>
 
 #ifdef NDEBUG
 #ifdef _MSC_VER
@@ -169,6 +172,55 @@ static float const trade_scarcity_scale = []() {
 	return s ? std::max(0.1f, std::min(100.f, float(std::atof(s)))) : 10.f;
 }();
 
+// LOCAL EXPERIMENT (rejected; ALICE_EXP_TRADE_VOLUME_TARGET=1): let profitable routes converge toward a
+// volume target derived from the target market's observed deficit, the origin's merchant offer,
+// and the target market's affordable import budget. The target is shared across routes, ramped
+// instead of forced, and never reduces an existing volume. Rejected as a standalone fix: the 1y
+// runtime-only arm left the Machine Parts price tail unchanged and created negative market money
+// in high-price import markets. Default off.
+static bool const trade_volume_target = []() {
+	auto s = std::getenv("ALICE_EXP_TRADE_VOLUME_TARGET");
+	return s && std::atoi(s) != 0;
+}();
+// LOCAL EXPERIMENT (rejected; ALICE_EXP_TRADE_VOLUME_TARGET_RUNTIME_ONLY=1): apply the volume target only
+// after presimulation. This isolates whether the target's macro effects come from rewriting the
+// initial 730-day economy or from its normal-play behaviour. Default off keeps the full-period arm.
+static bool const trade_volume_target_runtime_only = []() {
+	auto s = std::getenv("ALICE_EXP_TRADE_VOLUME_TARGET_RUNTIME_ONLY");
+	return s && std::atoi(s) != 0;
+}();
+
+// ===== LOCAL FORK (not upstream) =====
+// LOCAL EXPERIMENT (rejected; ALICE_EXP_TRADE_DEMAND_BUDGET=1): upstream gates route expansion with
+// target_daily_sales / (100 * unit_sale_price). For high-value, low-quantity goods this requires
+// the target to be able to buy 100 units before the first unit can enter. Use the value of one
+// day of observed target demand instead. This is a dimensional correction to the liquidity
+// constraint, not a volume target: the route still grows only through the existing profit,
+// transport, expected-flow, and budget terms. Default 0 keeps upstream behaviour.
+// Rejected by 1y seed 1234: GDP 445,008 -> 471,571 and trade 134,249 -> 116,191, while the
+// all-commodity median price/cost rose 0.0117 -> 40.69 and Ammunition reached 2.33e6x cost.
+// The gate was load-bearing: route expansion fed price and total_earn, which fed the next
+// route expansion, while market settlement still had no closed buyer/seller payment.
+static bool const trade_demand_budget = []() {
+	auto s = std::getenv("ALICE_EXP_TRADE_DEMAND_BUDGET");
+	return s && std::atoi(s) != 0;
+}();
+
+
+// ===== LOCAL FORK (not upstream) =====
+// LOCAL EXPERIMENT (rejected; ALICE_EXP_TRADE_GOODS_CONSERVATION=1): apply only the physical half
+// of the trade account: exported volume leaves the origin stockpile. Upstream credits the target
+// and records the export flow but never removes the origin units, so the C0 ledger finds a goods
+// residual almost exactly equal to recorded exports. Money, route volume, prices and tariffs are
+// untouched. Rejected by 1y seed 1234: the daily goods residual fell from 107,952 to 42,473, but
+// GDP fell 445,008 -> 389,892, factories 452 -> 365, and summary market money rose from 17.9M to
+// 2.79B (the daily money ledger stayed near 32M, so the two measures also diverged). Conserving
+// origin stock without a matching buyer, seller, ownership and settlement path is not viable.
+// Default 0 keeps upstream behaviour for controlled comparison.
+static bool const trade_goods_conservation = []() {
+	auto s = std::getenv("ALICE_EXP_TRADE_GOODS_CONSERVATION");
+	return s && std::atoi(s) != 0;
+}();
 
 // LOCAL EXPERIMENT (ALICE_EXP_TRADE_ACCOUNT=1): general trade account, all commodities.
 // Goods: exported volume is removed from the origin stockpile (upstream only credits the target).
@@ -178,6 +230,127 @@ static bool const trade_account = []() {
 	auto s = std::getenv("ALICE_EXP_TRADE_ACCOUNT");
 	return s && std::atoi(s) != 0;
 }();
+
+// LOCAL EXPERIMENT (ALICE_EXP_TRADE_IMPORT_ACCOUNT_FIX=1): the import buffer was accumulated from
+// the target's *export* buffer. Import accounting therefore mixed two different trade directions.
+// This switch only corrects the accumulation base; route volumes, prices and budgets are unchanged.
+// Default 0 preserves upstream behaviour for controlled comparison.
+static bool const trade_import_account_fix = []() {
+	auto s = std::getenv("ALICE_EXP_TRADE_IMPORT_ACCOUNT_FIX");
+	return s && std::atoi(s) != 0;
+}();
+
+// ===== LOCAL FORK (not upstream) =====
+// LOCAL EXPERIMENT (ALICE_EXP_TRADE_ESCROW=1): settle each import payment against the exporting
+// market's registered sellers. The target market pays first from its positive cash, then from a
+// bounded trade-credit line; the same payment is split into seller receipt, export/import tariff,
+// transport and merchant margin. Outstanding credit is repaid from the target's later market
+// income. This replaces the legacy unilateral export cut/import spending only for cash settlement;
+// route volumes and prices continue to use the existing logic. Default 0 keeps upstream behaviour.
+static bool const trade_escrow = []() {
+	auto s = std::getenv("ALICE_EXP_TRADE_ESCROW");
+	return s && std::atoi(s) != 0;
+}();
+static double const trade_credit_days = []() {
+	auto s = std::getenv("ALICE_TRADE_CREDIT_DAYS");
+	return s ? std::clamp(std::atof(s), 0.0, 3650.0) : 60.0;
+}();
+static std::vector<double> trade_credit_outstanding;
+static bool const trace_trade_escrow = []() {
+	auto s = std::getenv("ALICE_TRACE_TRADE_ESCROW");
+	return s && std::atoi(s) != 0;
+}();
+// LOCAL EXPERIMENT (ALICE_EXP_FREIGHT_AD_VALOREM=1): charge sea freight as a share of the shipment's
+// own value instead of an absolute amount of money per unit. The absolute form (distance x
+// naval_transportation_price) is added to pay_per_unit next to prices that span four orders of
+// magnitude across commodities: at the 1836 world mean naval price, moving one unit of grain 5,000 km
+// costs 5.17 while the median grain price is 0.074, i.e. 70x the good's value, so such a route can
+// never clear its first trade; moving one unit of clothes (median price 144.4) over the same distance
+// costs 3.6% of its value. The ad valorem form makes the freight share independent of the price level.
+// Land freight is untouched (it is written to 0 every day, economy.cpp:8512). Default 0 keeps the
+// existing expression bit-for-bit.
+static bool const freight_ad_valorem = []() {
+	auto s = std::getenv("ALICE_EXP_FREIGHT_AD_VALOREM");
+	return s && std::atoi(s) != 0;
+}();
+// Freight as a fraction of the unit's own value per km. 2.0e-5 => 2% per 1,000 km, 10% per 5,000 km.
+// Calibration: 0.10 / 5000 km, i.e. the middle of the 19th century ocean-freight range (5-20% of
+// value). Parameter validation only: a negative or absurd rate would make the experiment unreadable.
+static float const freight_ad_valorem_rate = []() {
+	auto s = std::getenv("ALICE_FREIGHT_AD_VALOREM_RATE");
+	return s ? std::clamp(float(std::atof(s)), 0.f, 1.f) : 2.0e-5f;
+}();
+// Money per unit of a shipment. Both overloads below compute the same expression; the scalar one is
+// for the per-route scalar paths (prediction, escrow settlement, trade ledger) and the vector one for
+// the vectorised volume update, so the decision and the settlement cannot drift apart.
+template<typename T>
+static inline T trade_freight_unit_cost(bool is_sea, T distance, T absolute_per_km, T unit_value) {
+	auto const absolute = distance * absolute_per_km;
+	if(!freight_ad_valorem || !is_sea)
+		return absolute;
+	return distance * T(freight_ad_valorem_rate) * unit_value;
+}
+template<typename MASK>
+static inline ve::fp_vector trade_freight_unit_cost_vec(MASK is_sea, ve::fp_vector distance, ve::fp_vector absolute_per_km, ve::fp_vector unit_value) {
+	auto const absolute = distance * absolute_per_km;
+	if(!freight_ad_valorem)
+		return absolute;
+	return ve::select(is_sea, distance * ve::fp_vector{ freight_ad_valorem_rate } * unit_value, absolute);
+}
+static double trade_escrow_day_sellers = 0.0;
+static double trade_escrow_day_costs = 0.0;
+static double trade_escrow_day_merchant = 0.0;
+static double trade_escrow_day_funding = 0.0;
+static double trade_escrow_day_cash = 0.0;
+static double trade_escrow_day_credit = 0.0;
+static double trade_escrow_day_unmatched = 0.0;
+static double trade_escrow_day_blocked = 0.0;
+static double trade_escrow_day_blocked_seller = 0.0;
+static double trade_escrow_day_blocked_stock = 0.0;
+static double trade_escrow_day_blocked_budget = 0.0;
+static double trade_escrow_day_blocked_unprofitable = 0.0;
+static double trade_escrow_day_blocked_partial = 0.0;
+static double trade_escrow_day_blocked_other = 0.0;
+static double trade_escrow_day_margin_origin = 0.0;
+static double trade_escrow_day_margin_target = 0.0;
+static double trade_escrow_day_margin_third = 0.0;
+
+bool trade_escrow_enabled() {
+	return trade_escrow && !is_presimulation_update();
+}
+
+double trade_credit_total() {
+	double total = 0.0;
+	for(auto const value : trade_credit_outstanding) {
+		if(std::isfinite(value))
+			total += value;
+	}
+	return total;
+}
+
+// LOCAL FORK (not upstream): the clearing bank's cash is the exact negative of outstanding trade
+// credit. Issuing credit debits this account and credits the seller; repayment debits the buyer
+// and credits it. Keeping the lender as an identity avoids a second mutable balance that could
+// drift from the loan book while still making the credit source explicit in the money audit.
+double trade_credit_lender_balance() {
+	return -trade_credit_total();
+}
+
+double trade_repay_credit(sys::state& state, dcon::market_id market, double available) {
+	if(!trade_escrow_enabled() || !market || !(available > 0.0) || !std::isfinite(available))
+		return 0.0;
+	auto const market_count = size_t(state.world.market_size());
+	if(trade_credit_outstanding.size() != market_count)
+		return 0.0;
+	auto const index = size_t(market.index());
+	if(index >= trade_credit_outstanding.size())
+		return 0.0;
+	auto const repayment = std::min(std::max(0.0, trade_credit_outstanding[index]), available);
+	if(!(repayment > 0.0) || !std::isfinite(repayment))
+		return 0.0;
+	trade_credit_outstanding[index] -= repayment;
+	return repayment;
+}
 
 // LOCAL EXPERIMENT (ALICE_EXP_TRADE_FINANCE=1): general income/credit-based trade finance.
 // Daily import budget = 50% of the market's realized daily income (sales + export revenue EMA);
@@ -301,11 +474,16 @@ inline auto trade_route_compute_change_multiplier(
 
 	auto hard_limit = transport_availability;
 	auto soft_limit = expected_to_sell * expected_to_buy;
+	auto const demand_units = adaptive_ve::max(
+		historical_demand, adaptive_ve::constant_value<scalar>(0.0001f));
+	auto const demand_weight = adaptive_ve::constant_value<scalar>(trade_demand_budget ? 1.f : 0.f);
+	auto const liquidity_need = price_sold
+		* (100.f + demand_weight * (demand_units - 100.f));
 	auto change_multiplier =
 		adaptive_ve::max(adaptive_ve::constant_value<scalar>(0.f), (hard_limit - 0.9f) / 0.1f)
 		* adaptive_ve::max(adaptive_ve::constant_value<scalar>(0.f), (soft_limit - 0.8f) / 0.2f)
 		* adaptive_ve::max(adaptive_ve::constant_value<scalar>(0.f), (budget_scale - 0.1f) / 0.2f)
-		* adaptive_ve::max(adaptive_ve::constant_value<scalar>(0.f), adaptive_ve::min(adaptive_ve::constant_value<scalar>(100.f), budget / (economy::price_properties::commodity::min + 100.f * price_sold) - 0.01f));
+		* adaptive_ve::max(adaptive_ve::constant_value<scalar>(0.f), adaptive_ve::min(adaptive_ve::constant_value<scalar>(100.f), budget / (economy::price_properties::commodity::min + liquidity_need) - 0.01f));
 
 	return change_multiplier;
 }
@@ -795,7 +973,7 @@ trade_route_volume_change_reasons predict_trade_route_volume_change(
 		transport_cost_per_distance_weight = state.world.market_get_naval_transportation_price(owner);
 	}
 
-	auto transport_cost_per_weight = distance * transport_cost_per_distance_weight;
+	auto transport_cost_per_weight = trade_freight_unit_cost(is_sea_route, distance, transport_cost_per_distance_weight, state.world.market_get_price(A, cid));
 	result.transport_cost_per_unit = transport_cost_per_weight;
 
 	result.trade_blocked = at_war
@@ -887,6 +1065,30 @@ void update_trade_routes_volume(
 
 	update_trade_finance_daily(state);
 
+	// LOCAL EXPERIMENT: route-count caches are only built when the target-volume probe is enabled.
+	static ve::vectorizable_buffer<float, dcon::market_id> incoming_route_count(uint32_t(1));
+	static ve::vectorizable_buffer<float, dcon::market_id> outgoing_route_count(uint32_t(1));
+	bool const apply_trade_volume_target = trade_volume_target
+		&& (!trade_volume_target_runtime_only || !is_presimulation_update());
+	if(apply_trade_volume_target) {
+		incoming_route_count = state.world.market_make_vectorizable_float_buffer();
+		outgoing_route_count = state.world.market_make_vectorizable_float_buffer();
+		state.world.for_each_market([&](dcon::market_id m) {
+			incoming_route_count.set(m, 0.f);
+			outgoing_route_count.set(m, 0.f);
+		});
+		state.world.for_each_trade_route([&](dcon::trade_route_id route) {
+			if(!state.world.trade_route_is_valid(route) || state.world.trade_route_get_is_trade_forbidden(route))
+				return;
+			auto const origin = state.world.trade_route_get_origin(route);
+			auto const target = state.world.trade_route_get_target(route);
+			if(!origin || !target)
+				return;
+			outgoing_route_count.set(origin, outgoing_route_count.get(origin) + 1.f);
+			incoming_route_count.set(target, incoming_route_count.get(target) + 1.f);
+		});
+	}
+
 	state.world.execute_parallel_over_trade_route([&](auto trade_route) {
 		auto origin = state.world.trade_route_get_origin(trade_route);
 		auto target = state.world.trade_route_get_target(trade_route);
@@ -942,7 +1144,7 @@ void update_trade_routes_volume(
 		// US3AC18
 		auto trade_good_loss_mult = ve::max(0.f, 1.f - trade_goods_lost_per_km * distance);
 
-		auto transport_cost = distance * ve::select(is_sea_route, state.world.market_get_naval_transportation_price(owner), state.world.market_get_land_transportation_price(owner));
+		auto transport_price_per_km = ve::select(is_sea_route, state.world.market_get_naval_transportation_price(owner), state.world.market_get_land_transportation_price(owner));
 
 		auto reset_route =
 			trade_closed || blockaded || trade_banned
@@ -968,6 +1170,8 @@ void update_trade_routes_volume(
 			auto price_import = price_target * confidence_import;
 			auto price_export = price_origin / confidence_export;
 
+			// ad valorem sea freight is a fraction of this commodity's own origin price
+			auto transport_cost = trade_freight_unit_cost_vec(is_sea_route, distance, transport_price_per_km, price_origin);
 
 			auto multiplier_value = trade_route_compute_change_multiplier<true, ve::fp_vector>(
 				state, reset_route, is_sea_route,
@@ -985,6 +1189,31 @@ void update_trade_routes_volume(
 				export_tariff, import_tariff, transport_cost, budget, trade_good_loss_mult, merchant_cut, price_import, price_export,
 				multiplier_value, decay_value
 			);
+
+			if(apply_trade_volume_target) {
+				auto const current_volume = state.world.trade_route_get_volume(trade_route, c);
+				auto const historical_demand = state.world.market_get_aggregated_demand_history(target, c);
+				auto const historical_supply = state.world.market_get_aggregated_supply_history(target, c);
+				auto const target_deficit = ve::max(ve::fp_vector{0.f}, historical_demand - historical_supply);
+				auto const incoming_count = ve::max(ve::fp_vector{1.f}, incoming_route_count.get(target));
+				auto const outgoing_count = ve::max(ve::fp_vector{1.f}, outgoing_route_count.get(origin));
+				auto const origin_offer = ve::max(ve::fp_vector{0.f}, state.world.market_get_stockpile_sales(origin, c));
+				auto const target_demand_share = target_deficit / incoming_count;
+				auto const source_capacity_share = origin_offer / outgoing_count;
+				auto const price_sold = adaptive_ve::select(owner == origin, price_import, price_export);
+				auto const budget_capacity_share = budget / (economy::price_properties::commodity::min + price_sold) / incoming_count;
+				auto const target_volume = ve::min(ve::min(target_demand_share, source_capacity_share), budget_capacity_share);
+				auto const earn_per_unit = price_import * trade_good_loss_mult;
+				auto const pay_per_unit = price_export * (1.f + export_tariff + merchant_cut) + price_import * import_tariff + transport_cost;
+				auto const transport_availability = ve::select(is_sea_route,
+					state.world.market_get_naval_transportation_demand_satisfaction(owner),
+					state.world.market_get_land_transportation_demand_satisfaction(owner));
+				auto const can_expand = (earn_per_unit > pay_per_unit)
+					&& (transport_availability > 0.5f)
+					&& (current_volume < target_volume);
+				auto const ramped = current_volume + (target_volume - current_volume) * 0.02f;
+				next = ve::select(reset_route, next, ve::select(can_expand, ve::max(next, ramped), next));
+			}
 
 			state.world.trade_route_set_volume(trade_route, c, next);
 		}
@@ -1455,6 +1684,242 @@ auto explain_trade_route(
 	return result;
 }
 
+// ===== LOCAL FORK (not upstream) =====
+// LOCAL TRACE (ALICE_TRACE_TRADE_LEDGER=1): monthly, read-only route x commodity trade account.
+// It is written after fill_trade_buffers(), so the quantities and prices are the ones used to build
+// the market export/import, tariff and arbitrage buffers for the next settlement stage. The trace
+// deliberately keeps the upstream and experimental account readings side by side: a positive route
+// volume is not evidence that the origin seller was paid or that the target buyer was debited.
+static bool const trace_trade_ledger = []() {
+	auto s = std::getenv("ALICE_TRACE_TRADE_LEDGER");
+	return s && std::atoi(s) != 0;
+}();
+static std::string const trade_ledger_good_filter = []() {
+	auto s = std::getenv("ALICE_TRADE_LEDGER_GOODS");
+	return s ? std::string(s) : std::string{};
+}();
+static double const trade_ledger_min_value = []() {
+	auto s = std::getenv("ALICE_TRADE_LEDGER_MIN_VALUE");
+	return s ? std::max(0.0, std::atof(s)) : 1.0;
+}();
+static FILE* trade_ledger_route_file = nullptr;
+static FILE* trade_ledger_market_file = nullptr;
+static bool trade_ledger_files_init = false;
+static std::string trade_ledger_last_date;
+
+static dcon::nation_id trade_ledger_market_nation(sys::state const& state, dcon::market_id market) {
+	auto const zone = state.world.market_get_zone_from_local_market(market);
+	auto const capital = state.world.state_instance_get_capital(zone);
+	auto const controller = state.world.province_get_nation_from_province_control(capital);
+	return controller ? controller : state.world.state_instance_get_nation_from_state_ownership(zone);
+}
+
+static bool trade_ledger_good_selected(std::string const& name) {
+	if(trade_ledger_good_filter.empty())
+		return true;
+	size_t begin = 0;
+	while(begin <= trade_ledger_good_filter.size()) {
+		auto const end = trade_ledger_good_filter.find(',', begin);
+		auto const token = trade_ledger_good_filter.substr(
+			begin, end == std::string::npos ? std::string::npos : end - begin);
+		if(!token.empty() && name.find(token) != std::string::npos)
+			return true;
+		if(end == std::string::npos)
+			break;
+		begin = end + 1;
+	}
+	return false;
+}
+
+static void dump_trade_ledger_trace(
+	sys::state const& state,
+	bool presimulation,
+	const ve::vectorizable_buffer<float, dcon::market_id>& export_tariff_buffer,
+	const ve::vectorizable_buffer<float, dcon::market_id>& import_tariff_buffer
+) {
+	if(!trace_trade_ledger || presimulation)
+		return;
+
+	auto const ymd = state.current_date.to_ymd(state.start_date);
+	if(ymd.day != 1)
+		return;
+
+	char datebuf[16];
+	std::snprintf(datebuf, sizeof(datebuf), "%04d-%02d-%02d", ymd.year, ymd.month, ymd.day);
+	if(trade_ledger_last_date == datebuf)
+		return;
+	trade_ledger_last_date = datebuf;
+
+	if(!trade_ledger_files_init) {
+		trade_ledger_files_init = true;
+		auto const route_path = std::getenv("ALICE_TRADE_LEDGER_FILE");
+		auto const market_path = std::getenv("ALICE_TRADE_LEDGER_MARKET_FILE");
+		if(route_path) {
+			trade_ledger_route_file = std::fopen(route_path, "w");
+			if(trade_ledger_route_file)
+				std::fprintf(trade_ledger_route_file,
+					"date,route,origin_market,target_market,owner_market,origin_nation,target_nation,owner_nation,is_sea,distance_km,good,good_id,route_volume,sat,moved_qty,arrived_qty,loss_rate,price_origin,price_target,origin_value_shipment,target_value_arrived,origin_export_credit_scheduled,target_import_debit_scheduled,export_tariff_rate,import_tariff_rate,export_tariff_value,import_tariff_value_shipment,import_tariff_value_arrived,merchant_cut_rate,merchant_cut_value,transport_cost_per_unit,transport_cost_value,owner_arbitrage_scheduled,origin_removed_qty,target_added_qty,origin_market_money,target_market_money,origin_market_export_cut,target_market_import_spending,origin_market_tariff,target_market_tariff,trade_forbidden\n");
+		}
+		if(market_path) {
+			trade_ledger_market_file = std::fopen(market_path, "w");
+			if(trade_ledger_market_file)
+				std::fprintf(trade_ledger_market_file,
+					"date,market,owner_market,owner_nation,export_qty,import_qty,export_value,import_value,net_value,export_cut,import_spending,arbitrage,tariff_collected,market_money,net_cash_scheduled\n");
+		}
+	}
+	if(!trade_ledger_route_file && !trade_ledger_market_file)
+		return;
+
+	auto const commodity_count = size_t(state.world.commodity_size());
+	std::vector<std::string> good_names(commodity_count);
+	std::vector<char> good_selected(commodity_count, 0);
+	state.world.for_each_commodity([&](dcon::commodity_id cid) {
+		auto const i = size_t(cid.index());
+		if(i >= commodity_count)
+			return;
+		good_names[i] = text::produce_simple_string(state, state.world.commodity_get_name(cid));
+		good_selected[i] = !state.world.commodity_get_money_rgo(cid)
+			&& !state.world.commodity_get_is_local(cid)
+			&& trade_ledger_good_selected(good_names[i]) ? 1 : 0;
+	});
+
+	if(trade_ledger_route_file) {
+	state.world.for_each_trade_route([&](dcon::trade_route_id route) {
+		if(!state.world.trade_route_is_valid(route))
+			return;
+		auto const origin = state.world.trade_route_get_origin(route);
+		auto const target = state.world.trade_route_get_target(route);
+		auto const owner = state.world.trade_route_get_owner(route);
+		if(!origin || !target)
+			return;
+
+		auto const is_sea = state.world.trade_route_get_is_sea_route(route);
+		auto const distance = double(state.world.trade_route_get_distance_km(route));
+		auto const origin_nation = trade_ledger_market_nation(state, origin);
+		auto const target_nation = trade_ledger_market_nation(state, target);
+		auto const owner_nation = trade_ledger_market_nation(state, owner);
+
+		for(auto cid : state.world.in_commodity) {
+			auto const ci = size_t(cid.id.index());
+			if(ci >= commodity_count || !good_selected[ci])
+				continue;
+			auto const volume = double(state.world.trade_route_get_volume(route, cid));
+			if(!(volume > 0.0) || !std::isfinite(volume))
+				continue;
+
+			auto const sat = double(state.world.market_get_actual_probability_to_buy(origin, cid));
+			auto const moved = volume * sat;
+			auto const price_origin = double(state.world.market_get_price(origin, cid));
+			auto const price_target = double(state.world.market_get_price(target, cid));
+			auto const export_rate = state.world.trade_route_get_is_tariff_applied_origin(route)
+				? double(export_tariff_buffer.get(origin)) : 0.0;
+			auto const import_rate = state.world.trade_route_get_is_tariff_applied_target(route)
+				? double(import_tariff_buffer.get(target)) : 0.0;
+			auto const loss_multiplier = std::max(0.0, 1.0 - distance * economy::trade_goods_lost_per_km);
+			auto const loss_rate = 1.0 - loss_multiplier;
+			auto const arrived = moved * loss_multiplier;
+			auto const cut_rate = double(state.world.trade_route_get_origin_cut_rate(route));
+			auto const cut_value = moved * price_origin * cut_rate;
+			auto const origin_credit = trade_account ? moved * price_origin : cut_value;
+			auto const target_debit = moved * price_target;
+			auto const origin_value = moved * price_origin;
+			auto const target_value = arrived * price_target;
+			if(std::max(std::max(origin_value, target_value), target_debit) < trade_ledger_min_value)
+				continue;
+			auto const export_tariff_value = moved * price_origin * export_rate;
+			auto const import_tariff_value = moved * price_target * import_rate;
+			auto const import_tariff_arrived = arrived * price_target * import_rate;
+			auto const transport_per_unit = trade_freight_unit_cost(bool(is_sea), distance, double(is_sea
+				? state.world.market_get_naval_transportation_price(owner)
+				: state.world.market_get_land_transportation_price(owner)), price_origin);
+			auto const owner_arbitrage = (owner == origin || owner == target)
+				? moved * (price_target * (1.0 - import_rate)
+					- price_origin * (1.0 + export_rate + (trade_account ? 0.0 : cut_rate)))
+				: 0.0;
+			auto const origin_removed = (trade_account || trade_goods_conservation) ? moved : 0.0;
+
+			std::fprintf(trade_ledger_route_file,
+				"%s,%d,%d,%d,%d,%d,%d,%d,%d,%.6g,%s,%d,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%d\n",
+				datebuf, route.index(), origin.index(), target.index(), owner.id.index(),
+				origin_nation.index(), target_nation.index(), owner_nation.index(), is_sea ? 1 : 0,
+				distance, good_names[ci].c_str(), cid.id.index(), volume,
+				sat,
+				moved, arrived, loss_rate, price_origin, price_target,
+				origin_value, target_value, origin_credit, target_debit,
+				export_rate, import_rate, export_tariff_value, import_tariff_value,
+				import_tariff_arrived, cut_rate, cut_value, transport_per_unit,
+				transport_per_unit * moved, owner_arbitrage, origin_removed, arrived,
+				double(state.world.market_get_stockpile(origin, economy::money)),
+				double(state.world.market_get_stockpile(target, economy::money)),
+				double(state.world.market_get_export_cut(origin)),
+				double(state.world.market_get_import_spending(target)),
+				double(state.world.market_get_tariff_collected(origin)),
+				double(state.world.market_get_tariff_collected(target)),
+				state.world.trade_route_get_is_trade_forbidden(route) ? 1 : 0);
+		}
+	});
+		std::fflush(trade_ledger_route_file);
+	}
+
+	if(trade_ledger_market_file) {
+		state.world.for_each_market([&](dcon::market_id market) {
+			double export_qty = 0.0;
+			double import_qty = 0.0;
+			double export_value = 0.0;
+			double import_value = 0.0;
+			state.world.for_each_commodity([&](dcon::commodity_id cid) {
+				auto const ci = size_t(cid.index());
+				if(ci >= commodity_count || !good_selected[ci])
+					return;
+				auto const price = double(state.world.market_get_price(market, cid));
+				auto const exported = double(state.world.market_get_export(market, cid));
+				auto const imported = double(state.world.market_get_import(market, cid));
+				if(!std::isfinite(price) || !std::isfinite(exported) || !std::isfinite(imported))
+					return;
+				export_qty += exported;
+				import_qty += imported;
+				export_value += price * exported;
+				import_value += price * imported;
+			});
+			auto const export_cut = double(state.world.market_get_export_cut(market));
+			auto const import_spending = double(state.world.market_get_import_spending(market));
+			auto const arbitrage = double(state.world.market_get_arbitrage(market));
+			auto const tariff = double(state.world.market_get_tariff_collected(market));
+			auto const money = double(state.world.market_get_stockpile(market, economy::money));
+			auto const owner_nation = trade_ledger_market_nation(state, market);
+			std::fprintf(trade_ledger_market_file,
+				"%s,%d,%d,%d,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g\n",
+				datebuf, market.index(), market.index(), owner_nation.index(), export_qty, import_qty,
+				export_value, import_value, export_value - import_value, export_cut,
+				import_spending, arbitrage, tariff, money,
+				export_cut - import_spending + arbitrage + tariff);
+		});
+		std::fflush(trade_ledger_market_file);
+	}
+}
+
+// LOCAL EXPERIMENT (ALICE_EXP_TRADE_ESCROW=1): only goods whose sellers are registered may be
+// exported. Market supply has already been reset when trade buffers run, so the surviving seller
+// batches are the authoritative capacity. Without this cap, a route can move goods while the
+// corresponding seller batches are missing, producing a delivery with no payee.
+static double trade_seller_supply_capacity(
+	sys::state const& state,
+	dcon::market_id market,
+	dcon::commodity_id commodity
+) {
+	auto const* batches = market_good_supply_batches(state, market, commodity);
+	if(!batches)
+		return 0.0;
+	double known = 0.0;
+	for(auto const& batch : *batches) {
+		if(batch.quantity > 0.f && std::isfinite(batch.quantity))
+			known += double(batch.quantity);
+	}
+	if(!(known > 0.0) || !std::isfinite(known))
+		return 0.0;
+	return known;
+}
+
 void fill_trade_buffers(
 	sys::state& state,
 	const ve::vectorizable_buffer<float, dcon::market_id>& export_tariff_buffer,
@@ -1462,18 +1927,163 @@ void fill_trade_buffers(
 	bool presimulation
 ) {
 	uint32_t total_commodities = state.world.commodity_size();
+	bool const trade_escrow_active = trade_escrow_enabled();
+	std::vector<double> trade_import_scale;
+	std::vector<double> trade_cash_budget;
+	std::vector<double> trade_credit_budget;
+	std::vector<double> trade_seller_capacity;
+	std::vector<double> trade_origin_scale;
+	if(trade_escrow_active) {
+		auto const market_count = size_t(state.world.market_size());
+		trade_escrow_day_sellers = 0.0;
+		trade_escrow_day_costs = 0.0;
+		trade_escrow_day_merchant = 0.0;
+		trade_escrow_day_funding = 0.0;
+		trade_escrow_day_cash = 0.0;
+		trade_escrow_day_credit = 0.0;
+		trade_escrow_day_unmatched = 0.0;
+		trade_escrow_day_blocked = 0.0;
+		trade_escrow_day_blocked_seller = 0.0;
+		trade_escrow_day_blocked_stock = 0.0;
+		trade_escrow_day_blocked_budget = 0.0;
+		trade_escrow_day_blocked_unprofitable = 0.0;
+		trade_escrow_day_blocked_partial = 0.0;
+		trade_escrow_day_blocked_other = 0.0;
+		trade_escrow_day_margin_origin = 0.0;
+		trade_escrow_day_margin_target = 0.0;
+		trade_escrow_day_margin_third = 0.0;
+		if(trade_credit_outstanding.size() != market_count)
+			trade_credit_outstanding.assign(market_count, 0.0);
+		std::vector<double> scheduled_import(market_count, 0.0);
+		trade_import_scale.assign(market_count, 0.0);
+		trade_cash_budget.assign(market_count, 0.0);
+		trade_credit_budget.assign(market_count, 0.0);
+		trade_seller_capacity.assign(market_count * size_t(total_commodities), 0.0);
+		trade_origin_scale.assign(market_count * size_t(total_commodities), 1.0);
+		state.world.for_each_market([&](dcon::market_id market) {
+			auto const base = size_t(market.index()) * size_t(total_commodities);
+			state.world.for_each_commodity([&](dcon::commodity_id cid) {
+				if(cid == economy::money || state.world.commodity_get_money_rgo(cid) || state.world.commodity_get_is_local(cid))
+					return;
+				auto const index = base + size_t(cid.index());
+				if(index < trade_seller_capacity.size())
+					trade_seller_capacity[index] = trade_seller_supply_capacity(state, market, cid);
+			});
+		});
+
+		state.world.for_each_trade_route([&](auto route) {
+			if(!state.world.trade_route_is_valid(route) || state.world.trade_route_get_is_trade_forbidden(route))
+				return;
+			auto const origin = state.world.trade_route_get_origin(route);
+			auto const target = state.world.trade_route_get_target(route);
+			if(!origin || !target)
+				return;
+			auto const distance = state.world.trade_route_get_distance_km(route);
+			auto const lost_modifier = std::max(0.f, 1.f - distance * trade_goods_lost_per_km);
+			state.world.for_each_commodity([&](auto cid) {
+				if(cid == economy::money || state.world.commodity_get_money_rgo(cid) || state.world.commodity_get_is_local(cid))
+					return;
+				auto const sat = state.world.market_get_actual_probability_to_buy(origin, cid);
+				auto const volume = state.world.trade_route_get_volume(route, cid) * sat;
+				auto const price_target = state.world.market_get_price(target, cid);
+				if(!(volume > 0.f) || !std::isfinite(volume) || !(price_target > 0.f) || !std::isfinite(price_target))
+					return;
+				auto const capacity_index = size_t(origin.index()) * size_t(total_commodities) + size_t(cid.index());
+				auto const seller_capacity = capacity_index < trade_seller_capacity.size() ? trade_seller_capacity[capacity_index] : 0.0;
+				if(!(seller_capacity > 0.0))
+					return;
+				auto const moved = std::min(double(volume), seller_capacity);
+				scheduled_import[size_t(target.index())] += moved * double(lost_modifier) * double(price_target);
+			});
+		});
+
+		state.world.for_each_market([&](dcon::market_id market) {
+			auto const index = size_t(market.index());
+			if(index >= market_count)
+				return;
+			auto const cash = double(state.world.market_get_stockpile(market, economy::money));
+			auto const income = double(std::max(0.f, state.world.market_get_total_earn(market)));
+			auto const credit_limit = trade_credit_days * income;
+			auto const credit_available = std::max(0.0, credit_limit - trade_credit_outstanding[index]);
+			trade_cash_budget[index] = std::max(0.0, std::isfinite(cash) ? cash : 0.0);
+			trade_credit_budget[index] = std::isfinite(credit_available) ? credit_available : 0.0;
+			auto const available = trade_cash_budget[index] + trade_credit_budget[index];
+			trade_import_scale[index] = scheduled_import[index] > 0.0
+				? std::min(1.0, available / scheduled_import[index])
+				: 0.0;
+		});
+
+		// Allocate the physical origin stock across all routes before settling them. Without this,
+		// route iteration order decides which targets receive goods and the rest are starved.
+		std::vector<double> desired_export(market_count * size_t(total_commodities), 0.0);
+		state.world.for_each_trade_route([&](dcon::trade_route_id route) {
+			if(!state.world.trade_route_is_valid(route) || state.world.trade_route_get_is_trade_forbidden(route))
+				return;
+			auto const origin = state.world.trade_route_get_origin(route);
+			auto const target = state.world.trade_route_get_target(route);
+			if(!origin || !target)
+				return;
+			auto const target_index = size_t(target.index());
+			if(target_index >= market_count)
+				return;
+			auto const scale = double(trade_import_scale[target_index]);
+			if(!(scale > 0.0) || !std::isfinite(scale))
+				return;
+			auto const origin_index = size_t(origin.index());
+			state.world.for_each_commodity([&](dcon::commodity_id cid) {
+				if(cid == economy::money || state.world.commodity_get_money_rgo(cid) || state.world.commodity_get_is_local(cid))
+					return;
+				auto const requested = double(state.world.trade_route_get_volume(route, cid))
+					* double(state.world.market_get_actual_probability_to_buy(origin, cid)) * scale;
+				if(!(requested > 0.0) || !std::isfinite(requested))
+					return;
+				auto const index = origin_index * size_t(total_commodities) + size_t(cid.index());
+				if(index < desired_export.size())
+					desired_export[index] += requested;
+			});
+		});
+		state.world.for_each_market([&](dcon::market_id market) {
+			auto const market_index = size_t(market.index());
+			state.world.for_each_commodity([&](dcon::commodity_id cid) {
+				if(cid == economy::money || state.world.commodity_get_money_rgo(cid) || state.world.commodity_get_is_local(cid))
+					return;
+				auto const index = market_index * size_t(total_commodities) + size_t(cid.index());
+				if(index >= desired_export.size() || index >= trade_origin_scale.size())
+					return;
+				auto const desired = desired_export[index];
+				if(!(desired > 0.0) || !std::isfinite(desired))
+					return;
+				auto const stock = double(std::max(0.f, state.world.market_get_stockpile(market, cid)));
+				auto const capacity = index < trade_seller_capacity.size() ? trade_seller_capacity[index] : 0.0;
+				auto const available = std::min(stock, capacity);
+				trade_origin_scale[index] = available > 0.0
+					? std::min(1.0, available / desired)
+					: 0.0;
+			});
+		});
+	}
+	if(!trade_escrow_active) {
 	concurrency::parallel_for(uint32_t(1), total_commodities, [&](uint32_t k) {
 		dcon::commodity_id cid{ dcon::commodity_id::value_base_t(k) };
 		state.world.for_each_trade_route([&](auto route) {
 			auto origin = state.world.trade_route_get_origin(route);
 			auto target = state.world.trade_route_get_target(route);
+			if(!origin || !target)
+				return;
 			auto distance = state.world.trade_route_get_distance_km(route);
 			auto volume = state.world.trade_route_get_volume(route, cid);
 			auto lost_modifier = std::max(0.f, 1.f - distance * trade_goods_lost_per_km);
 			auto sat = state.world.market_get_actual_probability_to_buy(origin, cid);
-			state.world.market_set_export(origin, cid, state.world.market_get_export(origin, cid) + sat * volume);
-			state.world.market_set_import(target, cid, state.world.market_get_export(target, cid) + sat * volume * lost_modifier);
-			state.world.market_set_stockpile(target, cid, state.world.market_get_stockpile(target, cid) + sat * volume * lost_modifier);
+			auto const scale = trade_escrow_active
+				? float(trade_import_scale[size_t(target.index())])
+				: 1.f;
+			auto const moved = sat * volume * scale;
+			state.world.market_set_export(origin, cid, state.world.market_get_export(origin, cid) + moved);
+				auto const import_base = trade_import_account_fix
+					? state.world.market_get_import(target, cid)
+					: state.world.market_get_export(target, cid);
+					state.world.market_set_import(target, cid, import_base + moved * lost_modifier);
+			state.world.market_set_stockpile(target, cid, state.world.market_get_stockpile(target, cid) + moved * lost_modifier);
 			if(presimulation && state.world.commodity_get_actually_exists_in_nature(cid)) {
 				state.world.market_set_stockpile(target, cid, state.world.market_get_stockpile(target, cid) + volume);
 			}
@@ -1502,7 +2112,8 @@ void fill_trade_buffers(
 
 				state.world.for_each_commodity([&](auto cid) {
 					auto sat = state.world.market_get_actual_probability_to_buy(origin, cid);
-					auto volume = state.world.trade_route_get_volume(route, cid) * sat;
+						auto volume = state.world.trade_route_get_volume(route, cid) * sat
+							* (trade_escrow_active ? float(trade_import_scale[size_t(target.index())]) : 1.f);
 					auto price_origin = state.world.market_get_price(origin, cid);
 					auto price_target = state.world.market_get_price(target, cid);
 					if(trade_account) {
@@ -1524,7 +2135,8 @@ void fill_trade_buffers(
 
 			state.world.market_set_arbitrage(origin, state.world.market_get_arbitrage(origin) + total_arbitrage);
 			state.world.market_set_export_cut(origin, state.world.market_get_export_cut(origin) + total_earn_export);
-			state.world.market_set_tariff_collected(origin, state.world.market_get_tariff_collected(origin) + total_origin_tariff);
+			if(!trade_escrow_active)
+				state.world.market_set_tariff_collected(origin, state.world.market_get_tariff_collected(origin) + total_origin_tariff);
 		}
 		{
 			dcon::market_id target{ dcon::market_id::value_base_t(k) };
@@ -1546,7 +2158,8 @@ void fill_trade_buffers(
 
 				state.world.for_each_commodity([&](auto cid) {
 					auto sat = state.world.market_get_actual_probability_to_buy(origin, cid);
-					auto volume = state.world.trade_route_get_volume(route, cid) * sat;
+						auto volume = state.world.trade_route_get_volume(route, cid) * sat
+							* (trade_escrow_active ? float(trade_import_scale[size_t(target.index())]) : 1.f);
 					auto price_origin = state.world.market_get_price(origin, cid);
 					auto price_target = state.world.market_get_price(target, cid);
 
@@ -1563,21 +2176,28 @@ void fill_trade_buffers(
 
 			state.world.market_set_arbitrage(target, state.world.market_get_arbitrage(target) + total_arbitrage);
 			state.world.market_set_import_spending(target, state.world.market_get_import_spending(target) + total_spend_import);
-			state.world.market_set_tariff_collected(target, state.world.market_get_tariff_collected(target) + total_target_tariff);
+			if(!trade_escrow_active)
+				state.world.market_set_tariff_collected(target, state.world.market_get_tariff_collected(target) + total_target_tariff);
 		}
 	});
 
-	if(trade_account) {
+	if(trade_account || trade_goods_conservation || trade_escrow_active) {
 		// general goods conservation: every exported unit leaves the origin stockpile
 		state.world.for_each_trade_route([&](dcon::trade_route_id route) {
 			if(!state.world.trade_route_is_valid(route))
 				return;
 			auto const origin = state.world.trade_route_get_origin(route);
+			auto const target = state.world.trade_route_get_target(route);
+			if(!origin || !target)
+				return;
 			state.world.for_each_commodity([&](dcon::commodity_id cid) {
 				if(state.world.commodity_get_money_rgo(cid) || state.world.commodity_get_is_local(cid))
 					return;
 				auto const sat = state.world.market_get_actual_probability_to_buy(origin, cid);
-				auto const moved = state.world.trade_route_get_volume(route, cid) * sat;
+				auto const scale = trade_escrow_active
+					? float(trade_import_scale[size_t(target.index())])
+					: 1.f;
+				auto const moved = state.world.trade_route_get_volume(route, cid) * sat * scale;
 				if(!(moved > 0.f) || !std::isfinite(moved))
 					return;
 				auto const stock = state.world.market_get_stockpile(origin, cid);
@@ -1585,6 +2205,205 @@ void fill_trade_buffers(
 			});
 		});
 	}
+	}
+
+	if(trade_escrow_active) {
+		auto const market_count = size_t(state.world.market_size());
+		std::vector<double> remaining_cash = trade_cash_budget;
+		std::vector<double> remaining_credit = trade_credit_budget;
+		auto credit_market_cash = [&](dcon::market_id market, double amount) {
+			if(!(amount > 0.0) || !std::isfinite(amount))
+				return;
+			auto const current = double(state.world.market_get_stockpile(market, economy::money));
+			auto const next = current + amount;
+			if(std::isfinite(next))
+				state.world.market_set_stockpile(market, economy::money, float(next));
+		};
+
+		state.world.for_each_trade_route([&](dcon::trade_route_id route) {
+			if(!state.world.trade_route_is_valid(route) || state.world.trade_route_get_is_trade_forbidden(route))
+				return;
+			auto const origin = state.world.trade_route_get_origin(route);
+			auto const target = state.world.trade_route_get_target(route);
+			auto owner = state.world.trade_route_get_owner(route);
+			if(!origin || !target)
+				return;
+			if(!owner)
+				owner = origin;
+			auto const distance = double(state.world.trade_route_get_distance_km(route));
+			auto const lost_modifier = std::max(0.0, 1.0 - distance * double(trade_goods_lost_per_km));
+			auto const export_rate = state.world.trade_route_get_is_tariff_applied_origin(route)
+				? double(export_tariff_buffer.get(origin)) : 0.0;
+			auto const import_rate = state.world.trade_route_get_is_tariff_applied_target(route)
+				? double(import_tariff_buffer.get(target)) : 0.0;
+			auto const transport_per_km = double(state.world.trade_route_get_is_sea_route(route)
+				? state.world.market_get_naval_transportation_price(owner)
+				: state.world.market_get_land_transportation_price(owner));
+			auto const cut_rate = double(state.world.trade_route_get_origin_cut_rate(route));
+			auto const target_index = size_t(target.index());
+			if(target_index >= market_count)
+				return;
+			auto const origin_index = size_t(origin.index());
+
+			state.world.for_each_commodity([&](dcon::commodity_id cid) {
+				if(cid == economy::money || state.world.commodity_get_money_rgo(cid) || state.world.commodity_get_is_local(cid))
+					return;
+				auto const price_origin = double(state.world.market_get_price(origin, cid));
+				auto const price_target = double(state.world.market_get_price(target, cid));
+				if(!(price_origin > 0.0) || !(price_target > 0.0) || !std::isfinite(price_origin) || !std::isfinite(price_target))
+					return;
+				auto const sat = state.world.market_get_actual_probability_to_buy(origin, cid);
+				auto const scale = float(trade_import_scale[target_index]);
+				auto const capacity_index = origin_index * size_t(total_commodities) + size_t(cid.index());
+				auto const origin_scale = capacity_index < trade_origin_scale.size() ? trade_origin_scale[capacity_index] : 0.0;
+				auto const requested_moved = double(state.world.trade_route_get_volume(route, cid)) * double(sat) * double(scale) * origin_scale;
+				auto const requested_arrived = requested_moved * lost_modifier;
+				if(!(requested_moved > 0.0) || !(requested_arrived > 0.0) || !std::isfinite(requested_moved) || !std::isfinite(requested_arrived))
+					return;
+				auto const potential_value = requested_arrived * price_target;
+				if(!(potential_value > 0.0) || !std::isfinite(potential_value))
+					return;
+
+				auto const seller_capacity = capacity_index < trade_seller_capacity.size() ? trade_seller_capacity[capacity_index] : 0.0;
+				auto const origin_stock = double(std::max(0.f, state.world.market_get_stockpile(origin, cid)));
+				auto const unit_buyer_value = lost_modifier * price_target;
+				auto const unit_transport = trade_freight_unit_cost(bool(state.world.trade_route_get_is_sea_route(route)), distance, transport_per_km, price_origin);
+				auto const unit_costs = price_origin + price_origin * export_rate
+					+ unit_transport + unit_buyer_value * import_rate;
+				auto const add_blocked = [&](double& reason, double value) {
+					if(value > 0.0 && std::isfinite(value)) {
+						reason += value;
+						trade_escrow_day_blocked += value;
+					}
+				};
+				auto const capacity_moved = std::min(requested_moved, seller_capacity);
+				add_blocked(trade_escrow_day_blocked_seller, (requested_moved - capacity_moved) * unit_buyer_value);
+				auto const stock_moved = std::min(capacity_moved, origin_stock);
+				add_blocked(trade_escrow_day_blocked_stock, (capacity_moved - stock_moved) * unit_buyer_value);
+				auto moved = stock_moved;
+				if(!(moved > 0.0) || !std::isfinite(moved) || !(unit_buyer_value > 0.0)
+					|| !std::isfinite(unit_buyer_value) || !std::isfinite(unit_costs)) {
+					add_blocked(trade_escrow_day_blocked_other, moved * unit_buyer_value);
+					return;
+				}
+				if(unit_costs > unit_buyer_value + 1e-12) {
+					add_blocked(trade_escrow_day_blocked_unprofitable, moved * unit_buyer_value);
+					return;
+				}
+				auto const available_funding = remaining_cash[target_index] + remaining_credit[target_index];
+				auto const affordable_moved = available_funding > 0.0 && std::isfinite(available_funding)
+					? available_funding / unit_buyer_value
+					: 0.0;
+				add_blocked(trade_escrow_day_blocked_budget,
+					std::max(0.0, moved - affordable_moved) * unit_buyer_value);
+				moved = std::min(moved, affordable_moved);
+				if(!(moved > 0.0) || !std::isfinite(moved)) {
+					return;
+				}
+
+				auto const seller_requested = moved * price_origin;
+				double seller_unmatched = 0.0;
+				auto const seller_paid = settle_trade_seller_payment(
+					state, origin, cid, seller_requested, seller_unmatched);
+				trade_escrow_day_unmatched += seller_unmatched;
+				if(!(seller_paid > 0.0) || !std::isfinite(seller_paid)) {
+					add_blocked(trade_escrow_day_blocked_partial, moved * unit_buyer_value);
+					return;
+				}
+
+				auto const matched_fraction = seller_requested > 0.0
+					? std::clamp(seller_paid / seller_requested, 0.0, 1.0)
+					: 0.0;
+				add_blocked(trade_escrow_day_blocked_partial,
+					moved * (1.0 - matched_fraction) * unit_buyer_value);
+				moved *= matched_fraction;
+				auto const arrived = moved * lost_modifier;
+				if(!(moved > 0.0) || !(arrived > 0.0) || !std::isfinite(moved) || !std::isfinite(arrived)) {
+					return;
+				}
+
+				auto const export_tariff = moved * price_origin * export_rate;
+				auto const import_tariff = arrived * price_target * import_rate;
+				auto const transport = moved * unit_transport;
+				auto const costs = export_tariff + import_tariff + transport;
+				auto const buyer_nominal = arrived * price_target;
+				auto const merchant_margin = std::max(0.0, buyer_nominal - costs - seller_paid);
+				auto const funding = seller_paid + costs + merchant_margin;
+				if(!(funding > 0.0) || !std::isfinite(funding) || !std::isfinite(costs) || !std::isfinite(merchant_margin)) {
+					add_blocked(trade_escrow_day_blocked_other, moved * unit_buyer_value);
+					return;
+				}
+
+				auto cash_part = std::min(funding, remaining_cash[target_index]);
+				auto credit_part = funding - cash_part;
+				if(!(credit_part >= 0.0) || credit_part > remaining_credit[target_index] + 1e-9) {
+					add_blocked(trade_escrow_day_blocked_other, moved * unit_buyer_value);
+					return;
+				}
+				remaining_cash[target_index] -= cash_part;
+				remaining_credit[target_index] -= credit_part;
+				if(cash_part > 0.0)
+					state.world.market_set_stockpile(target, economy::money,
+						float(double(state.world.market_get_stockpile(target, economy::money)) - cash_part));
+				trade_credit_outstanding[target_index] += credit_part;
+				trade_escrow_day_sellers += seller_paid;
+				trade_escrow_day_costs += costs;
+				trade_escrow_day_merchant += merchant_margin;
+				trade_escrow_day_funding += funding;
+				trade_escrow_day_cash += cash_part;
+				trade_escrow_day_credit += credit_part;
+				if(owner == origin)
+					trade_escrow_day_margin_origin += merchant_margin;
+				else if(owner == target)
+					trade_escrow_day_margin_target += merchant_margin;
+				else
+					trade_escrow_day_margin_third += merchant_margin;
+
+				auto const origin_stock_now = double(std::max(0.f, state.world.market_get_stockpile(origin, cid)));
+				state.world.market_set_stockpile(origin, cid, float(std::max(0.0, origin_stock_now - moved)));
+				state.world.market_set_stockpile(target, cid,
+					state.world.market_get_stockpile(target, cid) + float(arrived));
+				state.world.market_set_export(origin, cid,
+					state.world.market_get_export(origin, cid) + float(moved));
+				state.world.market_set_import(target, cid,
+					state.world.market_get_import(target, cid) + float(arrived));
+				state.world.market_set_export_cut(origin,
+					state.world.market_get_export_cut(origin) + float(moved * price_origin * cut_rate));
+				state.world.market_set_import_spending(target,
+					state.world.market_get_import_spending(target) + float(buyer_nominal));
+				state.world.market_set_arbitrage(owner,
+					state.world.market_get_arbitrage(owner) + float(transport + merchant_margin));
+				if(capacity_index < trade_seller_capacity.size())
+					trade_seller_capacity[capacity_index] = std::max(0.0, seller_capacity - moved);
+
+				state.world.market_set_tariff_collected(origin,
+					state.world.market_get_tariff_collected(origin) + float(export_tariff));
+				state.world.market_set_tariff_collected(target,
+					state.world.market_get_tariff_collected(target) + float(import_tariff));
+				credit_market_cash(owner, transport + merchant_margin);
+			});
+		});
+		if(trace_trade_escrow && !presimulation) {
+			auto const ymd = state.current_date.to_ymd(state.start_date);
+			fprintf(stderr,
+				"TRADEESCROW %04d-%02d-%02d sellers=%.6f costs=%.6f merchant=%.6f funding=%.6f "
+				"cash=%.6f credit=%.6f unmatched=%.6f blocked=%.6f blocked_seller=%.6f "
+				"blocked_stock=%.6f blocked_budget=%.6f blocked_unprofitable=%.6f "
+				"blocked_partial=%.6f blocked_other=%.6f margin_origin=%.6f "
+				"margin_target=%.6f margin_third=%.6f outstanding=%.6f lender=%.6f\n",
+				ymd.year, ymd.month, ymd.day, trade_escrow_day_sellers, trade_escrow_day_costs,
+				trade_escrow_day_merchant, trade_escrow_day_funding, trade_escrow_day_cash,
+				trade_escrow_day_credit, trade_escrow_day_unmatched, trade_escrow_day_blocked,
+				trade_escrow_day_blocked_seller, trade_escrow_day_blocked_stock,
+				trade_escrow_day_blocked_budget, trade_escrow_day_blocked_unprofitable,
+				trade_escrow_day_blocked_partial, trade_escrow_day_blocked_other,
+				trade_escrow_day_margin_origin, trade_escrow_day_margin_target,
+				trade_escrow_day_margin_third, trade_credit_total(), trade_credit_lender_balance());
+			fflush(stderr);
+		}
+	}
+
+	dump_trade_ledger_trace(state, presimulation, export_tariff_buffer, import_tariff_buffer);
 }
 
 }

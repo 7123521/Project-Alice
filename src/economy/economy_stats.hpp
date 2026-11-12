@@ -1,6 +1,7 @@
 #pragma once
 
 #include "dcon_generated_ids.hpp"
+#include <vector>
 // #include "adaptive_ve.hpp"
 
 namespace sys {
@@ -45,6 +46,29 @@ inline constexpr int32_t total = 10;
 enum class economy_reason {
 	pop, factory, rgo, artisan, construction, nation, stockpile, overseas_penalty, trade
 };
+
+// LOCAL EXPERIMENT (ALICE_EXP_GOV_PURCHASE_SETTLEMENT=1): supply is registered one day before
+// it clears, so the actual seller composition must survive until the next day's settlement.
+struct seller_supply_batch {
+	dcon::province_id province{};
+	float quantity = 0.f;
+	economy_reason reason = economy_reason::stockpile;
+};
+
+void reset_seller_supply_batches(sys::state& state);
+void record_seller_supply_batch(
+	sys::state& state,
+	dcon::market_id market,
+	dcon::commodity_id commodity,
+	dcon::province_id producer,
+	float quantity,
+	economy_reason reason
+);
+std::vector<seller_supply_batch> const* market_good_supply_batches(
+	sys::state const& state,
+	dcon::market_id market,
+	dcon::commodity_id commodity
+);
 
 ve::fp_vector ve_price(
 	sys::state const& state,
@@ -127,7 +151,8 @@ void register_domestic_supply(
 	dcon::market_id s,
 	dcon::commodity_id commodity_type,
 	float amount,
-	economy_reason reason
+	economy_reason reason,
+	dcon::province_id producer
 );
 void register_domestic_supply(
 	sys::state& state,

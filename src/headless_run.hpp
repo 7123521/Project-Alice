@@ -136,13 +136,17 @@ inline void dump_factory_trace(sys::state& state, std::string const& date) {
 	state.world.for_each_factory([&](dcon::factory_id f) {
 		auto const location = state.world.factory_get_province_from_factory_location(f);
 		auto const owner = state.world.province_get_nation_from_province_ownership(location);
+		auto const zone = state.world.province_get_state_membership(location);
+		auto const market = state.world.state_instance_get_market_from_local_market(zone);
 		auto const ftid = state.world.factory_get_building_type(f);
 		auto const good = state.world.factory_type_get_output(ftid);
 		auto const d = economy::diagnose_factory(state, f);
 		fprintf(factory_trace_csv,
-			"%s,%d,%s,%s,%s,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g\n",
+			"%s,%d,%s,%d,%s,%d,%s,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g\n",
 			date.c_str(), f.index(), tag_of(state, owner).c_str(),
+			location.index(), 
 			text::produce_simple_string(state, state.world.province_get_name(location)).c_str(),
+			market.index(),
 			text::produce_simple_string(state, state.world.commodity_get_name(good)).c_str(),
 			double(state.world.factory_get_size(f)), double(d.base_workforce), double(d.hiring_budget), double(d.affordable_employment),
 			double(d.desired_employment), double(d.construction_cost_per_capacity),
@@ -153,6 +157,237 @@ inline void dump_factory_trace(sys::state& state, std::string const& date) {
 	});
 	fflush(factory_trace_csv);
 }
+
+// ===== M10 OBSERVATION LAYER (2026-11-12) =====
+// Read-only measurement columns for summary.csv. Spec: dod-econ/model/design-measurement-export-2026-11-12.md.
+// Rules this block must keep (design L1/L2/L3, §6.2, §E8):
+//   * reads dcon getters only; never calls a set_*/make_*/resize_*, never writes sys::state;
+//   * adds no engine state: everything lives in stack doubles and function-local vectors;
+//   * does not touch the existing accumulation loops in dump_month, so the 49 inherited columns keep
+//     their exact floating-point evaluation order (L3/R3). Every input this needs is passed in;
+//   * the Paasche block below is a re-implementation isomorphic to the dead branch of
+//     economy::refresh_price_level (economy.cpp:991-1005). Do NOT replace it with a call to that
+//     function: it writes the static price_level_now buffer, and economy.cpp:10792-10814 multiplies
+//     that buffer into the labour price when ALICE_EXP_PRICE_INCOME_INDEX=1. A call from the export
+//     path would silently rewrite wages from the observation layer. Keep the two copies in sync by
+//     hand if economy.cpp:991-1005 ever changes.
+struct summary_measurement {
+	// columns 50-55: totals and price level
+	double gdp_nominal = 0; // 50: sum_m sum_c sup*price over finite sup>0 cells (market prices, not medians)
+	double gdp_engine_registered = 0; // 51: sum_m market.gdp -- engine accumulator, TODAY's registered supply at commodity median price. Reconciliation aid, not a GDP series.
+	double price_level_paasche = 0; // 52: sum sup*price / sum sup*cost over the engine's priced filter set. 1.0 is defined at load-time cost constants, NOT on the first exported row: presimulate() already ran 730 days.
+	double gdp_deflated = 0; // 53: gdp_nominal / price_level_paasche == sum sup*cost, i.e. gdp_real minus zero-priced supply. Reads as a cross-check column, not a second gdp_real.
+	double gdp_in_baskets = 0; // 54: gdp_nominal / basket_cost_now -- one day of output in worker baskets
+	double price_coverage_share = 0; // 55: paasche numerator / gdp_nominal. ~1.0 means nothing was dropped as unpriced; well below 1.0 means supply is sitting at price<=0.
+	// columns 56-64: basket and wages. Only the PAIR (real_wage_index, basket_fill) is interpretable:
+	// real_wage_index rising while basket_fill falls means the price signal decoupled from availability
+	// (rationing), not that living standards improved. real_wage_realized is for monotonicity only.
+	double basket_cost_now = 0; // 56: employment-weighted sum_c price(m,c)*coef(c), current prices
+	double basket_cost_base = 0; // 57: sum_c cost(c)*coef(c), a run-time constant (base-period basket)
+	double cpi_basket = 0; // 58: basket_cost_now / basket_cost_base -- pure price index, fixed weights
+	double basket_fill = 0; // 59: employment-weighted (ln*ln_r + en*en_r)/(ln+en) over markets
+	double wage_bill = 0; // 60: sum over land provinces and tiers of labour_price * employed
+	double wage_employed_people = 0; // 61: sum of the same employed terms (people)
+	double wage_nominal_mean = 0; // 62: wage_bill / wage_employed_people
+	double real_wage_index = 0; // 63: wage_nominal_mean / basket_cost_now
+	double real_wage_realized = 0; // 64: real_wage_index * basket_fill
+	// columns 65-68: labour demand split and transport prices
+	double labor_demand_people = 0; // 65: old column 42 minus column 66 (same doubles, so the split adds back)
+	double labor_demand_capacity = 0; // 66: building capacity that advanced_province_buildings.cpp:244-258 adds into labor_demand (design D3)
+	double land_transport_price = 0; // column 36 REWRITTEN: mean market land price over ALL markets, no sample filter. The engine hard-zeroes it daily (economy.cpp:8464), so this is 0 by construction and that 0 is the finding.
+	double land_transport_price_max = 0; // 67: max market land price. Any non-zero value means the engine changed behaviour.
+	double naval_transport_price_samples = 0; // 68: what old column 36 actually carried -- count of markets with naval price > 0
+	// columns 69-72: money pool revaluation
+	double pool_total_revalued = 0; // 69: market cash + pop savings, the only two pools economy.cpp revalues
+	double pool_total_unrevalued = 0; // 70: the other ten pools, never revalued (see design 3.6 for the mapping)
+	double pool_revalued_share = 0; // 71: revalued / (revalued + unrevalued). Only this share can be hit by inflation.
+	double inflation = 0; // 72: state.inflation as a multiplier (1.0 = no revaluation)
+};
+// Every input is a double dump_month has already computed for an existing column, which is what makes
+// invariants I2/I3 ("pool totals reconcile with the old columns") exact instead of approximate.
+inline summary_measurement compute_measurement(sys::state& state, double labor_demand_field,
+		double market_money, double pop_savings, double treasury, double government_bank,
+		double gov_escrow, double rgo_bank, double factory_bank, double rent_bank,
+		double pop_investments, double pop_dividends, double private_inv, double lender_balance,
+		[[maybe_unused]] double fac_wage_sum, [[maybe_unused]] double fac_emp_sum) {
+	// fac_wage_sum / fac_emp_sum are accepted so the call site passes exactly what dump_month has, and
+	// are unused on purpose: columns 60-63 are a price x quantity recomputation from province labour
+	// fields, not the engine's factory payroll (design §3.2, (b2)). They are here for a later
+	// factory-vs-province cross-check.
+	summary_measurement r;
+
+	// --- 1. basket coefficients: the primary factory worker's base life + everyday needs per head.
+	// Raw need coefficients only -- deliberately NOT multiplied by life_needs_mult, needs_weights,
+	// invention_factor or needs_scale_factor (economy.cpp:7686-7712). Do not swap this for
+	// market_get_life_needs_costs(): that field carries the weight drift, so a cpi built on it counts
+	// "needs weights changed" as "prices rose" (design D6 / R6).
+	auto const worker_type = state.culture_definitions.primary_factory_worker;
+	std::vector<double> coef(size_t(state.world.commodity_size()), 0.0);
+	double basket_cost_base = 0.0;
+	state.world.for_each_commodity([&](dcon::commodity_id c) {
+		if(c == economy::money) return; // same exclusion as the market loop below, so numerator and denominator weigh the same set
+		double const cf = double(state.world.pop_type_get_life_needs(worker_type, c))
+				+ double(state.world.pop_type_get_everyday_needs(worker_type, c));
+		coef[c.index()] = cf;
+		if(!(cf > 0.0)) return;
+		double const cost = double(state.world.commodity_get_cost(c));
+		if(std::isfinite(cost)) basket_cost_base += cost * cf;
+	});
+
+	// --- 2. one pass over markets x commodities: nominal gdp, the paasche pair, transport prices,
+	// the engine's own gdp accumulator, and the per-market pieces of the basket.
+	auto const n_markets = size_t(state.world.market_size());
+	std::vector<double> basket_now(n_markets, 0.0); // sum_c price(m,c)*coef(c)
+	std::vector<double> fill_share(n_markets, 0.0); // (ln*ln_r + en*en_r)/(ln+en)
+	std::vector<double> market_employment(n_markets, 0.0); // employed people living in market m
+	double gdp_nominal = 0.0, pa_num = 0.0, pa_den = 0.0, gdp_engine = 0.0;
+	double land_sum = 0.0, land_max = 0.0, naval_samples = 0.0;
+	int markets = 0;
+	state.world.for_each_market([&](dcon::market_id m) {
+		++markets;
+		gdp_engine += double(state.world.market_get_gdp(m));
+		double const lp = double(state.world.market_get_land_transportation_price(m));
+		land_sum += lp;
+		land_max = std::max(land_max, lp);
+		if(double(state.world.market_get_naval_transportation_price(m)) > 0.0) naval_samples += 1.0;
+		double bk = 0.0;
+		state.world.for_each_commodity([&](dcon::commodity_id c) {
+			if(c == economy::money) return;
+			double const pr = double(state.world.market_get_price(m, c));
+			// basket term: fixed coefficients, current market prices. No supply filter and no price>0
+			// filter -- a good whose price collapses towards 0 must show up as a cheaper basket, that
+			// collapse is exactly what real_wage_index has to be read against (design §3.2).
+			double const cf = coef[size_t(c.index())];
+			if(cf > 0.0 && std::isfinite(pr)) bk += pr * cf;
+			double const sup = double(state.world.market_get_supply(m, c));
+			if(!(sup > 0.0) || !std::isfinite(sup)) return; // engine's supply filter
+			if(std::isfinite(pr)) gdp_nominal += sup * pr; // column 50 keeps price<=0 cells; a non-finite price carries no value
+			double const cost = double(state.world.commodity_get_cost(c));
+			if(!(cost > 0.0) || !(pr > 0.0) || !std::isfinite(pr)) return; // engine's priced filter set
+			pa_num += sup * pr;
+			pa_den += sup * cost;
+		});
+		basket_now[size_t(m.index())] = bk;
+		double const ln = double(state.world.market_get_life_needs_costs(m, worker_type));
+		double const en = double(state.world.market_get_everyday_needs_costs(m, worker_type));
+		if(std::isfinite(ln) && std::isfinite(en) && ln + en > 0.0) {
+			double const ln_r = double(state.world.market_get_satisfied_ratio_of_max_life_needs(m, worker_type));
+			double const en_r = double(state.world.market_get_satisfied_ratio_of_max_everyday_needs(m, worker_type));
+			double const x = (ln * ln_r + en * en_r) / (ln + en);
+			if(std::isfinite(x)) fill_share[size_t(m.index())] = x;
+		}
+	});
+
+	// --- 3. land provinces: the capacity that labour_demand wrongly contains, and the wage bill.
+	// employed = min(supply, max(0, demand - capacity)) deliberately drops the building capacity that
+	// advanced_province_buildings.cpp:244-258 adds into province.labor_demand (capacity is slots, not
+	// people -- design D3). The engine's own satisfaction ratio does not drop it, so wage_bill is
+	// knowingly not the engine's payroll total; the two converge once the capacity bug itself is fixed.
+	double capacity_total = 0.0, wage_bill = 0.0, employed_total = 0.0;
+	state.world.for_each_province([&](dcon::province_id p) {
+		if(!province::is_land(state, p)) return; // same filter as the old labour columns
+		// civilian_ports feed labor::no_education, schools_and_universities feed labor::high_education
+		// (definitions[] in advanced_province_buildings.cpp:201-227).
+		double const cap_no_edu =
+				double(state.world.province_get_advanced_province_building_private_size(p, advanced_province_buildings::list::civilian_ports))
+				+ double(state.world.province_get_advanced_province_building_national_size(p, advanced_province_buildings::list::civilian_ports));
+		double const cap_high_edu =
+				double(state.world.province_get_advanced_province_building_private_size(p, advanced_province_buildings::list::schools_and_universities))
+				+ double(state.world.province_get_advanced_province_building_national_size(p, advanced_province_buildings::list::schools_and_universities));
+		capacity_total += cap_no_edu + cap_high_edu;
+		double employed_here = 0.0;
+		for(int32_t l = 0; l < economy::labor::total; ++l) {
+			double const dem = double(state.world.province_get_labor_demand(p, l));
+			double const sup = double(state.world.province_get_labor_supply(p, l));
+			double const price = double(state.world.province_get_labor_price(p, l));
+			if(!std::isfinite(dem) || !std::isfinite(sup) || !std::isfinite(price)) continue;
+			double const cap = l == economy::labor::no_education ? cap_no_edu
+					: (l == economy::labor::high_education ? cap_high_edu : 0.0);
+			double const dem_people = std::max(0.0, dem - cap);
+			double const sup_ok = std::max(0.0, sup);
+			double const employed = std::min(sup_ok, dem_people);
+			wage_bill += price * employed;
+			employed_here += employed;
+		}
+		employed_total += employed_here;
+		auto const sid = state.world.province_get_state_membership(p);
+		if(sid) {
+			auto const mkt = state.world.state_instance_get_market_from_local_market(sid);
+			if(mkt) market_employment[size_t(mkt.index())] += employed_here;
+		}
+	});
+
+	// --- 4. aggregation. Denominators are guarded, never clamped: a zero denominator yields 0 so no
+	// column can go NaN/Inf (harness.py treats a non-finite summary cell as a run violation).
+	// Weighted mean over markets, normalised by the weight actually used: a land province with no
+	// market contributes wages but no basket, and quietly dividing by the full employment total would
+	// then scale the basket down for a reason that has nothing to do with prices.
+	double basket_weighted = 0.0, fill_weighted = 0.0, mapped_employment = 0.0;
+	for(size_t i = 0; i < market_employment.size(); ++i) {
+		if(!(market_employment[i] > 0.0)) continue;
+		mapped_employment += market_employment[i];
+		basket_weighted += market_employment[i] * basket_now[i];
+		fill_weighted += market_employment[i] * fill_share[i];
+	}
+	r.gdp_nominal = gdp_nominal;
+	r.gdp_engine_registered = gdp_engine;
+	r.price_level_paasche = pa_den > 0.0 ? pa_num / pa_den : 0.0;
+	r.price_coverage_share = gdp_nominal > 0.0 ? pa_num / gdp_nominal : 0.0;
+	r.gdp_deflated = r.price_level_paasche > 0.0 ? gdp_nominal / r.price_level_paasche : 0.0;
+	r.basket_cost_base = basket_cost_base;
+	r.basket_cost_now = mapped_employment > 0.0 ? basket_weighted / mapped_employment : 0.0;
+	r.cpi_basket = basket_cost_base > 0.0 ? r.basket_cost_now / basket_cost_base : 0.0;
+	r.basket_fill = mapped_employment > 0.0 ? fill_weighted / mapped_employment : 0.0;
+	r.gdp_in_baskets = r.basket_cost_now > 0.0 ? gdp_nominal / r.basket_cost_now : 0.0;
+	r.wage_bill = wage_bill;
+	r.wage_employed_people = employed_total;
+	r.wage_nominal_mean = employed_total > 0.0 ? wage_bill / employed_total : 0.0;
+	r.real_wage_index = r.basket_cost_now > 0.0 ? r.wage_nominal_mean / r.basket_cost_now : 0.0;
+	r.real_wage_realized = r.real_wage_index * r.basket_fill;
+	// The split is a subtraction from the very double that feeds old column 42, not a second
+	// accumulation of the people part, so columns 65 + 66 == 42 (invariant I1, design §3.3).
+	r.labor_demand_capacity = capacity_total;
+	r.labor_demand_people = labor_demand_field - capacity_total;
+	// Column 36: mean over ALL markets, no "price > 0" sample filter. The old column mixed the naval
+	// sample count into this slot; averaging every market instead makes the structural zero show up as
+	// a zero instead of masquerading as a count (design §3.4).
+	r.land_transport_price = markets > 0 ? land_sum / double(markets) : 0.0;
+	r.land_transport_price_max = land_max;
+	r.naval_transport_price_samples = naval_samples;
+	r.pool_total_revalued = market_money + pop_savings;
+	r.pool_total_unrevalued = treasury + government_bank + gov_escrow + rgo_bank + factory_bank
+			+ rent_bank + pop_investments + pop_dividends + private_inv + lender_balance;
+	// Column 71 is a MAGNITUDE share. Market cash and savings can both go negative (unfunded
+	// market debits), which took the signed ratio outside [0,1] and fired 102 false invariant
+	// violations in a 10-year run -- a gate that always fires is a gate nobody reads. The
+	// magnitude share is always defined and still answers "how much of the money stock sits in
+	// inflation-rescaled pools"; the signs live in columns 69/70.
+	double const revalued_abs = std::fabs(r.pool_total_revalued);
+	double const unrevalued_abs = std::fabs(r.pool_total_unrevalued);
+	r.pool_revalued_share = (revalued_abs + unrevalued_abs > 0.0)
+			? revalued_abs / (revalued_abs + unrevalued_abs) : 0.0;
+	r.inflation = double(state.inflation);
+	return r;
+}
+
+// ---- summary.csv schema: 72 columns = 49 inherited + 23 appended. The count is enforced at compile
+// time (design E6) so a header/argument drift fails the build instead of shifting every field left,
+// which is what happened to welfare.csv (see the LOCAL FIX note below). Column 36 keeps its name and
+// changes content only. The row format string stays a literal at its fprintf on purpose: that keeps
+// the compiler's own format/argument checking alive.
+inline constexpr char const* summary_header =
+		"date,population,satisfaction,sat_poor,sat_middle,sat_rich,factories,capacity,fill_ratio,builds,"
+		"gdp_real,supply_total,demand_total,coverage,market_money,markets,routes,sea_routes,"
+		"treasury,private_investment,army_demand,gov_construction_demand,builds_clothes,builds_fabric,pop_savings,market_pop_investments,market_pop_dividends,rgo_bank,factory_bank,rent_bank,government_bank,total_loans,subsidy_spending,trade_volume,naval_transport_price,land_transport_price,naval_transport_demand,land_transport_demand,rgo_employment,factory_employment,labor_supply,labor_demand,factory_hiring_budget,factory_output_value,factory_input_cost,factory_wage_bill,trade_house_debt,net_money,foreign_settlement"
+		",gdp_nominal,gdp_engine_registered,price_level_paasche,gdp_deflated,gdp_in_baskets,price_coverage_share,basket_cost_now,basket_cost_base,cpi_basket,basket_fill,wage_bill,wage_employed_people,wage_nominal_mean,real_wage_index,real_wage_realized,labor_demand_people,labor_demand_capacity,land_transport_price_max,naval_transport_price_samples,pool_total_revalued,pool_total_unrevalued,pool_revalued_share,inflation";
+inline constexpr int count_summary_columns(char const* s) {
+	int n = 1;
+	for(; *s; ++s)
+		if(*s == ',') ++n;
+	return n;
+}
+static_assert(count_summary_columns(summary_header) == 72,
+		"summary.csv header column count drift (expected 72 = 49 inherited + 23 measurement columns)");
 
 inline void dump_month(sys::state& state, FILE* nations_csv, FILE* prices_csv, FILE* provinces_csv, FILE* markets_csv, FILE* welfare_csv, FILE* summary_csv, std::string const& date) {
 	if(summary_csv) {
@@ -218,25 +453,16 @@ inline void dump_month(sys::state& state, FILE* nations_csv, FILE* prices_csv, F
 		state.world.for_each_pop([&](dcon::pop_id p) {
 			pop_savings_total += double(state.world.pop_get_savings(p));
 		});
-		double const trade_house_debt_value = 0.0; // clean upstream: no local trade-house debt pool
-		double const net_money = market_money + pop_savings_total + treasury + government_bank - trade_house_debt_value;
+		double const trade_house_debt_value = economy::trade_credit_total();
+		double const trade_credit_lender_value = economy::trade_credit_lender_balance();
+		double const gov_escrow = economy::government_purchase_escrow_total();
+		double const net_money = market_money + pop_savings_total + treasury + government_bank + gov_escrow - trade_house_debt_value;
 		// LOCAL DIAGNOSTIC: daily money audit with two pool definitions. net_money matches the summary
 		// column; wide adds the producer/investment pools so creation can be separated from transfers.
 		double audit_market = market_money;
 		double audit_savings = pop_savings_total;
 		double audit_treasury = treasury;
 		double audit_bank = government_bank;
-		double audit_rgo = rgo_bank;
-		double audit_factory = factory_bank;
-		double audit_rent = rent_bank;
-		double audit_pop_inv = pop_investments;
-		double audit_pop_div = pop_dividends;
-		double audit_private_inv = private_inv;
-		double const audit_wide = audit_market + audit_savings + audit_treasury + audit_bank
-			+ audit_rgo + audit_factory + audit_rent + audit_pop_inv + audit_pop_div + audit_private_inv;
-		fprintf(stderr, "MONEYAUDIT %s net_money=%.6f wide=%.6f market=%.6f savings=%.6f treasury=%.6f bank=%.6f rgo=%.6f factory=%.6f rent=%.6f popinv=%.6f popdiv=%.6f private=%.6f\n",
-			date.c_str(), net_money, audit_wide, audit_market, audit_savings, audit_treasury, audit_bank,
-			audit_rgo, audit_factory, audit_rent, audit_pop_inv, audit_pop_div, audit_private_inv);
 		state.world.for_each_province([&](dcon::province_id p) {
 			// Only land provinces carry labour data: the engine initialises and updates labour supply
 			// through ve_for_each_land_province, so a sea province holds an uninitialised (NaN) value
@@ -265,6 +491,22 @@ inline void dump_month(sys::state& state, FILE* nations_csv, FILE* prices_csv, F
 				rgo_emp += double(state.world.province_get_rgo_target_employment(p, c));
 			});
 		});
+		// LOCAL DIAGNOSTIC (not upstream): the producer-bank sums above must be populated before the
+		// audit line is emitted. Printing first made rgo/factory/rent always zero and silently omitted
+		// these pools from wide, so money creation could not be separated from transfers.
+		double const audit_rgo = rgo_bank;
+		double const audit_factory = factory_bank;
+		double const audit_rent = rent_bank;
+		double const audit_pop_inv = pop_investments;
+		double const audit_pop_div = pop_dividends;
+		double const audit_private_inv = private_inv;
+		double const audit_wide = audit_market + audit_savings + audit_treasury + audit_bank + gov_escrow
+			+ audit_rgo + audit_factory + audit_rent + audit_pop_inv + audit_pop_div + audit_private_inv
+			+ trade_credit_lender_value;
+		fprintf(stderr, "MONEYAUDIT %s net_money=%.6f wide=%.6f market=%.6f savings=%.6f treasury=%.6f bank=%.6f escrow=%.6f rgo=%.6f factory=%.6f rent=%.6f popinv=%.6f popdiv=%.6f private=%.6f lender=%.6f\n",
+			date.c_str(), net_money, audit_wide, audit_market, audit_savings, audit_treasury, audit_bank,
+			gov_escrow, audit_rgo, audit_factory, audit_rent, audit_pop_inv, audit_pop_div, audit_private_inv,
+			trade_credit_lender_value);
 		state.world.for_each_market([&](dcon::market_id m) {
 			naval_demand += double(state.world.market_get_naval_transportation_demand(m));
 			land_demand += double(state.world.market_get_land_transportation_demand(m));
@@ -352,8 +594,41 @@ inline void dump_month(sys::state& state, FILE* nations_csv, FILE* prices_csv, F
 			if(labor_dem_nan > 0)
 				bad("labor_demand_nan_slots", double(labor_dem_nan));
 		}
+		// Measurement layer (design E2). Called only after every input it needs is final -- labour
+		// columns above, producer banks above, factory wage/employment above -- and before the row is
+		// printed. Everything it does is read-only; see the guard comments on compute_measurement.
+		auto const meas = compute_measurement(state, labor_dem, market_money, pop_savings_total, treasury,
+				government_bank, gov_escrow, rgo_bank, factory_bank, rent_bank, pop_investments,
+				pop_dividends, private_inv, trade_credit_lender_value, fac_wage, fac_emp);
+		// Instrument self-check (design E7 + §7.3 invariants), stderr only: it must stay silent on a
+		// healthy run, because harness.py records every "SANITY" line as a run violation.
+		{
+			auto bad = [&](char const* what, double v) {
+				fprintf(stderr, "SANITY %s warn=%s value=%.6g\n", date.c_str(), what, v);
+			};
+			if(!std::isfinite(meas.gdp_nominal)) bad("gdp_nominal_not_finite", meas.gdp_nominal);
+			if(!std::isfinite(meas.price_level_paasche)) bad("price_level_paasche_not_finite", meas.price_level_paasche);
+			if(!std::isfinite(meas.cpi_basket)) bad("cpi_basket_not_finite", meas.cpi_basket);
+			if(!std::isfinite(meas.real_wage_index)) bad("real_wage_index_not_finite", meas.real_wage_index);
+			if(!std::isfinite(meas.wage_bill)) bad("wage_bill_not_finite", meas.wage_bill);
+			// I1: the split must add back up to the old column. Relative tolerance, because (a - b) + b
+			// is not an exact identity in IEEE-754 even for the magnitudes involved here.
+			double const split_check = meas.labor_demand_people + meas.labor_demand_capacity;
+			if(std::fabs(split_check - labor_dem) > 1e-12 * std::max(1.0, std::fabs(labor_dem)))
+				bad("labor_demand_split_mismatch", split_check - labor_dem);
+			// I8: the engine hard-zeroes land transport price every day (economy.cpp:8464), so any
+			// non-zero reading here means the engine changed and both transport columns must be re-read.
+			if(meas.land_transport_price_max != 0.0)
+				bad("land_transport_price_max_nonzero", meas.land_transport_price_max);
+			// I9: domain checks
+			if(meas.basket_fill < -1e-6 || meas.basket_fill > 1.0 + 1e-6)
+				bad("basket_fill_out_of_range", meas.basket_fill);
+			if(meas.pool_revalued_share < -1e-6 || meas.pool_revalued_share > 1.0 + 1e-6)
+				bad("pool_revalued_share_out_of_range", meas.pool_revalued_share);
+			if(!(meas.inflation > 0.0)) bad("inflation_nonpositive", meas.inflation);
+		}
 		fprintf(summary_csv,
-			"%s,%.6g,%.4g,%.4g,%.4g,%.4g,%.6g,%.6g,%.4g,%.6g,%.6g,%.6g,%.6g,%.4g,%.6g,%d,%d,%d,%.6g,%.6g,%.6g,%.6g,%.0f,%.0f,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g\n",
+			"%s,%.6g,%.4g,%.4g,%.4g,%.4g,%.6g,%.6g,%.4g,%.6g,%.6g,%.6g,%.6g,%.4g,%.6g,%d,%d,%d,%.6g,%.6g,%.6g,%.6g,%.0f,%.0f,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.0f,%.6g,%.6g,%.6g,%.6g\n",
 			date.c_str(), pop_total, pop_total > 0 ? sat_weighted / pop_total : 0.0,
 			pop_sum[0] > 0 ? sat_sum[0] / pop_sum[0] : 0.0,
 			pop_sum[1] > 0 ? sat_sum[1] / pop_sum[1] : 0.0,
@@ -361,7 +636,13 @@ inline void dump_month(sys::state& state, FILE* nations_csv, FILE* prices_csv, F
 			double(factories), double(capacity), capacity > 0 ? double(factories) / capacity : 0.0, builds,
 			gdp_real, supply_total, demand_total, coverage / std::max(1, markets),
 			market_money, markets, routes, sea_routes, treasury, private_inv, army_dem, gov_dem,
-			builds_clothes, builds_fabric, pop_savings_total, pop_investments, pop_dividends, rgo_bank, factory_bank, rent_bank, government_bank, loan_total, subsidy_spend, trade_volume, naval_price_n > 0 ? naval_price / naval_price_n : 0.0, naval_price_n, naval_demand, land_demand, rgo_emp, fac_emp, labor_sup, labor_dem, fac_budget, fac_output_value, fac_input_cost, fac_wage, trade_house_debt_value, net_money, double(economy::total_foreign_settlement()));
+			builds_clothes, builds_fabric, pop_savings_total, pop_investments, pop_dividends, rgo_bank, factory_bank, rent_bank, government_bank, loan_total, subsidy_spend, trade_volume, naval_price_n > 0 ? naval_price / naval_price_n : 0.0, meas.land_transport_price, naval_demand, land_demand, rgo_emp, fac_emp, labor_sup, labor_dem, fac_budget, fac_output_value, fac_input_cost, fac_wage, trade_house_debt_value, net_money, double(economy::total_foreign_settlement()),
+			meas.gdp_nominal, meas.gdp_engine_registered, meas.price_level_paasche, meas.gdp_deflated,
+			meas.gdp_in_baskets, meas.price_coverage_share, meas.basket_cost_now, meas.basket_cost_base,
+			meas.cpi_basket, meas.basket_fill, meas.wage_bill, meas.wage_employed_people,
+			meas.wage_nominal_mean, meas.real_wage_index, meas.real_wage_realized, meas.labor_demand_people,
+			meas.labor_demand_capacity, meas.land_transport_price_max, meas.naval_transport_price_samples, meas.pool_total_revalued,
+			meas.pool_total_unrevalued, meas.pool_revalued_share, meas.inflation);
 	}
 	// total merchant fleet: transport capacity is what lets goods leave the market that produced them
 	{
@@ -895,13 +1176,23 @@ inline void run(sys::state& state, int years, std::string const& dump_dir) {
 	FILE* markets_csv = nullptr;
 	FILE* routes_csv = nullptr;
 	FILE* wars_csv = nullptr;
+	// LOCAL (ALICE_DUMP_MINIMAL=1): the per-province and per-route dumps are 66% of a run's bytes
+	// (119 MB + 28 MB of 223 MB at twenty years), and a hundred-year run is the game's real
+	// horizon. Sending just those two to /dev/null keeps a century at ~380 MB while everything the
+	// gates read -- summary.csv, prices.csv, markets.csv, nations.csv -- is still written.
+	auto const big_dump = [&](char const* name) {
+		bool minimal = false;
+		if(auto e = std::getenv("ALICE_DUMP_MINIMAL"); e && std::atoi(e) != 0)
+			minimal = true;
+		return minimal ? std::string("/dev/null") : (dump_dir + "/" + name);
+	};
 	if(!dump_dir.empty()) {
 		std::filesystem::create_directories(dump_dir);
 		nations_csv = fopen((dump_dir + "/nations.csv").c_str(), "w");
 		prices_csv = fopen((dump_dir + "/prices.csv").c_str(), "w");
-		provinces_csv = fopen((dump_dir + "/provinces.csv").c_str(), "w");
+		provinces_csv = fopen(big_dump("provinces.csv").c_str(), "w");
 		markets_csv = fopen((dump_dir + "/markets.csv").c_str(), "w");
-		routes_csv = fopen((dump_dir + "/routes.csv").c_str(), "w");
+		routes_csv = fopen(big_dump("routes.csv").c_str(), "w");
 		wars_csv = fopen((dump_dir + "/wars.csv").c_str(), "w");
 		factory_trace_csv = nullptr;
 		construction_trace_csv = nullptr;
@@ -919,7 +1210,7 @@ inline void run(sys::state& state, int years, std::string const& dump_dir) {
 		if(std::getenv("ALICE_TRACE_FACTORY")) {
 			factory_trace_csv = fopen((dump_dir + "/factory_trace.csv").c_str(), "w");
 			if(factory_trace_csv)
-				fprintf(factory_trace_csv, "date,factory,owner,province,good,size,base_workforce,hiring_budget,affordable_employment,desired_employment,construction_cost_per_capacity,output_per_worker,output_price,input_cost_per_worker,wage_per_worker,profit,profit_per_capacity,actual_output_per_capacity,actual_probability_to_sell,employment_ratio,labor_satisfaction,hiring_sat,hiring_multiplier,min_expected_input,min_available_input,subsidy,tokens,expand_priority\n");
+				fprintf(factory_trace_csv, "date,factory,owner,province_id,province,market_id,good,size,base_workforce,hiring_budget,affordable_employment,desired_employment,construction_cost_per_capacity,output_per_worker,output_price,input_cost_per_worker,wage_per_worker,profit,profit_per_capacity,actual_output_per_capacity,actual_probability_to_sell,employment_ratio,labor_satisfaction,hiring_sat,hiring_multiplier,min_expected_input,min_available_input,subsidy,tokens,expand_priority\n");
 			factory_input_trace_csv = fopen((dump_dir + "/factory_input_trace.csv").c_str(), "w");
 			if(factory_input_trace_csv)
 				fprintf(factory_input_trace_csv, "date,factory,owner,province,output_good,input_good,amount,price,actual_buy_prob,expected_buy_prob,supply,demand,stockpile\n");
@@ -941,10 +1232,7 @@ inline void run(sys::state& state, int years, std::string const& dump_dir) {
 		welfare_csv = fopen((dump_dir + "/welfare.csv").c_str(), "w");
 		summary_csv = fopen((dump_dir + "/summary.csv").c_str(), "w");
 		if(summary_csv)
-			fprintf(summary_csv,
-				"date,population,satisfaction,sat_poor,sat_middle,sat_rich,factories,capacity,fill_ratio,builds,"
-				"gdp_real,supply_total,demand_total,coverage,market_money,markets,routes,sea_routes,"
-				"treasury,private_investment,army_demand,gov_construction_demand,builds_clothes,builds_fabric,pop_savings,market_pop_investments,market_pop_dividends,rgo_bank,factory_bank,rent_bank,government_bank,total_loans,subsidy_spending,trade_volume,naval_transport_price,land_transport_price,naval_transport_demand,land_transport_demand,rgo_employment,factory_employment,labor_supply,labor_demand,factory_hiring_budget,factory_output_value,factory_input_cost,factory_wage_bill,trade_house_debt,net_money,foreign_settlement\n");
+			fprintf(summary_csv, "%s\n", summary_header);
 		if(welfare_csv)
 			fprintf(welfare_csv, "date,pop_type,population,mean_satisfaction,savings_per_capita,basket_cost_per_capita,spent_per_capita,mean_is_rich,life_sat,everyday_sat,luxury_sat\n");
 		if(provinces_csv)

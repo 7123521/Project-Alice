@@ -59,6 +59,19 @@ float estimate_trade_income(sys::state const& state, dcon::pop_id pop);
 float estimate_artisan_income(sys::state const& state, dcon::pop_id pop);
 float market_life_needs_spending(dcon::market_id m);
 float market_disposable_income(dcon::market_id m);
+// LOCAL EXPERIMENT (ALICE_EXP_BUYER_ESCROW=1): actual pop goods spending deposited into the
+// market clearing account this day. Read-only accessor for the market stage.
+bool buyer_escrow_enabled();
+float market_consumption_spending(dcon::market_id m);
+// LOCAL EXPERIMENT (ALICE_EXP_HOUSEHOLD_CLEARING=1): the goods spending deducted from a pop is
+// held for same-day clearing and any residual is returned to that same pop.
+bool household_clearing_enabled();
+float household_goods_escrow(dcon::pop_id p);
+// LOCAL TRACE (ALICE_TRACE_ECON_SHADOWPAY=1): exact household demand registered for the current
+// market/commodity/day. market_consumption_spending remains a separate market-level cash amount.
+void begin_household_demand_trace(sys::state& state);
+void trace_household_demand(dcon::market_id m, dcon::commodity_id c, float amount);
+float household_demand_qty(dcon::market_id m, dcon::commodity_id c);
 void snapshot_income_start(sys::state& state);
 void finalize_income_flow(sys::state& state);
 float market_daily_income(dcon::market_id m);

@@ -1,5 +1,6 @@
 #include "system_state.hpp"
 #include "demographics.hpp"
+#include "economy.hpp"
 #include "economy_stats.hpp"
 #include "economy_trade_routes.hpp"
 #include "economy_constants.hpp"
@@ -215,11 +216,61 @@ void register_domestic_supply(
 	dcon::market_id s,
 	dcon::commodity_id commodity_type,
 	float amount,
-	economy_reason reason
+	economy_reason reason,
+	dcon::province_id producer
 ) {
 	state.world.market_set_supply(s, commodity_type, state.world.market_get_supply(s, commodity_type) + amount);
 	auto median_price = state.world.commodity_get_median_price(commodity_type);
 	state.world.market_set_gdp(s, state.world.market_get_gdp(s) + amount * median_price);
+	record_seller_supply_batch(state, s, commodity_type, producer, amount, reason);
+}
+
+static std::vector<std::vector<seller_supply_batch>> seller_supply_batches;
+
+static void ensure_seller_supply_batch_storage(sys::state const& state) {
+	auto const cells = size_t(state.world.market_size()) * size_t(state.world.commodity_size());
+	if(seller_supply_batches.size() != cells)
+		seller_supply_batches.resize(cells);
+}
+
+void reset_seller_supply_batches(sys::state& state) {
+	if(!(government_purchase_settlement_enabled() || household_batch_settlement_enabled() || factory_input_settlement_enabled() || trade_escrow_enabled()) || is_presimulation_update())
+		return;
+	ensure_seller_supply_batch_storage(state);
+	for(auto& batches : seller_supply_batches)
+		batches.clear();
+}
+
+void record_seller_supply_batch(
+	sys::state& state,
+	dcon::market_id market,
+	dcon::commodity_id commodity,
+	dcon::province_id producer,
+	float quantity,
+	economy_reason reason
+) {
+	if(!(government_purchase_settlement_enabled() || household_batch_settlement_enabled() || factory_input_settlement_enabled() || trade_escrow_enabled()) || is_presimulation_update())
+		return;
+	if(!market || !commodity || commodity == economy::money)
+		return;
+	if(!(quantity > 0.f) || !std::isfinite(quantity))
+		return;
+	ensure_seller_supply_batch_storage(state);
+	auto const index = size_t(market.index()) * size_t(state.world.commodity_size()) + size_t(commodity.index());
+	if(index >= seller_supply_batches.size())
+		return;
+	seller_supply_batches[index].push_back(seller_supply_batch{ producer, quantity, reason });
+}
+
+std::vector<seller_supply_batch> const* market_good_supply_batches(
+	sys::state const& state,
+	dcon::market_id market,
+	dcon::commodity_id commodity
+) {
+	auto const index = size_t(market.index()) * size_t(state.world.commodity_size()) + size_t(commodity.index());
+	if(index >= seller_supply_batches.size())
+		return nullptr;
+	return &seller_supply_batches[index];
 }
 
 void register_foreign_supply(

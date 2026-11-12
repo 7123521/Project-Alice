@@ -26,6 +26,9 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
+#include <limits>
+#include <cmath>
 #include "economy_pops_constants.hpp"
 #include "economy_templates.hpp"
 #include "economy_templates_pure.hpp"
@@ -34,6 +37,16 @@
 #include "national_budget.hpp"
 
 namespace economy {
+
+double factory_input_escrow_total();
+
+// LOCAL EXPERIMENT: set by daily_update() so diagnostic code can distinguish presimulation
+// from normal play without changing the update signature.
+static bool presimulation_update_active = false;
+
+bool is_presimulation_update() {
+	return presimulation_update_active;
+}
 
 // LOCAL EXPERIMENT (ALICE_EXP_REFUND_PAID_ONLY=1): the consumption stage debits pops only for what
 // they actually spent, but the satisfaction stage refunds "required minus spent" -- money that was
@@ -52,6 +65,41 @@ static bool const refund_from_escrow = []() {
 	return e && std::atoi(e) != 0;
 }();
 static bool const refund_zeroed = refund_paid_only && !refund_from_escrow;
+// LOCAL EXPERIMENT (ALICE_EXP_HOUSEHOLD_CLEARING=1): settle household goods after the same day's
+// market clear. The escrow is the goods spending already deducted from pop savings; producers are
+// paid only the actual cleared household value and the residual returns to the same households.
+// Default 0 keeps upstream behaviour.
+static bool const household_clearing = []() {
+	auto e = std::getenv("ALICE_EXP_HOUSEHOLD_CLEARING");
+	return e && std::atoi(e) != 0;
+}();
+// LOCAL EXPERIMENT (ALICE_EXP_HOUSEHOLD_BATCH_SETTLEMENT=1): when household clearing is on,
+// pay each commodity's household purchase against the registered seller supply batches instead
+// of the market-level production-share reconstruction. Requires ALICE_EXP_HOUSEHOLD_CLEARING=1.
+// Default 0 keeps the existing household clearing path.
+static bool const household_batch_settlement = []() {
+	auto e = std::getenv("ALICE_EXP_HOUSEHOLD_BATCH_SETTLEMENT");
+	return household_clearing && e && std::atoi(e) != 0;
+}();
+bool household_batch_settlement_enabled() {
+	return household_batch_settlement;
+}
+// LOCAL EXPERIMENT (ALICE_EXP_FACTORY_INPUT_SETTLEMENT=1): factories already deduct input
+// costs from profit. Hold that deducted value in a province/commodity escrow and pay the
+// actual seller batches at the next market clear; refund any unused input budget to the
+// factory bank. Default 0 keeps upstream behaviour.
+static bool const factory_input_settlement = []() {
+	auto e = std::getenv("ALICE_EXP_FACTORY_INPUT_SETTLEMENT");
+	return e && std::atoi(e) != 0;
+}();
+// LOCAL EXPERIMENT (ALICE_EXP_CLEARING_CREDIT=1): when household clearing is on, fund the
+// domestic buyer side of the actual cleared value with an explicit bank clearing credit. The
+// credit is a liability, not market income: the bank account is debited and the amount is traced
+// for later government/producer repayment. Default 0 keeps the household-only settlement.
+static bool const clearing_credit = []() {
+	auto e = std::getenv("ALICE_EXP_CLEARING_CREDIT");
+	return e && std::atoi(e) != 0;
+}();
 
 
 // LOCAL EXPERIMENT (ALICE_EXP_SPOILAGE=1): replace the engine's global stockpile decay constant
@@ -219,6 +267,7 @@ static void apply_money_anchor(sys::state& state) {
 		for(int32_t i = 0; i < advanced_province_buildings::list::total; ++i)
 			M += double(state.world.province_get_advanced_province_building_private_savings(p, i));
 	});
+	M += factory_input_escrow_total();
 	if(!(Y > 0.0) || !std::isfinite(Y) || !std::isfinite(M))
 		return;
 	auto const target = double(money_anchor_ratio) * Y;
@@ -265,6 +314,17 @@ static float const price_flow_alpha = []() {
 	return e ? std::clamp(float(std::atof(e)), 0.f, 1.f) : 0.2f;
 }();
 
+// ===== LOCAL FORK (not upstream) =====
+// LOCAL EXPERIMENT (rejected as standalone; ALICE_EXP_EXPECTED_PROB_SMOOTHING): upstream adds 0.25
+// to both the numerator and denominator of the expected trade probabilities. When both flows are
+// much smaller than 0.25 the ratio tends to 1 regardless of the actual shortage. Default 0.25 keeps
+// upstream behaviour. With 1e-6 the 1y control kept 452 factories while this arm kept 315; Pacific
+// routes stayed at six, so the constant is only a symptom mask and must not be changed alone.
+static float const expected_prob_smoothing = []() {
+	auto e = std::getenv("ALICE_EXP_EXPECTED_PROB_SMOOTHING");
+	return e ? std::clamp(float(std::atof(e)), 0.f, 100.f) : 0.25f;
+}();
+
 
 // LOCAL EXPERIMENT (ALICE_EXP_PRESIM_STOCKPILE=1): normalize RGO market stockpiles during
 // presimulation to a band of days of demand. The upstream rule only enforces a floor, so a
@@ -278,6 +338,187 @@ static bool const presim_stockpile_1y = []() {
 	return s && std::atoi(s) != 0;
 }();
 
+// ===== LOCAL FORK (not upstream) =====
+// LOCAL EXPERIMENT (rejected as standalone; ALICE_EXP_STOCKPILE_OFFER_LOWER_BOUND=1): the upstream
+// stockpile offer uses min(max(lower, stock_available), target). When the historical balance is
+// negative, target can fall below the lower bound and the offer becomes zero even though a large
+// stockpile exists. Restoring the lower bound clears stock (32.8M -> 27.0M grain) but lowers GDP
+// (445k -> 415k), raises market money (17.9M -> 77.5M) and reduces trade; the cause is missing
+// demand/purchasing power, not a stock-offer floor. Default 0 keeps upstream behaviour.
+static bool const stockpile_offer_lower_bound = []() {
+	auto s = std::getenv("ALICE_EXP_STOCKPILE_OFFER_LOWER_BOUND");
+	return s && std::atoi(s) != 0;
+}();
+
+// ===== LOCAL FORK (not upstream) =====
+// LOCAL EXPERIMENT (rejected as standalone; ALICE_EXP_STOCKPILE_PRICE_RESPONSE=1): make the
+// merchant stockpile offer respond smoothly to the posted price relative to replacement cost.
+// 1y seed 1234: GDP 445.0k -> 312.1k, clothes price 0.28 -> 15.2, grain stock 32.85M -> 37.26M,
+// market money 17.9M -> 28.7M. Supply-side release without income/demand cannot clear stock.
+// Default 0 keeps upstream behaviour.
+static bool const stockpile_price_response = []() {
+	auto s = std::getenv("ALICE_EXP_STOCKPILE_PRICE_RESPONSE");
+	return s && std::atoi(s) != 0;
+}();
+
+// ===== LOCAL FORK (not upstream) =====
+// LOCAL EXPERIMENT (ALICE_EXP_STOCK_RELEASE_PRICE=1): replace the merchant stock-offer rule with a
+// price-driven supply curve. Upstream offers
+//   min( max(D_hist * 0.1, stock * 1/1095) , offer_prev * 0.5 + balance * 0.4 + target * 0.1 )
+// The second argument has a 0.5/day geometric memory and wins the min whenever production exceeds
+// the merchant offer, so the offer decays even in a permanent surplus: measured grain has S/D
+// 1.03-1.11 all year, stock -1.1%, but the offer falls 31,186 -> 8,480 (-73%) and the offer rate
+// 0.100% -> 0.027%/day. This experiment replaces the whole min() and all three of its terms
+// (offer_prev * 0.5, balance * 0.4, target * 0.1) as well as the fixed stock * 1/1095 turnover
+// floor, with
+//   release = D_hist * (price / max(cost, price_min)) ^ theta        (theta, default 1)
+// then the pre-existing physical clamp min(stock, max(0, release)) at the call site applies.
+// The merchant offers everything it holds when price is far above replacement cost and almost
+// nothing when price is far below it. No anchor, no floor, no cap, no quota, no target stock days:
+// cost enters only as the denominator of a ratio, and price * lambda and cost * lambda give the
+// same release (scale invariance), so this cannot pull the posted price toward cost. The price
+// update itself never reads commodity.cost unless ALICE_EXP_TARGET_PRICE / COST_PLUS / PRICE_RECOVERY
+// are enabled, all of which are default-off.
+//
+// KNOWN OVERSHOOT - READ BEFORE ENABLING. This experiment closes the hoarding loop but NOT the
+// price level. Under the default price rule the only flow balance is supply == demand, i.e.
+// P/D + release/D == 1, so the implied stationary point is price/cost = 1 - P/D_hist, which is
+// below 1 for every market where production does not fully cover demand. Measured P/D_hist on
+// DEF_1234_20y is 0.04-0.49, i.e. the implied stationary price/cost is 0.5-0.96; a market already
+// at 3.65x cost (driving branch, clothes 1926) would be pushed BELOW cost, not to it. That is an
+// overshoot in the opposite direction, not a fix. The intended offsetting mechanism is the one the
+// engine already has: gradient_employment_i() turns (revenue - inputs - wage) into an employment
+// gradient, so negative profit sheds workers, output falls, P/D_hist rises and the stationary
+// price/cost rises with it. For the investment margin use the existing ALICE_EXP_PROFIT_INVESTMENT
+// flag. Run both arms before judging: see economy-model-demand-clearing-2026-11-12.md S14.
+// Default 0 keeps upstream behaviour byte for byte.
+static bool const stock_release_price = []() {
+	auto s = std::getenv("ALICE_EXP_STOCK_RELEASE_PRICE");
+	return s && std::atoi(s) != 0;
+}();
+// Release elasticity theta in release = D_hist * (price/cost)^theta. Only read when
+// ALICE_EXP_STOCK_RELEASE_PRICE is on. 1.0 means "offer one day of demand at cost, proportionally
+// more above cost". Lower values compress the response; higher values empty the warehouse faster.
+static float const stock_release_elasticity = []() {
+	auto s = std::getenv("ALICE_STOCK_RELEASE_ELASTICITY");
+	return s ? std::clamp(float(std::atof(s)), 0.1f, 3.f) : 1.0f;
+}();
+
+// ===== LOCAL FORK (not upstream) =====
+// LOCAL EXPERIMENT (ALICE_EXP_PRESIM_PRICE_MODE): diagnose the presimulation price collapse.
+// Upstream applies change_fast() as price + price*delta*speed; with speed=4 a sufficiently
+// negative signal makes the next price negative, which is then clamped to the 1e-12 floor.
+// 0 = upstream, 1 = positive exponential fast step, 2 = exponential fast without the extra
+// surplus ratio, 3 = normal-speed step, 4 = normal-speed step without the extra surplus ratio.
+// Default 0 keeps upstream behaviour.
+static int const presim_price_mode = []() {
+	auto s = std::getenv("ALICE_EXP_PRESIM_PRICE_MODE");
+	return s ? std::clamp(std::atoi(s), 0, 4) : 0;
+}();
+static float const presim_price_speed = []() {
+	auto s = std::getenv("ALICE_PRESIM_PRICE_SPEED");
+	return s ? std::clamp(float(std::atof(s)), 0.01f, 200.f) : 200.f;
+}();
+
+// LOCAL EXPERIMENT (ALICE_EXP_PRICE_ZERO_FLOW_HOLD=1): when the observed price inputs contain
+// no supply and no demand, keep the posted price unchanged. Upstream's asymmetric smoothing
+// creates a negative price step from (0, 0), which is a numerical artifact rather than a market
+// signal. Default 0 keeps upstream behaviour.
+static bool const price_zero_flow_hold = []() {
+	auto s = std::getenv("ALICE_EXP_PRICE_ZERO_FLOW_HOLD");
+	return s && std::atoi(s) != 0;
+}();
+
+// LOCAL EXPERIMENT (ALICE_EXP_PRICE_CURRENT_FLOW=1): drive the posted price from the current
+// day's observed supply and demand instead of the one-day aggregated history. This removes the
+// cobweb lag without changing the price rule, the speed, or any price level target. Default 0
+// keeps upstream behaviour.
+static bool const price_current_flow = []() {
+	auto s = std::getenv("ALICE_EXP_PRICE_CURRENT_FLOW");
+	return s && std::atoi(s) != 0;
+}();
+
+// ===== LOCAL FORK (not upstream) =====
+// LOCAL EXPERIMENT (ALICE_EXP_PRICE_BALANCE=1): replace the additive-smoothed supply/demand
+// ratio with a log-space balance step normalized by the market's current/historical flow scale.
+// This is deliberately not a price target: it removes the numerical ghost that lets a 1e-43
+// residual demand hold a price millions of times above cost. Default 0 keeps upstream behaviour.
+static bool const price_balance = []() {
+	auto s = std::getenv("ALICE_EXP_PRICE_BALANCE");
+	return s && std::atoi(s) != 0;
+}();
+// ===== LOCAL EXPERIMENT (ALICE_EXP_PRICE_REGRESSION=1) =====
+// Commodity side only. Adds a mean-reverting drift to the posted commodity price, in log space:
+//
+//   L_m   = median over commodities of [ ln(p) - ln(cost) ]     (per market, recomputed daily)
+//   u     = ln(p) - ln(cost_c) - L_m
+//   kappa = K0 + K1 * u^2 / (u^2 + U^2)                         (slow inside the band, fast outside)
+//   p'    = p * exp(-kappa * u)                                 (applied after the market step)
+//
+// The target is cost_c * exp(L_m): the good's own cost scaled by the market's OWN level. The term is
+// invariant under p -> lambda * p for every good of one market, so it exerts exactly zero force on
+// any market-wide price level. Cross-market spreads -- what trade lives on -- therefore have zero
+// drift from it by construction, which is the defence against the LEVEL_PRICE failure (trade 2-6%
+// of default). It does not replace the market step and does not bound the price; it adds a velocity.
+// A second consequence of the invariance: with an odd good count the median good gets u == 0 and
+// therefore exactly zero step, so L_m's own trajectory -- and with it the cross-market level
+// differences trade lives on -- keeps the dynamics it had without this term.
+//
+// Calibration (dod-econ/model/design-price-regression-2026-11-12.md, section 4):
+//   K0 = 2e-4/day. Upper bound: the only existing anchor of this size (the labour blend at
+//      economy.cpp:10789, weight 1e-4) has no recorded trade damage across the experiment ledger.
+//      Lower bound: the default arm's grain cross-market median drifts ln(6.32e3/5.79e-7)/7300 =
+//      3.2e-3/day; with a mispricing budget of e^8 that gives 3.2e-3/8 = 4e-4. Midpoint 2e-4.
+//   K1 = 2e-2/day. Equal to price_properties::commodity::speed_multiplier (price.hpp:99), so the
+//      reversion's COEFFICIENT can at most match the market step's coefficient. The per-day step is
+//      kappa*u and therefore grows with the deviation -- that is the whole point (a pinned price
+//      needs a repair, not a market signal). Sustained scarcity still wins inside the band: a good
+//      with a permanent +2%/day market signal settles at u* ~ 3-4 (a 20-55x premium over the
+//      market's own median), so the premium stays bounded instead of integrating without limit.
+//   U  = 8. Measured within-market |ln(p/cost) - median| is 2.2-5.7 in the working arms, so a knee
+//      at 8 leaves normal behaviour untouched; a floor-pinned price sits at |u| = 27.6.
+//
+// PRE-REGISTRATION (against DEF_1234_20y; R-lines are the falsification gates):
+//   clothes at the cost*1e6 ceiling     87.5% (DEF 1856)   -> <= 5%
+//   clothes p50 / cost                  4.62e6x (DEF 1856) -> 3-50x
+//   sd(ln p) of grain                   3.86 (DEF 1846)    -> must fall but stay >= 1.5   [R1]
+//   within-market mean|u|               2.9-5.7 (DEF)      -> converge toward ~2-4 (by design)
+//   highest sustainable within-market
+//     scarcity premium (u*)             unbounded today    -> ~e^4 = 55x                  [design]
+//   adjacent-pair grain spread p50      0.46-0.55          -> essentially unchanged (zero drift)
+//   paasche @1856                       384,200            -> 5-100
+//   trade_volume                        324,700            -> >= 40% of default          [R2]
+//   naval_transport_price / paasche     14.7 (TGT0)        -> < 1                         [R3]
+// Falsification (any one rejects the arm): R1 sd(ln p) < 1.5, R2 trade < 40% of DEF,
+// R3 transport/price > 1. Default 0 leaves the update bit-for-bit unchanged: nothing below runs
+// and no buffer is allocated.
+static bool const price_regression = []() {
+	auto s = std::getenv("ALICE_EXP_PRICE_REGRESSION");
+	return s && std::atoi(s) != 0;
+}();
+static float const price_regression_k0 = []() {
+	auto s = std::getenv("ALICE_PRICE_REGRESSION_K0");
+	return s ? std::clamp(float(std::atof(s)), 0.f, 1.f) : 2e-4f;
+}();
+static float const price_regression_k1 = []() {
+	auto s = std::getenv("ALICE_PRICE_REGRESSION_K1");
+	return s ? std::clamp(float(std::atof(s)), 0.f, 0.2f) : 2e-2f;
+}();
+static float const price_regression_u = []() {
+	auto s = std::getenv("ALICE_PRICE_REGRESSION_U");
+	return s ? std::clamp(float(std::atof(s)), 0.1f, 100.f) : 8.f;
+}();
+// File-scope scalar helper: deliberately outside price_properties so there is no ADL surprise and
+// no header dependency. The vectorised path calls it through ve::apply below.
+static float price_regression_kappa(float u) {
+	float const u2 = u * u;
+	float const uu = u2 + price_regression_u * price_regression_u;
+	return price_regression_k0 + price_regression_k1 * (uu > 0.f ? u2 / uu : 0.f);
+}
+// Per-market logarithmic price level, the scale of the reversion target. Filled once per day before
+// the commodity price loop and only touched when the switch is on.
+static std::vector<float> price_regression_level;
+
 // LOCAL EXPERIMENT (ALICE_EXP_MARKET_CASH=1): record the cost of goods sold as market purchases.
 // Upstream never writes market purchases, so sales revenue accumulates in the market money pool.
 // This is the first cash-in-advance step: a sale is matched by a purchase of equal value.
@@ -288,6 +529,27 @@ static bool const presim_stockpile_1y = []() {
 // the reconstructed rgo/guild/factory output shares. Market money is then only working capital.
 static bool const seller_payout = []() {
 	auto s = std::getenv("ALICE_EXP_SELLER_PAYOUT");
+	return s && std::atoi(s) != 0;
+}();
+// ===== LOCAL FORK (not upstream) =====
+// LOCAL EXPERIMENT (ALICE_EXP_SELLER_PAYOUT_BUYER_BASE=1): when buyer escrow supplies the
+// market's cash inflow, pay producers out of that same buyer payment rather than the separately
+// recorded gross sales value. The two sides of the transaction then use one base. Default 0 keeps
+// the historical seller-payout behaviour. Screened and rejected as a standalone fix: household
+// goods spending is only 0.2-1.1% of recorded sales, so GDP fell to 132.5k (BUYER 305.9k).
+static bool const seller_payout_buyer_base = []() {
+	auto s = std::getenv("ALICE_EXP_SELLER_PAYOUT_BUYER_BASE");
+	return s && std::atoi(s) != 0;
+}();
+// ===== LOCAL FORK (not upstream) =====
+// LOCAL EXPERIMENT (ALICE_EXP_GROSS_SALES_BASE=1): the stockpile update sells
+// total_supply * p_sell, but upstream records revenue only for the stockpile-offered
+// merchants_supply. Direct production sold in the same clearing pass receives no sales
+// revenue. Use the full cleared quantity for the sales/purchases base. Default 0 keeps
+// upstream behaviour. Screened 1y seed 1234: the seller gap closes, but unbacked sales drive
+// market money 17.9M -> 49.2M and net money 32.6M -> 65.4M; rejected as a standalone fix.
+static bool const gross_sales_base = []() {
+	auto s = std::getenv("ALICE_EXP_GROSS_SALES_BASE");
 	return s && std::atoi(s) != 0;
 }();
 // LOCAL EXPERIMENT (ALICE_EXP_CLEARING_LOOP=1): with seller payout on, let the market clearing
@@ -329,6 +591,19 @@ static bool const gov_stockpile_purchase = []() {
 	auto s = std::getenv("ALICE_EXP_GOV_STOCKPILE_PURCHASE");
 	return s && std::atoi(s) != 0;
 }();
+// LOCAL EXPERIMENT (ALICE_EXP_GOV_PURCHASE_SETTLEMENT=1): the daily budget debit includes the
+// government goods bill, but the goods are delivered without a seller receipt. Reserve the goods
+// portion of that debit in a government purchase escrow, pay the sellers of the units that actually
+// cleared, and return the escrow residual to the treasury. The upstream nominal goods refund is
+// replaced by that residual rather than added again. Default 0 keeps upstream behaviour.
+static bool const gov_purchase_settlement = []() {
+	auto s = std::getenv("ALICE_EXP_GOV_PURCHASE_SETTLEMENT");
+	return s && std::atoi(s) != 0;
+}();
+
+bool government_purchase_settlement_enabled() {
+	return gov_purchase_settlement;
+}
 // LOCAL EXPERIMENT (ALICE_CB_CREDIT_LIMIT): bounded central-bank inventory/working-capital credit.
 // The national bank may go negative down to -limit; future sales repay it.
 static float const cb_credit_limit = []() {
@@ -379,6 +654,12 @@ static bool const closed_settlement = []() {
 	auto s = std::getenv("ALICE_EXP_CLOSED_SETTLEMENT");
 	return s && std::atoi(s) != 0;
 }();
+static bool factory_input_settlement_active() {
+	return factory_input_settlement && !seller_payout && !producer_settlement && !closed_settlement;
+}
+bool factory_input_settlement_enabled() {
+	return factory_input_settlement;
+}
 static std::vector<float> foreign_settlement;
 
 void reset_foreign_settlement(sys::state& state) {
@@ -398,6 +679,125 @@ static bool const trace_market_flow = []() {
 	auto s = std::getenv("ALICE_TRACE_MARKET_FLOW");
 	return s && std::atoi(s) != 0;
 }();
+static bool const trace_household_clearing = []() {
+	auto s = std::getenv("ALICE_TRACE_HOUSEHOLD_CLEARING");
+	return s && std::atoi(s) != 0;
+}();
+static bool const trace_factory_input_settlement = []() {
+	auto s = std::getenv("ALICE_TRACE_FACTORY_INPUT_SETTLEMENT");
+	return s && std::atoi(s) != 0;
+}();
+// ===== LOCAL FORK (not upstream) =====
+// LOCAL TRACE (ALICE_TRACE_BUYER_LEDGER=1): monthly, read-only decomposition of market demand
+// by buyer category at current prices. The market only records one aggregate demand quantity and
+// one sales value, so this makes explicit which buyers are represented in that value.
+static bool const trace_buyer_ledger = []() {
+	auto s = std::getenv("ALICE_TRACE_BUYER_LEDGER");
+	return s && std::atoi(s) != 0;
+}();
+// LOCAL TRACE (ALICE_TRACE_ECON_SHADOWPAY=1): read-only buyer-category and market-cash ledger.
+// It records registered quantities, the exact household portion, and the observed cash-side fields;
+// it does not infer that registered demand was paid.
+static bool const trace_econ_shadowpay = []() {
+	auto s = std::getenv("ALICE_TRACE_ECON_SHADOWPAY");
+	return s && std::atoi(s) != 0;
+}();
+// ===== LOCAL FORK (not upstream) =====
+// LOCAL TRACE (ALICE_TRACE_GOV_CASH=1): read-only S2 audit of the government cash chain. It keeps
+// the budget estimate, the actual treasury debit, registered government demand, the goods added to
+// government stockpiles, and the refund separate. It also records whether the market money account
+// changed during the government settlement stage; the current code does not use that account for
+// government purchases, so a zero delta is evidence of a missing seller receipt, not a payment.
+static bool const trace_gov_cash = []() {
+	auto s = std::getenv("ALICE_TRACE_GOV_CASH");
+	return s && std::atoi(s) != 0;
+}();
+struct gov_budget_day_snapshot {
+	double base_budget = 0.0;
+	double admin_est = 0.0;
+	double army_est = 0.0;
+	double navy_est = 0.0;
+	double construction_est = 0.0;
+	double stockpile_est = 0.0;
+	double other_est = 0.0;
+	double total_est = 0.0;
+	double required_funding = 0.0;
+	double additional_funding = 0.0;
+	double spending_scale = 0.0;
+	double budget_debit = 0.0;
+	double treasury_after_interest = 0.0;
+	double treasury_after_budget_debit = 0.0;
+	double treasury_after_financing = 0.0;
+	double treasury_before_admin_refund = 0.0;
+	double admin_refund = 0.0;
+	double refund_goods_nominal = 0.0;
+	double refund_overseas_nominal = 0.0;
+	double refund_total_nominal = 0.0;
+	double refund_total_paid = 0.0;
+	double treasury_after_refund = 0.0;
+	double demand_qty = 0.0;
+	double registered_value = 0.0;
+	double bought_qty = 0.0;
+	double bought_value = 0.0;
+	double stockpile_added_qty = 0.0;
+	double stockpile_added_value = 0.0;
+	double market_money_delta_gov_stage = 0.0;
+	double seller_receipt_producers = 0.0;
+	double seller_receipt_merchants = 0.0;
+	double seller_receipt_total = 0.0;
+	double gov_purchase_reserved = 0.0;
+	double gov_purchase_value = 0.0;
+	double gov_purchase_unallocated = 0.0;
+	double gov_purchase_batch_unmatched = 0.0;
+	double gov_purchase_refund = 0.0;
+	bool valid = false;
+};
+struct gov_market_good_day_snapshot {
+	uint32_t nation_index = 0;
+	double army_demand_qty = 0.0;
+	double navy_demand_qty = 0.0;
+	double construction_demand_qty = 0.0;
+	double stockpile_demand_qty = 0.0;
+	double total_demand_qty = 0.0;
+	double registered_value = 0.0;
+	double price = 0.0;
+	double spending_scale = 0.0;
+	double sat = 0.0;
+	double army_bought_qty = 0.0;
+	double navy_bought_qty = 0.0;
+	double construction_bought_qty = 0.0;
+	double stockpile_bought_qty = 0.0;
+	double total_bought_qty = 0.0;
+	double stockpile_added_qty = 0.0;
+	double stockpile_added_value = 0.0;
+	double refund_nominal = 0.0;
+	double seller_receipt_producers = 0.0;
+	double seller_receipt_merchants = 0.0;
+	double seller_receipt_total = 0.0;
+	double purchase_value = 0.0;
+	double unallocated_value = 0.0;
+	double escrow_before = 0.0;
+	double escrow_after = 0.0;
+	double seller_batch_quantity = 0.0;
+	double seller_batch_paid = 0.0;
+	double seller_batch_unmatched = 0.0;
+	bool valid = false;
+};
+static std::vector<gov_budget_day_snapshot> gov_budget_day;
+static std::vector<gov_market_good_day_snapshot> gov_market_good_day;
+static std::vector<double> gov_market_money_before;
+static std::vector<double> gov_market_money_after;
+static FILE* gov_cash_file = nullptr;
+static FILE* gov_budget_file = nullptr;
+static bool gov_cash_files_init = false;
+static bool gov_cash_trace_active();
+static void ensure_gov_cash_trace_size(sys::state& state);
+// LOCAL TRACE (ALICE_TRACE_PRIVATE_CONSTRUCTION=1): per-market/commodity decomposition of
+// private construction demand after the daily market clear. Read-only; no economic effect.
+static bool const trace_private_construction = []() {
+	auto s = std::getenv("ALICE_TRACE_PRIVATE_CONSTRUCTION");
+	return s && std::atoi(s) != 0;
+}();
 static bool const trace_grain = []() {
 	auto s = std::getenv("ALICE_TRACE_GRAIN");
 	return s && std::atoi(s) != 0;
@@ -407,6 +807,7 @@ struct market_flow_snapshot {
 	float money_before = 0.f;
 	float money_after = 0.f;
 	float sales = 0.f;
+	float buyer_payment = 0.f;
 	float purchases = 0.f;
 	float exports = 0.f;
 	float imports = 0.f;
@@ -421,8 +822,69 @@ struct market_flow_snapshot {
 	float arb_pos = 0.f;
 	float arb_neg = 0.f;
 	float payout = 0.f;
+	float gov_receipt = 0.f;
 };
 static std::vector<market_flow_snapshot> market_flow_snap;
+// LOCAL TRACE: per-market/per-commodity transaction snapshot for the canonical quantity
+// comparison. This is written only when ALICE_TRACE_ECON_CLOSURE is enabled and is cleared at
+// the start of each observed day. The three quantities below deliberately stay separate:
+// cleared_qty is what buyers actually received, sold_qty is what the market recorded as sold,
+// and supply_qty/merchant_qty expose the two supply bases used by the clearing pass.
+struct econ_market_good_snapshot {
+	float sold_qty = 0.f;
+	float cleared_qty = 0.f;
+	float supply_qty = 0.f;
+	float merchant_qty = 0.f;
+	float merchant_sold_qty = 0.f;
+	float direct_sold_qty = 0.f;
+	float direct_unsold_qty = 0.f;
+	float stock_before_clear = 0.f;
+	float stock_after_clear = 0.f;
+	float spoiled_qty = 0.f;
+	float sales_value = 0.f;
+	float price = 0.f;
+};
+// ===== LOCAL FORK (not upstream) =====
+// LOCAL TRACE (ALICE_TRACE_ECON_CLOSURE=1): read-only day-end reconciliation. It does not
+// change market behaviour; it records the money and goods identities that the settlement
+// experiments keep breaking. Presimulation is excluded unless explicitly requested because
+// those 730 days are a construction phase rather than the observed economy.
+static bool const trace_econ_closure = []() {
+	auto s = std::getenv("ALICE_TRACE_ECON_CLOSURE");
+	return s && std::atoi(s) != 0;
+}();
+static bool const trace_econ_closure_presim = []() {
+	auto s = std::getenv("ALICE_TRACE_ECON_CLOSURE_PRESIM");
+	return s && std::atoi(s) != 0;
+}();
+struct econ_money_snapshot {
+	double market = 0.0;
+	double savings = 0.0;
+	double treasury = 0.0;
+	double bank = 0.0;
+	double gov_escrow = 0.0;
+	double factory_input_escrow = 0.0;
+	double trade_credit = 0.0;
+	double rgo = 0.0;
+	double factory = 0.0;
+	double artisan = 0.0;
+	double rent = 0.0;
+	double private_investment = 0.0;
+	double pop_investment = 0.0;
+	double pop_dividend = 0.0;
+	double total() const {
+		return market + savings + treasury + bank + gov_escrow + factory_input_escrow + rgo + factory + artisan + rent
+			+ private_investment + pop_investment + pop_dividend - trade_credit;
+	}
+};
+static econ_money_snapshot econ_money_day_open;
+static bool econ_money_day_open_valid = false;
+static econ_money_snapshot econ_money_last_close;
+static bool econ_money_last_close_valid = false;
+static std::vector<double> econ_goods_day_start;
+static std::vector<double> econ_goods_last_close;
+static std::vector<market_flow_snapshot> econ_market_day;
+static std::vector<econ_market_good_snapshot> econ_market_good_day;
 static FILE* market_flow_file = nullptr;
 static bool market_flow_file_init = false;
 static FILE* grain_trace_file = nullptr;
@@ -445,13 +907,28 @@ static FILE* grain_flow_file = nullptr;
 static bool grain_flow_file_init = false;
 static std::string last_grain_flow_date;
 static std::vector<float> prev_grain_stockpile;
+// LOCAL CANDIDATE (ALICE_EXP_LEVEL_PRICE=1): one switch for the two-part fix that the evidence
+// ledger in dod-econ/model/design-price-as-level-function-2026-11-12.md supports. It bundles:
+//   1. the price becomes a level function of the CURRENT state (cost x sqrt(D/S)) instead of an
+//      integral of past imbalances, so ln(p) stops being the accumulated history of flow errors;
+//   2. the stock-days term is off, i.e. the author's 2023 form without the 1/5x-5x clamp;
+//   3. needs weights stop being driven by price. That drift term divides by 10'000 and was
+//      calibrated when a normal price was 1e-5 of cost, so once prices are sane it drives the
+//      weight -- and with it registered demand -- to zero (1,631 vs 115,874 units of grain).
+// Measured three seeds x ten years: satisfaction 0.324i vs 0.138 for the default, price level
+// 0.64 vs 159,234, market cash positive instead of -4.09e13, seed spread under 1%.
+// No anchor, no band, no cap, no target, no forced settlement. Default off.
+static bool const level_price_package = []() {
+	auto s = std::getenv("ALICE_EXP_LEVEL_PRICE");
+	return s && std::atoi(s) != 0;
+}();
 // LOCAL EXPERIMENT (ALICE_EXP_PRICE_RECOVERY=1): add an absolute price-adjustment term scaled by
 // the commodity base cost, so a near-zero price can still respond to demand/supply. The term is
 // symmetric (delta can be negative) and is zero when supply == demand; cost is a unit scale, not
 // a floor or anchor. Default 0 keeps upstream.
 static bool const target_price = []() {
 	auto s = std::getenv("ALICE_EXP_TARGET_PRICE");
-	return s && std::atoi(s) != 0;
+	return (s && std::atoi(s) != 0) || level_price_package;
 }();
 static float const target_price_speed = []() {
 	auto s = std::getenv("ALICE_TARGET_PRICE_SPEED");
@@ -673,7 +1150,8 @@ static float const target_price_flow_elast = []() {
 }();
 static float const target_price_stock_elast = []() {
 	auto s = std::getenv("ALICE_TARGET_PRICE_STOCK_ELAST");
-	return s ? std::clamp(float(std::atof(s)), 0.f, 2.f) : 0.2f;
+	return s ? std::clamp(float(std::atof(s)), 0.f, 2.f)
+		: (level_price_package ? 0.f : 0.2f); // the package is the plain cost x sqrt(D/S) form
 }();
 
 static bool const price_recovery = []() {
@@ -694,6 +1172,15 @@ static bool const deficit_price_recovery = []() {
 static float const deficit_price_recovery_speed = []() {
 	auto s = std::getenv("ALICE_DEFICIT_PRICE_RECOVERY_SPEED");
 	return s ? std::clamp(float(std::atof(s)), 0.0001f, 0.05f) : 0.005f;
+}();
+
+// ===== LOCAL FORK (not upstream) =====
+// LOCAL EXPERIMENT (ALICE_EXP_INITIAL_LABOR_PRICE): upstream initializes every labor price at
+// 0.0001 while commodity costs are of order 1-20. Test whether this nominal mismatch is what
+// forces the presimulation into a low-wage / low-price state. The default preserves upstream.
+static float const initial_labor_price = []() {
+	auto s = std::getenv("ALICE_EXP_INITIAL_LABOR_PRICE");
+	return s ? std::clamp(float(std::atof(s)), 1e-8f, 1.f) : 0.0001f;
 }();
 
 static bool const trace_joint_clear = []() {
@@ -748,38 +1235,113 @@ static std::vector<dcon::commodity_id> price_decomp_goods;
 static bool price_decomp_goods_init = false;
 
 static void init_price_decomp_goods(sys::state& state) {
-	if(price_decomp_goods_init)
+	if(price_decomp_goods_init && !price_decomp_goods.empty())
 		return;
 	price_decomp_goods_init = true;
-	auto const list = std::getenv("ALICE_PRICE_DECOMP_GOODS");
-	if(!list)
-		return;
-	std::string names(list);
-	size_t start = 0;
-	while(start < names.size()) {
-		auto const end = names.find(',', start);
-		auto token = names.substr(start, end == std::string::npos ? std::string::npos : end - start);
-		std::string lower = token;
-		std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char ch) { return char(std::tolower(ch)); });
-		while(!lower.empty() && lower.front() == ' ')
-			lower.erase(lower.begin());
-		while(!lower.empty() && lower.back() == ' ')
-			lower.pop_back();
-		if(!lower.empty()) {
-			state.world.for_each_commodity([&](dcon::commodity_id c) {
-				if(c == economy::money)
-					return;
-				auto const name = text::produce_simple_string(state, state.world.commodity_get_name(c));
-				std::string n = name;
-				std::transform(n.begin(), n.end(), n.begin(), [](unsigned char ch) { return char(std::tolower(ch)); });
-				if(n.find(lower) != std::string::npos && std::find(price_decomp_goods.begin(), price_decomp_goods.end(), c) == price_decomp_goods.end())
+	// LOCAL TRACE: commodity ids are usable before localization is loaded, unlike display names.
+	auto const id_list = std::getenv("ALICE_PRICE_DECOMP_GOOD_IDS");
+	if(id_list) {
+		std::string ids(id_list);
+		size_t id_start = 0;
+		while(id_start < ids.size()) {
+			auto const id_end = ids.find(',', id_start);
+			auto const token = ids.substr(id_start, id_end == std::string::npos ? std::string::npos : id_end - id_start);
+			char* parse_end = nullptr;
+			long const value = std::strtol(token.c_str(), &parse_end, 10);
+			if(parse_end != token.c_str() && value > 0 && value < long(state.world.commodity_size())) {
+				dcon::commodity_id c{ dcon::commodity_id::value_base_t(int(value)) };
+				if(c != economy::money && std::find(price_decomp_goods.begin(), price_decomp_goods.end(), c) == price_decomp_goods.end())
 					price_decomp_goods.push_back(c);
-			});
+			}
+			if(id_end == std::string::npos)
+				break;
+			id_start = id_end + 1;
 		}
-		if(end == std::string::npos)
-			break;
-		start = end + 1;
 	}
+	auto const list = std::getenv("ALICE_PRICE_DECOMP_GOODS");
+	if(list) {
+		std::string names(list);
+		size_t start = 0;
+		while(start < names.size()) {
+			auto const end = names.find(',', start);
+			auto token = names.substr(start, end == std::string::npos ? std::string::npos : end - start);
+			std::string lower = token;
+			std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char ch) { return char(std::tolower(ch)); });
+			while(!lower.empty() && lower.front() == ' ')
+				lower.erase(lower.begin());
+			while(!lower.empty() && lower.back() == ' ')
+				lower.pop_back();
+			if(!lower.empty()) {
+				state.world.for_each_commodity([&](dcon::commodity_id c) {
+					if(c == economy::money)
+						return;
+					auto const name = text::produce_simple_string(state, state.world.commodity_get_name(c));
+					std::string n = name;
+					std::transform(n.begin(), n.end(), n.begin(), [](unsigned char ch) { return char(std::tolower(ch)); });
+					if(n.find(lower) != std::string::npos && std::find(price_decomp_goods.begin(), price_decomp_goods.end(), c) == price_decomp_goods.end())
+						price_decomp_goods.push_back(c);
+				});
+			}
+			if(end == std::string::npos)
+				break;
+			start = end + 1;
+		}
+	}
+	if(price_decomp_goods.empty())
+		price_decomp_goods_init = false;
+}
+
+// ===== LOCAL FORK (not upstream) =====
+// LOCAL TRACE (ALICE_TRACE_PRICE_UPDATE=1): record the actual commodity price update path.
+// This is read-only and reuses ALICE_PRICE_DECOMP_GOODS for commodity selection. The optional
+// ALICE_PRICE_UPDATE_MARKETS limits output to a comma-separated list of market indices.
+// The presimulation date is fixed at the scenario start, so date_offset is the useful time key.
+static bool const trace_price_update = []() {
+	auto s = std::getenv("ALICE_TRACE_PRICE_UPDATE");
+	return s && std::atoi(s) != 0;
+}();
+static FILE* price_update_file = nullptr;
+static bool price_update_file_init = false;
+static std::mutex price_update_mutex;
+static std::vector<int> price_update_markets;
+static bool price_update_markets_init = false;
+
+static void init_price_update_trace(sys::state& state) {
+	if(!trace_price_update)
+		return;
+	init_price_decomp_goods(state);
+	if(!price_update_markets_init) {
+		price_update_markets_init = true;
+		auto const list = std::getenv("ALICE_PRICE_UPDATE_MARKETS");
+		if(list) {
+			std::string names(list);
+			size_t start = 0;
+			while(start < names.size()) {
+				auto const end = names.find(',', start);
+				auto const token = names.substr(start, end == std::string::npos ? std::string::npos : end - start);
+				char* parse_end = nullptr;
+				long const value = std::strtol(token.c_str(), &parse_end, 10);
+				if(parse_end != token.c_str() && value >= 0 && value <= std::numeric_limits<int>::max())
+					price_update_markets.push_back(int(value));
+				if(end == std::string::npos)
+					break;
+				start = end + 1;
+			}
+		}
+	}
+	if(price_update_file_init)
+		return;
+	price_update_file_init = true;
+	auto const path = std::getenv("ALICE_PRICE_UPDATE_FILE");
+	if(path) {
+		price_update_file = fopen(path, "w");
+		if(price_update_file)
+			fprintf(price_update_file, "date,date_offset,presim,stage,market,owner,good,good_id,current_price,cost,price_over_cost,agg_supply,agg_demand,flow_supply,flow_demand,current_supply,current_demand,stockpile,stockpile_sales,change_fast,damped_change,ratio_mult,next_before_clamp,next_after_clamp,at_floor,confidence,presim_price_mode\n");
+	}
+}
+
+static bool price_update_market_selected(dcon::market_id m) {
+	return price_update_markets.empty() || std::find(price_update_markets.begin(), price_update_markets.end(), int(m.index())) != price_update_markets.end();
 }
 
 static bool const trace_pop_demand = []() {
@@ -911,7 +1473,7 @@ static void dump_market_flow_trace(sys::state& state, sys::year_month_day const&
 		if(path) {
 			market_flow_file = fopen(path, "w");
 			if(market_flow_file)
-				fprintf(market_flow_file, "date,market,owner_index,money_before,money_after,delta,sales,purchases,exports,imports,investments,unused_dividends,dividends,reinvest,debt,ship_build,ship_maint,refund,arb_pos,arb_neg,payout,residual\n");
+			fprintf(market_flow_file, "date,market,owner_index,money_before,money_after,delta,sales,buyer_payment,purchases,exports,imports,investments,unused_dividends,dividends,reinvest,debt,ship_build,ship_maint,refund,arb_pos,arb_neg,payout,residual\n");
 		}
 	}
 	if(!market_flow_file)
@@ -924,21 +1486,603 @@ static void dump_market_flow_trace(sys::state& state, sys::year_month_day const&
 		auto const delta = f.money_after - f.money_before;
 		// delta is measured before the seller payout pass-through; exclude payout from both sides
 		// so residual is the actual closure error of the settlement identity.
-		auto const expected = f.arb_pos - f.arb_neg + f.exports + f.investments + f.unused_dividends + f.sales
+		auto const market_receipts = economy::pops::buyer_escrow_enabled() ? f.buyer_payment : f.sales;
+		auto const expected = f.arb_pos - f.arb_neg + f.exports + f.investments + f.unused_dividends + market_receipts
 			+ f.refund - f.imports - f.purchases - f.dividends - f.ship_build - f.ship_maint;
 		auto const residual = delta - expected;
 		auto const m = dcon::market_id{dcon::market_id::value_base_t(i)};
 		auto const zone = state.world.market_get_zone_from_local_market(m);
 		auto const owner = state.world.state_instance_get_nation_from_state_ownership(zone);
-		fprintf(market_flow_file, "%s,%d,%d,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g\n",
+		fprintf(market_flow_file, "%s,%d,%d,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g\n",
 			datebuf, int(i), owner.index(),
-			double(f.money_before), double(f.money_after), double(delta), double(f.sales), double(f.purchases),
+			double(f.money_before), double(f.money_after), double(delta), double(f.sales), double(f.buyer_payment), double(f.purchases),
 			double(f.exports), double(f.imports), double(f.investments), double(f.unused_dividends), double(f.dividends),
 			double(f.reinvest), double(f.debt), double(f.ship_build), double(f.ship_maint), double(f.refund),
 			double(f.arb_pos), double(f.arb_neg), double(f.payout), double(residual));
 	}
 	fflush(market_flow_file);
 	std::fill(market_flow_snap.begin(), market_flow_snap.end(), market_flow_snapshot{});
+}
+
+static void dump_buyer_ledger_trace(sys::state& state, sys::year_month_day const& ymd) {
+	// Presimulation repeats the same date and would write hundreds of thousands of rows.
+	if(!trace_buyer_ledger || is_presimulation_update() || ymd.day != 1)
+		return;
+	static FILE* buyer_ledger_file = nullptr;
+	if(!buyer_ledger_file) {
+		auto const path = std::getenv("ALICE_BUYER_LEDGER_FILE");
+		if(path) {
+			buyer_ledger_file = fopen(path, "w");
+			if(buyer_ledger_file) {
+				fprintf(buyer_ledger_file,
+					"date,market,owner_index,sales,household_spend,total_value,bought_value,"
+					"army_value,navy_value,gov_construction_value,gov_stockpile_value,"
+					"private_construction_value,intermediate_value,trade_value,untagged_value,"
+					"cleared_qty,cleared_value,category_sum_value,residual_value,over_tagged_qty,"
+					"total_qty,tagged_qty\n");
+			}
+		}
+	}
+	if(!buyer_ledger_file)
+		return;
+	char datebuf[16];
+	std::snprintf(datebuf, sizeof(datebuf), "%04d-%02d-%02d", ymd.year, ymd.month, ymd.day);
+	state.world.for_each_market([&](dcon::market_id m) {
+		auto const zone = state.world.market_get_zone_from_local_market(m);
+		auto const owner = state.world.state_instance_get_nation_from_state_ownership(zone);
+		double total_value = 0.0;
+		double bought_value = 0.0;
+		double army_value = 0.0;
+		double navy_value = 0.0;
+		double gov_construction_value = 0.0;
+		double gov_stockpile_value = 0.0;
+		double private_construction_value = 0.0;
+		double intermediate_value = 0.0;
+		double trade_value = 0.0;
+		double untagged_value = 0.0;
+		double cleared_qty = 0.0;
+		double cleared_value = 0.0;
+		double category_sum_value = 0.0;
+		double residual_value = 0.0;
+		double over_tagged_qty = 0.0;
+		double total_qty = 0.0;
+		double tagged_qty = 0.0;
+		auto const private_scale = owner
+			? double(state.world.nation_get_private_investment_effective_fraction(owner)) : 1.0;
+		state.world.for_each_commodity([&](dcon::commodity_id c) {
+			if(c == economy::money)
+				return;
+			auto const price = double(state.world.market_get_price(m, c));
+			auto const probability = double(state.world.market_get_actual_probability_to_buy(m, c));
+			if(!std::isfinite(price) || !std::isfinite(probability) || price <= 0.0 || probability <= 0.0)
+				return;
+			auto const demand = double(state.world.market_get_demand(m, c));
+			if(!std::isfinite(demand) || demand <= 0.0)
+				return;
+			auto const army = double(state.world.market_get_army_demand(m, c));
+			auto const navy = double(state.world.market_get_navy_demand(m, c));
+			auto const gov_construction = double(state.world.market_get_government_construction_demand(m, c));
+			auto const gov_stockpile = double(state.world.market_get_government_stockpile_demand(m, c));
+			auto const private_construction = double(state.world.market_get_private_construction_demand(m, c)) * private_scale;
+			auto const intermediate = double(state.world.market_get_intermediate_demand(m, c));
+			auto const trade = double(economy::trade_demand(state, m, c));
+			auto const tagged = army + navy + gov_construction + gov_stockpile + private_construction + intermediate + trade;
+			auto const untagged = std::max(0.0, demand - tagged);
+			auto const over_tagged = std::max(0.0, tagged - demand);
+			auto const cleared = double(state.world.market_get_consumption(m, c));
+			auto const cleared_share = demand > 0.0 ? cleared / demand : 0.0;
+			total_qty += demand;
+			tagged_qty += std::min(demand, tagged);
+			total_value += demand * price;
+			cleared_qty += cleared;
+			cleared_value += cleared * price;
+			bought_value += demand * price * probability;
+			army_value += army * price * cleared_share;
+			navy_value += navy * price * cleared_share;
+			gov_construction_value += gov_construction * price * cleared_share;
+			gov_stockpile_value += gov_stockpile * price * cleared_share;
+			private_construction_value += private_construction * price * cleared_share;
+			intermediate_value += intermediate * price * cleared_share;
+			trade_value += trade * price * cleared_share;
+			untagged_value += untagged * price * cleared_share;
+			over_tagged_qty += over_tagged;
+		});
+		category_sum_value = untagged_value + army_value + navy_value + gov_construction_value
+			+ gov_stockpile_value + private_construction_value + intermediate_value + trade_value;
+		residual_value = cleared_value - category_sum_value;
+		fprintf(buyer_ledger_file,
+			"%s,%d,%d,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g\n",
+			datebuf, int(m.index()), owner.index(),
+			double(state.world.market_get_sales(m)),
+			double(economy::pops::market_consumption_spending(m)),
+			total_value, bought_value,
+			army_value, navy_value, gov_construction_value, gov_stockpile_value,
+			private_construction_value, intermediate_value, trade_value, untagged_value,
+			cleared_qty, cleared_value, category_sum_value, residual_value, over_tagged_qty,
+			total_qty, tagged_qty);
+	});
+	fflush(buyer_ledger_file);
+}
+
+// LOCAL TRACE (ALICE_TRACE_ECON_SHADOWPAY=1): one row per market/commodity for registered and
+// cleared buyer demand, plus one row per market for the observed cash-side fields. This is the S1
+// audit: registration is not treated as payment, and the two scopes are kept separate.
+static void dump_econ_shadowpay(sys::state& state, sys::year_month_day const& ymd) {
+	if(!trace_econ_shadowpay || is_presimulation_update() || ymd.day != 1)
+		return;
+	static FILE* shadowpay_file = nullptr;
+	static FILE* shadowpay_market_file = nullptr;
+	static bool initialized = false;
+	if(!initialized) {
+		initialized = true;
+		if(auto const path = std::getenv("ALICE_SHADOWPAY_FILE"); path) {
+			shadowpay_file = fopen(path, "w");
+			if(shadowpay_file) {
+				fprintf(shadowpay_file,
+					"date,market,owner_index,good,good_id,price,demand_qty,household_qty,"
+					"army_qty,navy_qty,gov_construction_qty,gov_stockpile_qty,"
+					"private_construction_qty,intermediate_qty,trade_qty,untagged_qty,"
+					"over_tagged_qty,registered_value,cleared_qty,cleared_value,bought_qty,"
+					"bought_value,actual_probability_to_buy,actual_probability_to_sell\n");
+			}
+		}
+		if(auto const path = std::getenv("ALICE_SHADOWPAY_MARKET_FILE"); path) {
+			shadowpay_market_file = fopen(path, "w");
+			if(shadowpay_market_file) {
+				fprintf(shadowpay_market_file,
+					"date,market,owner_index,sales,household_cash,buyer_payment,purchases,"
+					"import_spending,export_cut,market_money,total_earn,total_paid,"
+					"demand_qty,cleared_qty,demand_value,cleared_value,household_value,"
+					"army_value,navy_value,gov_construction_value,gov_stockpile_value,"
+					"private_construction_value,intermediate_value,trade_value,untagged_value,"
+					"category_sum_value,residual_value,over_tagged_qty,buyer_escrow,seller_payout,"
+					"owner_treasury,owner_spending_level,owner_base_budget\n");
+			}
+		}
+	}
+	if(!shadowpay_file && !shadowpay_market_file)
+		return;
+
+	char datebuf[16];
+	std::snprintf(datebuf, sizeof(datebuf), "%04d-%02d-%02d", ymd.year, ymd.month, ymd.day);
+	state.world.for_each_market([&](dcon::market_id m) {
+		auto const sid = state.world.market_get_zone_from_local_market(m);
+		auto const owner = state.world.state_instance_get_nation_from_state_ownership(sid);
+		auto const private_scale = owner
+			? double(state.world.nation_get_private_investment_effective_fraction(owner)) : 1.0;
+		double market_demand_qty = 0.0;
+		double market_cleared_qty = 0.0;
+		double market_demand_value = 0.0;
+		double market_cleared_value = 0.0;
+		double household_value = 0.0;
+		double army_value = 0.0;
+		double navy_value = 0.0;
+		double gov_construction_value = 0.0;
+		double gov_stockpile_value = 0.0;
+		double private_construction_value = 0.0;
+		double intermediate_value = 0.0;
+		double trade_value = 0.0;
+		double untagged_value = 0.0;
+		double over_tagged_qty = 0.0;
+
+		state.world.for_each_commodity([&](dcon::commodity_id c) {
+			if(c == economy::money)
+				return;
+			auto const price = double(state.world.market_get_price(m, c));
+			auto const demand = double(state.world.market_get_demand(m, c));
+			auto const cleared = double(state.world.market_get_consumption(m, c));
+			auto const probability = std::clamp(double(state.world.market_get_actual_probability_to_buy(m, c)), 0.0, 1.0);
+			auto const sell_probability = std::clamp(double(state.world.market_get_actual_probability_to_sell(m, c)), 0.0, 1.0);
+			if(!std::isfinite(price) || !std::isfinite(demand) || !std::isfinite(cleared)
+				|| !std::isfinite(probability) || !std::isfinite(sell_probability))
+				return;
+			auto const household = double(economy::pops::household_demand_qty(m, c));
+			auto const army = double(state.world.market_get_army_demand(m, c));
+			auto const navy = double(state.world.market_get_navy_demand(m, c));
+			auto const gov_construction = double(state.world.market_get_government_construction_demand(m, c));
+			auto const gov_stockpile = double(state.world.market_get_government_stockpile_demand(m, c));
+			auto const private_construction = double(state.world.market_get_private_construction_demand(m, c)) * private_scale;
+			auto const intermediate = double(state.world.market_get_intermediate_demand(m, c));
+			auto const trade = double(economy::trade_demand(state, m, c));
+			auto const tagged = household + army + navy + gov_construction + gov_stockpile
+				+ private_construction + intermediate + trade;
+			auto const untagged = std::max(0.0, demand - tagged);
+			auto const over_tagged = std::max(0.0, tagged - demand);
+			auto const cleared_share = demand > 0.0 ? std::clamp(cleared / demand, 0.0, 1.0) : 0.0;
+			auto const value = demand * price;
+			market_demand_qty += demand;
+			market_cleared_qty += cleared;
+			market_demand_value += value;
+			market_cleared_value += cleared * price;
+			over_tagged_qty += over_tagged;
+			household_value += household * price * cleared_share;
+			army_value += army * price * cleared_share;
+			navy_value += navy * price * cleared_share;
+			gov_construction_value += gov_construction * price * cleared_share;
+			gov_stockpile_value += gov_stockpile * price * cleared_share;
+			private_construction_value += private_construction * price * cleared_share;
+			intermediate_value += intermediate * price * cleared_share;
+			trade_value += trade * price * cleared_share;
+			untagged_value += untagged * price * cleared_share;
+
+			if(shadowpay_file && (demand > 0.0 || tagged > 0.0)) {
+				auto const good_name = text::produce_simple_string(state, state.world.commodity_get_name(c));
+				fprintf(shadowpay_file,
+					"%s,%d,%d,%s,%d,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,"
+					"%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g\n",
+					datebuf, int(m.index()), int(owner.index()), good_name.c_str(), int(c.index()),
+					price, demand, household, army, navy, gov_construction, gov_stockpile,
+					private_construction, intermediate, trade, untagged, over_tagged,
+					value, cleared, cleared * price, demand * probability, cleared * price,
+					probability, sell_probability);
+			}
+		});
+
+		auto const category_sum_value = household_value + army_value + navy_value
+			+ gov_construction_value + gov_stockpile_value + private_construction_value
+			+ intermediate_value + trade_value + untagged_value;
+		if(shadowpay_market_file) {
+			fprintf(shadowpay_market_file,
+				"%s,%d,%d,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,"
+				"%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%d,%d,%.8g,%.8g,%.8g\n",
+				datebuf, int(m.index()), int(owner.index()),
+				double(state.world.market_get_sales(m)),
+				double(economy::pops::market_consumption_spending(m)),
+				economy::pops::buyer_escrow_enabled() ? double(economy::pops::market_consumption_spending(m)) : 0.0,
+				double(state.world.market_get_purchases(m)),
+				double(state.world.market_get_import_spending(m)),
+				double(state.world.market_get_export_cut(m)),
+				double(state.world.market_get_stockpile(m, economy::money)),
+				double(state.world.market_get_total_earn(m)),
+				double(state.world.market_get_total_paid(m)),
+				market_demand_qty, market_cleared_qty, market_demand_value, market_cleared_value,
+				household_value, army_value, navy_value, gov_construction_value, gov_stockpile_value,
+				private_construction_value, intermediate_value, trade_value, untagged_value,
+				category_sum_value, market_cleared_value - category_sum_value, over_tagged_qty,
+				economy::pops::buyer_escrow_enabled() ? 1 : 0, seller_payout ? 1 : 0,
+				owner ? double(state.world.nation_get_treasury(owner)) : 0.0,
+				owner ? double(state.world.nation_get_spending_level(owner)) : 0.0,
+				owner ? double(state.world.nation_get_last_base_budget(owner)) : 0.0);
+		}
+	});
+	if(shadowpay_file)
+		fflush(shadowpay_file);
+	if(shadowpay_market_file)
+		fflush(shadowpay_market_file);
+}
+
+// ===== LOCAL FORK (not upstream) =====
+// LOCAL TRACE (ALICE_TRACE_GOV_CASH=1): write the S2 government cash audit. The budget file has
+// one row per nation and the market file has one row per nation-market-commodity. Both are monthly
+// snapshots of the current day; no cumulative quantities are mixed across days.
+static void dump_gov_cash(sys::state& state, sys::year_month_day const& ymd) {
+	if(!gov_cash_trace_active() || ymd.day != 1)
+		return;
+	ensure_gov_cash_trace_size(state);
+	if(!gov_cash_files_init) {
+		gov_cash_files_init = true;
+		if(auto const path = std::getenv("ALICE_GOV_CASH_FILE"); path) {
+			gov_cash_file = fopen(path, "w");
+			if(gov_cash_file) {
+				fprintf(gov_cash_file,
+					"date,nation,market,market_owner,controller,good,good_id,price,spending_scale,"
+					"sat,army_demand_qty,navy_demand_qty,construction_demand_qty,stockpile_demand_qty,"
+					"total_demand_qty,registered_value,army_bought_qty,navy_bought_qty,"
+					"construction_bought_qty,stockpile_bought_qty,total_bought_qty,"
+					"stockpile_added_qty,stockpile_added_value,refund_nominal,"
+					"market_money_before_gov_stage,market_money_after_gov_stage,"
+					"market_money_delta_gov_stage,seller_receipt_producers,"
+					"seller_receipt_merchants,seller_receipt_total,purchase_value,"
+					"unallocated_value,escrow_before,escrow_after,"
+					"seller_batch_quantity,seller_batch_paid,seller_batch_unmatched\n");
+			}
+		}
+		if(auto const path = std::getenv("ALICE_GOV_BUDGET_FILE"); path) {
+			gov_budget_file = fopen(path, "w");
+			if(gov_budget_file) {
+				fprintf(gov_budget_file,
+					"date,nation,base_budget,admin_est,army_est,navy_est,construction_est,"
+					"stockpile_est,other_est,total_est,required_funding,additional_funding,"
+					"spending_scale,budget_debit,treasury_after_interest,treasury_after_budget_debit,"
+					"treasury_after_financing,treasury_before_admin_refund,admin_refund,"
+					"refund_goods_nominal,refund_overseas_nominal,refund_total_nominal,refund_total_paid,"
+					"treasury_after_refund,treasury_end_of_day,"
+					"gov_demand_qty,gov_registered_value,gov_bought_qty,gov_bought_value,"
+					"gov_stockpile_added_qty,gov_stockpile_added_value,"
+					"market_money_delta_gov_stage,local_loan,national_bank,"
+						"seller_receipt_producers,seller_receipt_merchants,seller_receipt_total,"
+						"gov_purchase_value,gov_purchase_unallocated,gov_purchase_refund,"
+						"gov_purchase_reserved,gov_purchase_batch_unmatched\n");
+			}
+		}
+	}
+	if(!gov_cash_file && !gov_budget_file)
+		return;
+
+	char datebuf[16];
+	std::snprintf(datebuf, sizeof(datebuf), "%04d-%02d-%02d", ymd.year, ymd.month, ymd.day);
+
+	std::vector<double> nation_market_money_delta(size_t(state.world.nation_size()), 0.0);
+	state.world.for_each_market([&](dcon::market_id m) {
+		auto const sid = state.world.market_get_zone_from_local_market(m);
+		auto const controller = state.world.state_instance_get_nation_from_state_control(sid);
+		auto const index = size_t(m.index());
+		if(!controller || index >= gov_market_money_before.size() || index >= gov_market_money_after.size())
+			return;
+		if(size_t(controller.index()) < nation_market_money_delta.size()) {
+			nation_market_money_delta[size_t(controller.index())] += gov_market_money_after[index] - gov_market_money_before[index];
+		}
+	});
+
+	if(gov_budget_file) {
+		state.world.for_each_nation([&](dcon::nation_id n) {
+			auto const index = size_t(n.index());
+			if(index >= gov_budget_day.size() || !gov_budget_day[index].valid)
+				return;
+			auto const& b = gov_budget_day[index];
+			fprintf(gov_budget_file,
+				"%s,%d,%.10g,%.10g,%.10g,%.10g,%.10g,%.10g,%.10g,%.10g,"
+				"%.10g,%.10g,%.10g,%.10g,%.10g,%.10g,%.10g,%.10g,"
+				"%.10g,%.10g,%.10g,%.10g,%.10g,%.10g,%.10g,%.10g,"
+					"%.10g,%.10g,%.10g,%.10g,%.10g,%.10g,%.10g,%.10g,"
+					"%.10g,%.10g,%.10g,%.10g,%.10g,%.10g,%.10g,%.10g\n",
+				datebuf, int(n.index()), b.base_budget, b.admin_est, b.army_est, b.navy_est,
+				b.construction_est, b.stockpile_est, b.other_est, b.total_est,
+				b.required_funding, b.additional_funding, b.spending_scale, b.budget_debit,
+				b.treasury_after_interest, b.treasury_after_budget_debit, b.treasury_after_financing,
+				b.treasury_before_admin_refund, b.admin_refund, b.refund_goods_nominal,
+				b.refund_overseas_nominal, b.refund_total_nominal, b.refund_total_paid,
+				b.treasury_after_refund, double(state.world.nation_get_treasury(n)),
+				b.demand_qty, b.registered_value,
+				b.bought_qty, b.bought_value, b.stockpile_added_qty, b.stockpile_added_value,
+				nation_market_money_delta[index], double(state.world.nation_get_local_loan(n)),
+				double(state.world.nation_get_national_bank(n)),
+				b.seller_receipt_producers, b.seller_receipt_merchants, b.seller_receipt_total,
+					b.gov_purchase_value, b.gov_purchase_unallocated, b.gov_purchase_refund,
+					b.gov_purchase_reserved, b.gov_purchase_batch_unmatched);
+		});
+	}
+
+	if(gov_cash_file) {
+		auto const commodity_count = size_t(state.world.commodity_size());
+		state.world.for_each_market([&](dcon::market_id m) {
+			auto const sid = state.world.market_get_zone_from_local_market(m);
+			auto const owner = state.world.state_instance_get_nation_from_state_ownership(sid);
+			auto const controller = state.world.state_instance_get_nation_from_state_control(sid);
+			auto const market_index = size_t(m.index());
+			for(uint32_t k = 1; k < commodity_count; ++k) {
+				dcon::commodity_id c{ dcon::commodity_id::value_base_t(k) };
+				if(c == economy::money)
+					continue;
+				auto const index = market_index * commodity_count + size_t(c.index());
+				if(index >= gov_market_good_day.size())
+					continue;
+				auto const& g = gov_market_good_day[index];
+				if(!g.valid)
+					continue;
+				auto const good_name = text::produce_simple_string(state, state.world.commodity_get_name(c));
+				auto const before = market_index < gov_market_money_before.size() ? gov_market_money_before[market_index] : 0.0;
+				auto const after = market_index < gov_market_money_after.size() ? gov_market_money_after[market_index] : 0.0;
+				fprintf(gov_cash_file,
+					"%s,%d,%d,%d,%d,%s,%d,%.10g,%.10g,%.10g,%.10g,%.10g,%.10g,%.10g,"
+					"%.10g,%.10g,%.10g,%.10g,%.10g,%.10g,%.10g,%.10g,%.10g,%.10g,%.10g,%.10g,%.10g,"
+					"%.10g,%.10g,%.10g,%.10g,%.10g,%.10g,%.10g,%.10g,%.10g,%.10g\n",
+					datebuf, int(g.nation_index), int(m.index()), int(owner.index()), int(controller.index()),
+					good_name.c_str(), int(c.index()), g.price, g.spending_scale, g.sat,
+					g.army_demand_qty, g.navy_demand_qty, g.construction_demand_qty,
+					g.stockpile_demand_qty, g.total_demand_qty, g.registered_value,
+					g.army_bought_qty, g.navy_bought_qty, g.construction_bought_qty,
+					g.stockpile_bought_qty, g.total_bought_qty, g.stockpile_added_qty,
+					g.stockpile_added_value, g.refund_nominal, before, after, after - before,
+					g.seller_receipt_producers, g.seller_receipt_merchants, g.seller_receipt_total,
+					g.purchase_value, g.unallocated_value, g.escrow_before, g.escrow_after,
+					g.seller_batch_quantity, g.seller_batch_paid, g.seller_batch_unmatched);
+			}
+		});
+	}
+	if(gov_cash_file)
+		fflush(gov_cash_file);
+	if(gov_budget_file)
+		fflush(gov_budget_file);
+}
+
+// LOCAL TRACE (ALICE_TRACE_PRIVATE_CONSTRUCTION=1): identify which goods and prices make up the
+// private-construction demand value. Called after clear_market, so actual_probability_to_buy is the
+// current day's clearing probability rather than the previous day's lagged value.
+static void dump_private_construction_trace(sys::state& state, sys::year_month_day const& ymd) {
+	if(!trace_private_construction || is_presimulation_update() || ymd.day != 1)
+		return;
+	static FILE* private_construction_file = nullptr;
+	if(!private_construction_file) {
+		auto const path = std::getenv("ALICE_PRIVATE_CONSTRUCTION_FILE");
+		if(path) {
+			private_construction_file = fopen(path, "w");
+			if(private_construction_file)
+				fprintf(private_construction_file, "date,market,owner_index,good,demand,price,actual_buy,actual_bought,value,bought_value,stockpile,supply\n");
+		}
+	}
+	if(!private_construction_file)
+		return;
+	char datebuf[16];
+	std::snprintf(datebuf, sizeof(datebuf), "%04d-%02d-%02d", ymd.year, ymd.month, ymd.day);
+	state.world.for_each_market([&](dcon::market_id m) {
+		auto const zone = state.world.market_get_zone_from_local_market(m);
+		auto const owner = state.world.state_instance_get_nation_from_state_ownership(zone);
+		state.world.for_each_commodity([&](dcon::commodity_id c) {
+			if(c == economy::money)
+				return;
+			auto const demand = double(state.world.market_get_private_construction_demand(m, c));
+			auto const price = double(state.world.market_get_price(m, c));
+			auto const probability = double(state.world.market_get_actual_probability_to_buy(m, c));
+			if(!(demand > 0.0) || !std::isfinite(demand) || !(price > 0.0) || !std::isfinite(price) || !std::isfinite(probability))
+				return;
+			auto const bought = demand * probability;
+			auto const good_name = text::produce_simple_string(state, state.world.commodity_get_name(c));
+			fprintf(private_construction_file, "%s,%d,%d,%s,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g\n",
+				datebuf, int(m.index()), owner.index(), good_name.c_str(),
+				demand, price, probability, bought, demand * price, bought * price,
+				double(state.world.market_get_stockpile(m, c)), double(state.world.market_get_supply(m, c)));
+		});
+	});
+	fflush(private_construction_file);
+}
+
+// ===== LOCAL FORK (not upstream) =====
+// LOCAL TRACE (ALICE_TRACE_TRADE_PROBE=1): read-only monthly snapshot of one commodity's trade
+// routes and markets. It is called immediately after the route-volume update, so the route rows
+// show the same prices, stockpiles and probabilities that the volume rule saw. Default off.
+static bool const trace_trade_probe = []() {
+	auto s = std::getenv("ALICE_TRACE_TRADE_PROBE");
+	return s && std::atoi(s) != 0;
+}();
+static dcon::commodity_id trade_probe_good{};
+static bool trade_probe_good_init = false;
+static bool trade_probe_files_init = false;
+static FILE* trade_probe_route_file = nullptr;
+static FILE* trade_probe_market_file = nullptr;
+static std::vector<float> trade_probe_prev_volume;
+static bool trade_probe_prev_init = false;
+
+static void dump_trade_probe_trace(sys::state& state, sys::year_month_day const& ymd) {
+	if(!trace_trade_probe || is_presimulation_update() || ymd.day != 1)
+		return;
+	if(!trade_probe_good_init) {
+		trade_probe_good_init = true;
+		auto const wanted = std::string(std::getenv("ALICE_TRADE_PROBE_GOOD") ? std::getenv("ALICE_TRADE_PROBE_GOOD") : "Machine Parts");
+		state.world.for_each_commodity([&](dcon::commodity_id c) {
+			if(!trade_probe_good && text::produce_simple_string(state, state.world.commodity_get_name(c)) == wanted)
+				trade_probe_good = c;
+		});
+	}
+	if(!trade_probe_good)
+		return;
+	if(!trade_probe_files_init) {
+		trade_probe_files_init = true;
+		auto const route_path = std::getenv("ALICE_TRADE_PROBE_ROUTE_FILE");
+		auto const market_path = std::getenv("ALICE_TRADE_PROBE_MARKET_FILE");
+		if(route_path) {
+			trade_probe_route_file = fopen(route_path, "w");
+			if(trade_probe_route_file)
+				fprintf(trade_probe_route_file, "date,route,origin,target,owner,is_sea,distance_km,volume,prev_volume,volume_delta,origin_price,target_price,price_gap,origin_cost,target_price_over_cost,origin_stockpile,target_stockpile,origin_stockpile_sales,target_stockpile_sales,origin_supply,target_supply,origin_demand,target_demand,origin_expected_buy,target_expected_sell,transport_availability,transport_price,target_total_earn,target_import_budget_scale,route_forbidden\n");
+		}
+		if(market_path) {
+			trade_probe_market_file = fopen(market_path, "w");
+			if(trade_probe_market_file)
+				fprintf(trade_probe_market_file, "date,market,owner_nation,price,cost,price_over_cost,stockpile,stockpile_sales,supply,demand,consumption,expected_buy,expected_sell,actual_buy,actual_sell,money,total_earn,import_budget_scale,naval_satisfaction,land_satisfaction,incoming_routes,outgoing_routes,incoming_volume,outgoing_volume,incoming_origin_stockpile,incoming_origin_offer\n");
+		}
+	}
+	if(!trade_probe_route_file && !trade_probe_market_file)
+		return;
+
+	char datebuf[16];
+	std::snprintf(datebuf, sizeof(datebuf), "%04d-%02d-%02d", ymd.year, ymd.month, ymd.day);
+	auto const route_count = state.world.trade_route_size();
+	auto const market_count = state.world.market_size();
+	std::vector<int32_t> incoming_routes(size_t(market_count), 0);
+	std::vector<int32_t> outgoing_routes(size_t(market_count), 0);
+	std::vector<double> incoming_volume(size_t(market_count), 0.0);
+	std::vector<double> outgoing_volume(size_t(market_count), 0.0);
+	std::vector<double> incoming_origin_stockpile(size_t(market_count), 0.0);
+	std::vector<double> incoming_origin_offer(size_t(market_count), 0.0);
+
+	if(!trade_probe_prev_init || trade_probe_prev_volume.size() != size_t(route_count)) {
+		trade_probe_prev_volume.assign(size_t(route_count), 0.f);
+		state.world.for_each_trade_route([&](dcon::trade_route_id route) {
+			trade_probe_prev_volume[size_t(route.index())] = state.world.trade_route_get_volume(route, trade_probe_good);
+		});
+		trade_probe_prev_init = true;
+	}
+
+	state.world.for_each_trade_route([&](dcon::trade_route_id route) {
+		auto const origin = state.world.trade_route_get_origin(route);
+		auto const target = state.world.trade_route_get_target(route);
+		if(!origin || !target)
+			return;
+		auto const owner = state.world.trade_route_get_owner(route);
+		auto const origin_index = size_t(origin.index());
+		auto const target_index = size_t(target.index());
+		if(origin_index >= size_t(market_count) || target_index >= size_t(market_count))
+			return;
+		auto const volume = state.world.trade_route_get_volume(route, trade_probe_good);
+		auto const origin_price = state.world.market_get_price(origin, trade_probe_good);
+		auto const target_price = state.world.market_get_price(target, trade_probe_good);
+		auto const origin_stockpile = state.world.market_get_stockpile(origin, trade_probe_good);
+		auto const origin_offer = state.world.market_get_stockpile_sales(origin, trade_probe_good);
+		++outgoing_routes[origin_index];
+		++incoming_routes[target_index];
+		outgoing_volume[origin_index] += double(volume);
+		incoming_volume[target_index] += double(volume);
+		incoming_origin_stockpile[target_index] += double(origin_stockpile);
+		incoming_origin_offer[target_index] += double(origin_offer);
+		if(trade_probe_route_file) {
+			auto const is_sea = state.world.trade_route_get_is_sea_route(route);
+			auto const transport_availability = is_sea
+				? state.world.market_get_naval_transportation_demand_satisfaction(owner)
+				: state.world.market_get_land_transportation_demand_satisfaction(owner);
+			auto const transport_price = is_sea
+				? state.world.market_get_naval_transportation_price(owner)
+				: state.world.market_get_land_transportation_price(owner);
+			auto const cost = state.world.commodity_get_cost(trade_probe_good);
+			auto const previous = trade_probe_prev_volume[size_t(route.index())];
+			fprintf(trade_probe_route_file,
+				"%s,%d,%d,%d,%d,%d,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%d\n",
+				datebuf, route.index(), origin.index(), target.index(), owner.id.index(), is_sea ? 1 : 0,
+				double(state.world.trade_route_get_distance_km(route)), double(volume), double(previous), double(volume - previous),
+				double(origin_price), double(target_price), double(target_price - origin_price), double(cost),
+				double(cost > 0.f ? target_price / cost : 0.f), double(origin_stockpile),
+				double(state.world.market_get_stockpile(target, trade_probe_good)), double(origin_offer),
+				double(state.world.market_get_stockpile_sales(target, trade_probe_good)),
+				double(state.world.market_get_supply(origin, trade_probe_good)),
+				double(state.world.market_get_supply(target, trade_probe_good)),
+				double(state.world.market_get_demand(origin, trade_probe_good)),
+				double(state.world.market_get_demand(target, trade_probe_good)),
+				double(state.world.market_get_expected_probability_to_buy(origin, trade_probe_good)),
+				double(state.world.market_get_expected_probability_to_sell(target, trade_probe_good)),
+				double(transport_availability), double(transport_price),
+				double(state.world.market_get_total_earn(target)),
+				double(state.world.market_get_trade_house_budget_import_scale(target)),
+				state.world.trade_route_get_is_trade_forbidden(route) ? 1 : 0);
+		}
+	});
+
+	if(trade_probe_market_file) {
+		state.world.for_each_market([&](dcon::market_id market) {
+			auto const zone = state.world.market_get_zone_from_local_market(market);
+			auto const owner = state.world.state_instance_get_nation_from_state_ownership(zone);
+			auto const price = state.world.market_get_price(market, trade_probe_good);
+			auto const cost = state.world.commodity_get_cost(trade_probe_good);
+			auto const index = size_t(market.index());
+			fprintf(trade_probe_market_file,
+				"%s,%d,%d,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%d,%d,%.6g,%.6g,%.6g,%.6g\n",
+				datebuf, market.index(), owner.index(), double(price), double(cost),
+				double(cost > 0.f ? price / cost : 0.f),
+				double(state.world.market_get_stockpile(market, trade_probe_good)),
+				double(state.world.market_get_stockpile_sales(market, trade_probe_good)),
+				double(state.world.market_get_supply(market, trade_probe_good)),
+				double(state.world.market_get_demand(market, trade_probe_good)),
+				double(state.world.market_get_consumption(market, trade_probe_good)),
+				double(state.world.market_get_expected_probability_to_buy(market, trade_probe_good)),
+				double(state.world.market_get_expected_probability_to_sell(market, trade_probe_good)),
+				double(state.world.market_get_actual_probability_to_buy(market, trade_probe_good)),
+				double(state.world.market_get_actual_probability_to_sell(market, trade_probe_good)),
+				double(state.world.market_get_stockpile(market, economy::money)),
+				double(state.world.market_get_total_earn(market)),
+				double(state.world.market_get_trade_house_budget_import_scale(market)),
+				double(state.world.market_get_naval_transportation_demand_satisfaction(market)),
+				double(state.world.market_get_land_transportation_demand_satisfaction(market)),
+				incoming_routes[index], outgoing_routes[index], incoming_volume[index], outgoing_volume[index],
+				incoming_origin_stockpile[index], incoming_origin_offer[index]);
+		});
+	}
+
+	if(trade_probe_route_file)
+		fflush(trade_probe_route_file);
+	if(trade_probe_market_file)
+		fflush(trade_probe_market_file);
+	state.world.for_each_trade_route([&](dcon::trade_route_id route) {
+		if(size_t(route.index()) < trade_probe_prev_volume.size())
+			trade_probe_prev_volume[size_t(route.index())] = state.world.trade_route_get_volume(route, trade_probe_good);
+	});
 }
 
 static void dump_grain_trace(sys::state& state, sys::year_month_day const& ymd) {
@@ -1420,6 +2564,504 @@ static void rebuild_seller_share_cache(sys::state& state, int key) {
 	seller_share_cache_key = key;
 }
 
+static float pay_market_producers(sys::state& state, dcon::market_id m, float amount) {
+	if(!(amount > 0.f) || !std::isfinite(amount) || size_t(m.index()) >= seller_share_cache.size())
+		return 0.f;
+	auto const& entry = seller_share_cache[size_t(m.index())];
+	if(!(entry.total > 0.f) || !std::isfinite(entry.total))
+		return 0.f;
+	auto const money = state.world.market_get_stockpile(m, economy::money);
+	if(!std::isfinite(money) || money < amount)
+		return 0.f;
+	state.world.market_set_stockpile(m, economy::money, money - amount);
+	for(auto const& ps : entry.provinces) {
+		auto const own = ps.rgo + ps.guild + ps.factory;
+		if(!(own > 0.f) || !std::isfinite(own))
+			continue;
+		auto const share = amount * own / entry.total;
+		if(!std::isfinite(share))
+			continue;
+		if(ps.rgo > 0.f)
+			state.world.province_set_rgo_bank(ps.province, state.world.province_get_rgo_bank(ps.province) + share * ps.rgo / own);
+		if(ps.guild > 0.f)
+			state.world.province_set_artisan_bank(ps.province, state.world.province_get_artisan_bank(ps.province) + share * ps.guild / own);
+		if(ps.factory > 0.f)
+			state.world.province_set_factory_bank(ps.province, state.world.province_get_factory_bank(ps.province) + share * ps.factory / own);
+	}
+	return amount;
+}
+
+// The government goods bill is part of the treasury debit. Keep that part in a same-day escrow
+// until the actual cleared quantity and its sellers are known, then refund the unused remainder.
+static std::vector<double> gov_purchase_escrow;
+
+double government_purchase_escrow_total() {
+	double total = 0.0;
+	if(!gov_purchase_settlement)
+		return total;
+	for(auto const value : gov_purchase_escrow) {
+		if(std::isfinite(value))
+			total += value;
+	}
+	return total;
+}
+
+static float credit_market_merchant(sys::state& state, dcon::market_id m, float amount) {
+	if(!(amount > 0.f) || !std::isfinite(amount))
+		return 0.f;
+	auto const money = state.world.market_get_stockpile(m, economy::money);
+	auto const next = money + amount;
+	if(!std::isfinite(money) || !std::isfinite(next))
+		return 0.f;
+	state.world.market_set_stockpile(m, economy::money, next);
+	return amount;
+}
+
+struct seller_settlement_result {
+	double producer_receipt = 0.0;
+	double merchant_receipt = 0.0;
+	double batch_quantity = 0.0;
+	double paid = 0.0;
+	double unmatched = 0.0;
+};
+
+static double credit_seller_supply_batch(sys::state& state, dcon::market_id market, seller_supply_batch const& batch, double amount) {
+	if(!(amount > 0.0) || !std::isfinite(amount))
+		return 0.0;
+	if(batch.reason == economy_reason::stockpile)
+		return double(credit_market_merchant(state, market, float(amount)));
+	if(!batch.province)
+		return 0.0;
+	auto credit_bank = [&](float current) -> double {
+		auto const next = current + float(amount);
+		return std::isfinite(next) ? amount : 0.0;
+	};
+	if(batch.reason == economy_reason::rgo) {
+		auto const current = state.world.province_get_rgo_bank(batch.province);
+		auto const credited = credit_bank(current);
+		if(credited <= 0.0)
+			return 0.0;
+		state.world.province_set_rgo_bank(batch.province, current + float(amount));
+		return credited;
+	}
+	if(batch.reason == economy_reason::artisan) {
+		auto const current = state.world.province_get_artisan_bank(batch.province);
+		auto const credited = credit_bank(current);
+		if(credited <= 0.0)
+			return 0.0;
+		state.world.province_set_artisan_bank(batch.province, current + float(amount));
+		return credited;
+	}
+	if(batch.reason == economy_reason::factory) {
+		auto const current = state.world.province_get_factory_bank(batch.province);
+		auto const credited = credit_bank(current);
+		if(credited <= 0.0)
+			return 0.0;
+		state.world.province_set_factory_bank(batch.province, current + float(amount));
+		return credited;
+	}
+	return 0.0;
+}
+
+static seller_settlement_result settle_seller_supply_batches_internal(
+	sys::state& state,
+	dcon::market_id market,
+	dcon::commodity_id commodity,
+	double payment,
+	bool prorate_to_market_supply
+) {
+	seller_settlement_result result;
+	if(!(payment > 0.0) || !std::isfinite(payment))
+		return result;
+	auto market_supply = 0.0;
+	if(prorate_to_market_supply) {
+		market_supply = double(std::max(0.f, state.world.market_get_supply(market, commodity)));
+		if(!(market_supply > 0.0) || !std::isfinite(market_supply)) {
+			result.unmatched = payment;
+			return result;
+		}
+	}
+	auto const* batches = market_good_supply_batches(state, market, commodity);
+	if(!batches) {
+		result.unmatched = payment;
+		return result;
+	}
+	for(auto const& batch : *batches) {
+		if(batch.quantity > 0.f && std::isfinite(batch.quantity))
+			result.batch_quantity += double(batch.quantity);
+	}
+	auto const covered_quantity = prorate_to_market_supply
+		? std::min(result.batch_quantity, market_supply)
+		: result.batch_quantity;
+	if(!(covered_quantity > 0.0) || !std::isfinite(covered_quantity)) {
+		result.unmatched = payment;
+		return result;
+	}
+	auto const allocatable = prorate_to_market_supply
+		? payment * covered_quantity / market_supply
+		: payment;
+	double remaining = allocatable;
+	for(auto const& batch : *batches) {
+		if(!(batch.quantity > 0.f) || !std::isfinite(batch.quantity))
+			continue;
+		auto const value = std::min(remaining, allocatable * double(batch.quantity) / covered_quantity);
+		auto const credited = credit_seller_supply_batch(state, market, batch, value);
+		if(credited <= 0.0)
+			continue;
+		result.paid += credited;
+		remaining = std::max(0.0, remaining - credited);
+		if(batch.reason == economy_reason::stockpile)
+			result.merchant_receipt += credited;
+		else
+			result.producer_receipt += credited;
+	}
+	result.unmatched = std::max(0.0, payment - result.paid);
+	return result;
+}
+
+static seller_settlement_result settle_seller_supply_batches(
+	sys::state& state,
+	dcon::market_id market,
+	dcon::commodity_id commodity,
+	double payment
+) {
+	return settle_seller_supply_batches_internal(state, market, commodity, payment, true);
+}
+
+// LOCAL EXPERIMENT (ALICE_EXP_TRADE_ESCROW=1): an export payment is already the value of the
+// shipped units, not a share of the origin market's total supply. Allocate the full payment
+// across the registered seller batches instead of prorating it by covered/supply.
+double settle_trade_seller_payment(
+	sys::state& state,
+	dcon::market_id market,
+	dcon::commodity_id commodity,
+	double payment,
+	double& unmatched
+) {
+	auto const settlement = settle_seller_supply_batches_internal(
+		state, market, commodity, payment, false);
+	unmatched = settlement.unmatched;
+	return settlement.paid;
+}
+
+static void trace_gov_settlement_good(
+	sys::state& state,
+	dcon::nation_id n,
+	dcon::market_id m,
+	dcon::commodity_id c,
+	double payment,
+	seller_settlement_result const& settlement,
+	double escrow_before,
+	double escrow_after
+) {
+	if(!gov_cash_trace_active())
+		return;
+	ensure_gov_cash_trace_size(state);
+	auto const commodity_count = size_t(state.world.commodity_size());
+	auto const index = size_t(m.index()) * commodity_count + size_t(c.index());
+	if(index >= gov_market_good_day.size() || size_t(n.index()) >= gov_budget_day.size())
+		return;
+	auto& good = gov_market_good_day[index];
+	good.seller_receipt_producers = settlement.producer_receipt;
+	good.seller_receipt_merchants = settlement.merchant_receipt;
+	good.seller_receipt_total = settlement.paid;
+	good.purchase_value = payment;
+	good.unallocated_value = settlement.unmatched;
+	good.escrow_before = escrow_before;
+	good.escrow_after = escrow_after;
+	good.seller_batch_quantity = settlement.batch_quantity;
+	good.seller_batch_paid = settlement.paid;
+	good.seller_batch_unmatched = settlement.unmatched;
+	auto& nation = gov_budget_day[size_t(n.index())];
+	nation.seller_receipt_producers += settlement.producer_receipt;
+	nation.seller_receipt_merchants += settlement.merchant_receipt;
+	nation.seller_receipt_total += settlement.paid;
+	nation.gov_purchase_value += payment;
+	nation.gov_purchase_unallocated += settlement.unmatched;
+	nation.gov_purchase_batch_unmatched += settlement.unmatched;
+	nation.valid = true;
+}
+
+static std::vector<float> market_household_purchase_value;
+static std::vector<float> market_commodity_household_purchase_value;
+static std::vector<float> market_household_refund_ratio;
+static std::vector<double> clearing_credit_by_nation;
+
+static void settle_household_clearing(sys::state& state) {
+	if(!household_clearing)
+		return;
+	auto const market_count = size_t(state.world.market_size());
+	auto const commodity_count = size_t(state.world.commodity_size());
+	if(market_household_purchase_value.size() != market_count)
+		market_household_purchase_value.assign(market_count, 0.f);
+	if(market_household_refund_ratio.size() != market_count)
+		market_household_refund_ratio.assign(market_count, 0.f);
+	if(household_batch_settlement) {
+		auto const cells = market_count * commodity_count;
+		if(market_commodity_household_purchase_value.size() != cells)
+			market_commodity_household_purchase_value.assign(cells, 0.f);
+	}
+
+	double total_escrow = 0.0;
+	double total_value = 0.0;
+	double total_paid = 0.0;
+	double total_refund = 0.0;
+	double total_shortfall = 0.0;
+	double total_unallocated = 0.0;
+	double total_credit = 0.0;
+	double total_batch_quantity = 0.0;
+	double total_batch_paid = 0.0;
+	double total_batch_unmatched = 0.0;
+	state.world.for_each_market([&](dcon::market_id m) {
+		auto const escrow = std::max(0.f, economy::pops::market_consumption_spending(m));
+		if(household_batch_settlement && !clearing_credit && !is_presimulation_update()) {
+			double household_value = 0.0;
+			for(size_t k = 1; k < commodity_count; ++k) {
+				auto const idx = size_t(m.index()) * commodity_count + k;
+				if(idx < market_commodity_household_purchase_value.size()) {
+					auto const value = market_commodity_household_purchase_value[idx];
+					if(value > 0.f && std::isfinite(value))
+						household_value += double(value);
+				}
+			}
+			auto const household_actual = std::min(double(escrow), household_value);
+			double remaining = household_actual;
+			double market_paid = 0.0;
+			double market_batch_quantity = 0.0;
+			double market_batch_unmatched = 0.0;
+			if(household_actual > 0.0 && household_value > 0.0) {
+				auto const scale = household_actual / household_value;
+				for(size_t k = 1; k < commodity_count && remaining > 0.0; ++k) {
+					auto const idx = size_t(m.index()) * commodity_count + k;
+					if(idx >= market_commodity_household_purchase_value.size())
+						break;
+					auto const value = market_commodity_household_purchase_value[idx];
+					if(!(value > 0.f) || !std::isfinite(value))
+						continue;
+					auto const payment = std::min(remaining, double(value) * scale);
+					if(!(payment > 0.0) || !std::isfinite(payment))
+						continue;
+					dcon::commodity_id c{ dcon::commodity_id::value_base_t(k) };
+					auto const settlement = settle_seller_supply_batches(state, m, c, payment);
+					auto const paid = std::min(payment, settlement.paid);
+					market_paid += paid;
+					remaining = std::max(0.0, remaining - paid);
+					market_batch_quantity += settlement.batch_quantity;
+					market_batch_unmatched += settlement.unmatched;
+				}
+			}
+			auto const refund = std::max(0.0, double(escrow) - market_paid);
+			market_household_refund_ratio[size_t(m.index())] = escrow > 0.f ? float(refund / double(escrow)) : 0.f;
+			if(refund > 0.0 && std::isfinite(refund)) {
+				auto const market_money = state.world.market_get_stockpile(m, economy::money);
+				auto const next = double(market_money) + refund;
+				if(std::isfinite(next))
+					state.world.market_set_stockpile(m, economy::money, float(next));
+			}
+			total_escrow += double(escrow);
+			total_value += household_actual;
+			total_paid += market_paid;
+			total_refund += refund;
+			total_shortfall += std::max(0.0, household_value - double(escrow));
+			total_unallocated += std::max(0.0, household_actual - market_paid);
+			total_batch_quantity += market_batch_quantity;
+			total_batch_paid += market_paid;
+			total_batch_unmatched += market_batch_unmatched;
+			return;
+		}
+		auto const household_value = std::max(0.f, market_household_purchase_value[size_t(m.index())]);
+		auto const sales_value = std::max(0.f, state.world.market_get_sales(m));
+		auto const household_actual = std::min(escrow, household_value);
+		auto const producer_pay = clearing_credit ? sales_value : household_actual;
+		auto const credit = clearing_credit ? std::max(0.f, producer_pay - household_actual) : 0.f;
+		auto funded_credit = credit;
+		auto const refund = std::max(0.f, escrow - household_actual);
+		auto const shortfall = std::max(0.f, household_value - escrow);
+		market_household_refund_ratio[size_t(m.index())] = escrow > 0.f ? refund / escrow : 0.f;
+		if(funded_credit > 0.f && std::isfinite(funded_credit)) {
+			auto const sid = state.world.market_get_zone_from_local_market(m);
+			auto const n = state.world.state_instance_get_nation_from_state_ownership(sid);
+			if(n && std::isfinite(state.world.nation_get_national_bank(n))) {
+				if(clearing_credit_by_nation.size() <= size_t(n.index()))
+					clearing_credit_by_nation.resize(size_t(n.index()) + 1, 0.0);
+				state.world.nation_set_national_bank(n, state.world.nation_get_national_bank(n) - funded_credit);
+				clearing_credit_by_nation[size_t(n.index())] += double(funded_credit);
+				total_credit += double(funded_credit);
+			} else {
+				funded_credit = 0.f;
+			}
+		}
+		if((escrow > 0.f || funded_credit > 0.f) && std::isfinite(escrow) && std::isfinite(funded_credit)) {
+			auto const market_money = state.world.market_get_stockpile(m, economy::money);
+			state.world.market_set_stockpile(m, economy::money, market_money + escrow + funded_credit);
+			auto const paid = pay_market_producers(state, m, producer_pay);
+			total_paid += double(paid);
+			total_unallocated += double(producer_pay - paid);
+		}
+		total_escrow += double(escrow);
+		total_value += double(producer_pay);
+		total_refund += double(refund);
+		total_shortfall += double(shortfall);
+	});
+	if(trace_household_clearing) {
+		auto const ymd = state.current_date.to_ymd(state.start_date);
+		fprintf(stderr,
+			"HOUSEHOLDCLEAR %04d-%02d-%02d escrow=%.6f cleared_value=%.6f producer_pay=%.6f "
+			"credit=%.6f paid=%.6f refund=%.6f shortfall=%.6f unallocated=%.6f "
+			"batch_quantity=%.6f batch_paid=%.6f batch_unmatched=%.6f\n",
+			ymd.year, ymd.month, ymd.day, total_escrow, total_value + total_shortfall, total_value,
+			total_credit, total_paid, total_refund, total_shortfall, total_unallocated,
+			total_batch_quantity, total_batch_paid, total_batch_unmatched);
+		fflush(stderr);
+	}
+}
+
+static std::vector<double> factory_input_escrow;
+static uint32_t factory_input_escrow_province_count = 0;
+static uint32_t factory_input_escrow_commodity_count = 0;
+
+static void ensure_factory_input_escrow_storage(sys::state const& state) {
+	auto const provinces = state.world.province_size();
+	auto const commodities = state.world.commodity_size();
+	if(factory_input_escrow_province_count != provinces || factory_input_escrow_commodity_count != commodities) {
+		factory_input_escrow_province_count = provinces;
+		factory_input_escrow_commodity_count = commodities;
+		factory_input_escrow.assign(size_t(provinces) * size_t(commodities), 0.0);
+	}
+}
+
+double factory_input_escrow_total() {
+	double total = 0.0;
+	for(auto const value : factory_input_escrow) {
+		if(std::isfinite(value))
+			total += value;
+	}
+	return total;
+}
+
+static void record_factory_input_escrow(
+	sys::state& state,
+	dcon::province_id province,
+	dcon::market_id market,
+	dcon::factory_id factory,
+	float input_cost
+) {
+	if(!factory_input_settlement_active() || is_presimulation_update())
+		return;
+	if(!(input_cost > 0.f) || !std::isfinite(input_cost))
+		return;
+	if(!province || !market)
+		return;
+	auto const commodity_count = size_t(state.world.commodity_size());
+	auto const base = size_t(province.index()) * commodity_count;
+	if(base + commodity_count > factory_input_escrow.size())
+		return;
+	auto const factory_type = state.world.factory_get_building_type(factory);
+	auto const& inputs = state.world.factory_type_get_inputs(factory_type);
+	double total_weight = 0.0;
+	uint32_t valid_inputs = 0;
+	for(uint32_t i = 0; i < economy::commodity_set::set_size; ++i) {
+		auto const commodity = inputs.commodity_type[i];
+		if(!commodity || commodity == economy::money)
+			continue;
+		++valid_inputs;
+		auto const amount = double(std::max(0.f, inputs.commodity_amounts[i]));
+		auto const price = double(std::max(0.f, state.world.market_get_price(market, commodity)));
+		if(std::isfinite(amount) && std::isfinite(price))
+			total_weight += amount * price;
+	}
+	if(valid_inputs == 0)
+		return;
+	for(uint32_t i = 0; i < economy::commodity_set::set_size; ++i) {
+		auto const commodity = inputs.commodity_type[i];
+		if(!commodity || commodity == economy::money)
+			continue;
+		auto const amount = double(std::max(0.f, inputs.commodity_amounts[i]));
+		auto const price = double(std::max(0.f, state.world.market_get_price(market, commodity)));
+		auto const weight = amount * price;
+		auto const share = total_weight > 0.0 ? weight / total_weight : 1.0 / double(valid_inputs);
+		if(!(share > 0.0) || !std::isfinite(share))
+			continue;
+		factory_input_escrow[base + size_t(commodity.index())] += double(input_cost) * share;
+	}
+}
+
+static void settle_factory_inputs(sys::state& state) {
+	if(!factory_input_settlement_active() || is_presimulation_update())
+		return;
+	ensure_factory_input_escrow_storage(state);
+	auto const commodity_count = size_t(state.world.commodity_size());
+	double total_escrow = 0.0;
+	double total_cleared_value = 0.0;
+	double total_payment = 0.0;
+	double total_paid = 0.0;
+	double total_refund = 0.0;
+	double total_batch_quantity = 0.0;
+	double total_unmatched = 0.0;
+	state.world.for_each_market([&](dcon::market_id market) {
+		auto const zone = state.world.market_get_zone_from_local_market(market);
+		if(!zone)
+			return;
+		for(size_t k = 1; k < commodity_count; ++k) {
+			dcon::commodity_id commodity{ dcon::commodity_id::value_base_t(k) };
+			double escrow = 0.0;
+			province::for_each_province_in_state_instance(state, zone, [&](dcon::province_id province) {
+				auto const idx = size_t(province.index()) * commodity_count + k;
+				if(idx < factory_input_escrow.size() && factory_input_escrow[idx] > 0.0 && std::isfinite(factory_input_escrow[idx]))
+					escrow += factory_input_escrow[idx];
+			});
+			if(!(escrow > 0.0) || !std::isfinite(escrow))
+				continue;
+			auto const demand = double(std::max(0.f, state.world.market_get_intermediate_demand(market, commodity)));
+			auto const probability = double(std::clamp(state.world.market_get_actual_probability_to_buy(market, commodity), 0.f, 1.f));
+			auto const price = double(std::max(0.f, state.world.market_get_price(market, commodity)));
+			auto const cleared_value = demand * probability * price;
+			if(!std::isfinite(cleared_value))
+				continue;
+			auto const payment = std::min(escrow, std::max(0.0, cleared_value));
+			seller_settlement_result settlement;
+			if(payment > 0.0)
+				settlement = settle_seller_supply_batches(state, market, commodity, payment);
+			auto const paid = std::min(payment, settlement.paid);
+			auto const refund = std::max(0.0, escrow - paid);
+			double remaining_refund = refund;
+			double remaining_escrow = escrow;
+			province::for_each_province_in_state_instance(state, zone, [&](dcon::province_id province) {
+				auto const idx = size_t(province.index()) * commodity_count + k;
+				if(idx >= factory_input_escrow.size())
+					return;
+				auto const contribution = std::max(0.0, factory_input_escrow[idx]);
+				factory_input_escrow[idx] = 0.0;
+				if(!(contribution > 0.0) || !(remaining_escrow > 0.0) || !(remaining_refund > 0.0))
+					return;
+				auto const credit = remaining_refund * contribution / remaining_escrow;
+				remaining_escrow = std::max(0.0, remaining_escrow - contribution);
+				remaining_refund = std::max(0.0, remaining_refund - credit);
+				auto const current = state.world.province_get_factory_bank(province);
+				auto const next = double(current) + credit;
+				if(std::isfinite(next))
+					state.world.province_set_factory_bank(province, float(next));
+			});
+			total_escrow += escrow;
+			total_cleared_value += cleared_value;
+			total_payment += payment;
+			total_paid += paid;
+			total_refund += refund;
+			total_batch_quantity += settlement.batch_quantity;
+			total_unmatched += settlement.unmatched;
+		}
+	});
+	if(trace_factory_input_settlement) {
+		auto const ymd = state.current_date.to_ymd(state.start_date);
+		fprintf(stderr,
+			"FACTORYCLEAR %04d-%02d-%02d escrow=%.6f cleared_value=%.6f payment=%.6f paid=%.6f "
+			"refund=%.6f batch_quantity=%.6f unmatched=%.6f\n",
+			ymd.year, ymd.month, ymd.day, total_escrow, total_cleared_value, total_payment, total_paid,
+			total_refund, total_batch_quantity, total_unmatched);
+		fflush(stderr);
+	}
+}
+
 dcon::province_id construction_get_location(const sys::state& state, dcon::province_land_construction_id con) {
 		return state.world.pop_get_province_from_pop_location( state.world.province_land_construction_get_pop(con));
 }
@@ -1593,7 +3235,212 @@ struct spending_cost {
 	float construction;
 	float other;
 	float total;
+	float army;
+	float navy;
+	float stockpile;
 };
+
+// ===== LOCAL FORK (not upstream) =====
+// Read-only S2 government cash trace. The helpers below run only when ALICE_TRACE_GOV_CASH is
+// enabled; they never write game state.
+static bool gov_cash_trace_active() {
+	return trace_gov_cash && !is_presimulation_update();
+}
+
+static void ensure_gov_cash_trace_size(sys::state& state) {
+	auto const nation_count = size_t(state.world.nation_size());
+	auto const market_count = size_t(state.world.market_size());
+	auto const commodity_count = size_t(state.world.commodity_size());
+	if(gov_budget_day.size() != nation_count) {
+		gov_budget_day.assign(nation_count, gov_budget_day_snapshot{});
+	}
+	if(gov_market_money_before.size() != market_count) {
+		gov_market_money_before.assign(market_count, 0.0);
+		gov_market_money_after.assign(market_count, 0.0);
+	}
+	if(gov_market_good_day.size() != market_count * commodity_count) {
+		gov_market_good_day.assign(market_count * commodity_count, gov_market_good_day_snapshot{});
+	}
+}
+
+static void trace_gov_cash_day_start(sys::state& state) {
+	if(!gov_cash_trace_active())
+		return;
+	ensure_gov_cash_trace_size(state);
+	std::fill(gov_budget_day.begin(), gov_budget_day.end(), gov_budget_day_snapshot{});
+	std::fill(gov_market_good_day.begin(), gov_market_good_day.end(), gov_market_good_day_snapshot{});
+	std::fill(gov_market_money_before.begin(), gov_market_money_before.end(), 0.0);
+	std::fill(gov_market_money_after.begin(), gov_market_money_after.end(), 0.0);
+}
+
+static void trace_gov_cash_money_before(sys::state& state) {
+	if(!gov_cash_trace_active())
+		return;
+	ensure_gov_cash_trace_size(state);
+	state.world.for_each_market([&](dcon::market_id m) {
+		if(size_t(m.index()) < gov_market_money_before.size()) {
+			gov_market_money_before[size_t(m.index())] = double(state.world.market_get_stockpile(m, economy::money));
+		}
+	});
+}
+
+static void trace_gov_cash_money_after(sys::state& state) {
+	if(!gov_cash_trace_active())
+		return;
+	ensure_gov_cash_trace_size(state);
+	state.world.for_each_market([&](dcon::market_id m) {
+		if(size_t(m.index()) < gov_market_money_after.size()) {
+			gov_market_money_after[size_t(m.index())] = double(state.world.market_get_stockpile(m, economy::money));
+		}
+	});
+}
+
+static void trace_gov_budget_snapshot(
+	sys::state& state,
+	dcon::nation_id n,
+	float base_budget,
+	spending_cost const& costs,
+	float spending_scale,
+	float required_funding,
+	float additional_funding,
+	float treasury_before_budget,
+	float treasury_after_budget_debit,
+	float treasury_after_financing
+) {
+	if(!gov_cash_trace_active() || size_t(n.index()) >= gov_budget_day.size())
+		return;
+	auto& out = gov_budget_day[size_t(n.index())];
+	out.base_budget = double(base_budget);
+	out.admin_est = double(costs.administration);
+	out.army_est = double(costs.army);
+	out.navy_est = double(costs.navy);
+	out.construction_est = double(costs.construction);
+	out.stockpile_est = double(costs.stockpile);
+	out.other_est = double(costs.other);
+	out.total_est = double(costs.total);
+	out.required_funding = double(required_funding);
+	out.additional_funding = double(additional_funding);
+	out.spending_scale = double(spending_scale);
+	out.budget_debit = double(std::max(0.f, treasury_before_budget - treasury_after_budget_debit));
+	out.treasury_after_interest = double(treasury_before_budget);
+	out.treasury_after_budget_debit = double(treasury_after_budget_debit);
+	out.treasury_after_financing = double(treasury_after_financing);
+	out.valid = true;
+}
+
+static void trace_gov_register_demand(
+	sys::state& state,
+	dcon::nation_id n,
+	dcon::market_id m,
+	dcon::commodity_id c,
+	float army_qty,
+	float navy_qty,
+	float construction_qty,
+	float stockpile_qty,
+	float total_scaled_qty,
+	float price,
+	float spending_scale
+) {
+	if(!gov_cash_trace_active())
+		return;
+	if(!(army_qty > 0.f || navy_qty > 0.f || construction_qty > 0.f
+		|| stockpile_qty > 0.f || total_scaled_qty > 0.f))
+		return;
+	ensure_gov_cash_trace_size(state);
+	auto const commodity_count = size_t(state.world.commodity_size());
+	auto const index = size_t(m.index()) * commodity_count + size_t(c.index());
+	if(index >= gov_market_good_day.size() || size_t(n.index()) >= gov_budget_day.size())
+		return;
+	auto& good = gov_market_good_day[index];
+	if(!good.valid) {
+		good.valid = true;
+		good.nation_index = uint32_t(n.index());
+	}
+	good.army_demand_qty = double(army_qty) * double(spending_scale);
+	good.navy_demand_qty = double(navy_qty) * double(spending_scale);
+	good.construction_demand_qty = double(construction_qty) * double(spending_scale);
+	good.stockpile_demand_qty = double(stockpile_qty) * double(spending_scale);
+	good.total_demand_qty = double(total_scaled_qty);
+	good.price = double(price);
+	good.spending_scale = double(spending_scale);
+	good.registered_value = double(total_scaled_qty) * double(price);
+	auto& nation = gov_budget_day[size_t(n.index())];
+	nation.demand_qty += double(total_scaled_qty);
+	nation.registered_value += double(total_scaled_qty) * double(price);
+	nation.valid = true;
+}
+
+static void trace_gov_refund_good(
+	sys::state& state,
+	dcon::nation_id n,
+	dcon::market_id m,
+	dcon::commodity_id c,
+	float combined_demand,
+	float price,
+	float spending_scale,
+	float sat,
+	float refund_nominal,
+	float delivered_qty
+) {
+	if(!gov_cash_trace_active())
+		return;
+	ensure_gov_cash_trace_size(state);
+	auto const commodity_count = size_t(state.world.commodity_size());
+	auto const index = size_t(m.index()) * commodity_count + size_t(c.index());
+	if(index >= gov_market_good_day.size() || size_t(n.index()) >= gov_budget_day.size())
+		return;
+	auto& good = gov_market_good_day[index];
+	if(!good.valid) {
+		good.valid = true;
+		good.nation_index = uint32_t(n.index());
+	}
+	good.price = double(price);
+	good.spending_scale = double(spending_scale);
+	good.sat = double(sat);
+	auto const requested_qty = double(combined_demand) * double(spending_scale) * double(sat);
+	auto const delivered_scale = requested_qty > 0.0
+		? std::clamp(double(delivered_qty) / requested_qty, 0.0, 1.0)
+		: 0.0;
+	good.total_bought_qty = double(delivered_qty);
+	good.army_bought_qty = good.army_demand_qty * double(sat) * delivered_scale;
+	good.navy_bought_qty = good.navy_demand_qty * double(sat) * delivered_scale;
+	good.construction_bought_qty = good.construction_demand_qty * double(sat) * delivered_scale;
+	good.stockpile_bought_qty = good.stockpile_demand_qty * double(sat) * delivered_scale;
+	good.stockpile_added_qty = good.total_bought_qty;
+	good.stockpile_added_value = good.total_bought_qty * double(price);
+	good.refund_nominal = double(refund_nominal);
+	auto& nation = gov_budget_day[size_t(n.index())];
+	nation.bought_qty += good.total_bought_qty;
+	nation.bought_value += good.stockpile_added_value;
+	nation.stockpile_added_qty += good.stockpile_added_qty;
+	nation.stockpile_added_value += good.stockpile_added_value;
+	nation.refund_goods_nominal += double(refund_nominal);
+	nation.valid = true;
+}
+
+static void trace_gov_refund_nation(
+	sys::state& state,
+	dcon::nation_id n,
+	float treasury_before_admin_refund,
+	float admin_refund,
+	float goods_refund_nominal,
+	float overseas_refund_nominal,
+	float total_refund_nominal,
+	float total_refund_paid,
+	float treasury_after_refund
+) {
+	if(!gov_cash_trace_active() || size_t(n.index()) >= gov_budget_day.size())
+		return;
+	auto& out = gov_budget_day[size_t(n.index())];
+	out.treasury_before_admin_refund = double(treasury_before_admin_refund);
+	out.admin_refund = double(admin_refund);
+	out.refund_goods_nominal = double(goods_refund_nominal);
+	out.refund_overseas_nominal = double(overseas_refund_nominal);
+	out.refund_total_nominal = double(total_refund_nominal);
+	out.refund_total_paid = double(total_refund_paid);
+	out.treasury_after_refund = double(treasury_after_refund);
+	out.valid = true;
+}
 
 spending_cost full_spending_cost(sys::state& state, dcon::nation_id n, float budget);
 // Sets army demand to be purchased to govt stockpiles.Will set the demand in states which is deemed the most likely to be able to satisfy the demand locally
@@ -1672,6 +3519,14 @@ static bool const weight_normalize = []() {
 	auto s = std::getenv("ALICE_EXP_WEIGHT_NORMALIZE");
 	return s && std::atoi(s) != 0;
 }();
+// LOCAL EXPERIMENT (ALICE_EXP_FIXED_NEED_WEIGHTS=1): keep the base need quantities as the
+// demand weights instead of drifting them with local price and availability. Budgets and
+// prices still decide how much is bought; this only removes the unstable weight feedback.
+// Default 0 keeps upstream behaviour.
+static bool const fixed_need_weights = []() {
+	auto s = std::getenv("ALICE_EXP_FIXED_NEED_WEIGHTS");
+	return (s && std::atoi(s) != 0) || level_price_package;
+}();
 static bool const demand_share = []() {
 	auto s = std::getenv("ALICE_EXP_DEMAND_SHARE");
 	return s && std::atoi(s) != 0;
@@ -1688,6 +3543,9 @@ static bool const demand_les = []() {
 	auto s = std::getenv("ALICE_EXP_DEMAND_LES");
 	return s && std::atoi(s) != 0;
 }();
+// LOCAL EXPERIMENT (ALICE_EXP_DEMAND_LES_ACTUAL=1): allocate life demand from actual
+// life-needs spending. Screened 1y seed 1234: GDP 280.8k vs 445.0k, demand 393.7 vs 724.5,
+// satisfaction 0.144 vs 0.277. Rejected standalone; income/settlement must be fixed first.
 static bool const demand_les_actual = []() {
 	auto s = std::getenv("ALICE_EXP_DEMAND_LES_ACTUAL");
 	return s && std::atoi(s) != 0;
@@ -1917,6 +3775,11 @@ void rebalance_needs_weights(sys::state& state) {
 			}
 			w_everyday = ve::max(ve::fp_vector{ 0.f }, ve::min(ve::fp_vector{ 1.f }, w_everyday + dw_everyday * 10.f * state.defines.alice_need_drift_speed));
 			w_luxury = ve::max(ve::fp_vector{ 0.f }, ve::min(ve::fp_vector{ 1.f }, w_luxury + dw_luxury * 10.f * state.defines.alice_need_drift_speed));
+			if(fixed_need_weights) {
+				w_life = ve::fp_vector{ 1.f };
+				w_everyday = ve::fp_vector{ 1.f };
+				w_luxury = ve::fp_vector{ 1.f };
+			}
 
 			state.world.market_set_life_needs_weights(market, c, w_life);
 			state.world.market_set_everyday_needs_weights(market, c, w_everyday);
@@ -3287,7 +5150,7 @@ void initialize(sys::state& state) {
 
 	province::ve_for_each_land_province(state, [&](auto ids) {
 		for(int32_t i = 0; i < labor::total; i++) {
-			state.world.province_set_labor_price(ids, i, 0.0001f);
+			state.world.province_set_labor_price(ids, i, initial_labor_price);
 		}
 	});
 
@@ -3792,6 +5655,9 @@ spending_cost full_spending_cost(sys::state& state, dcon::nation_id n, float bas
 		.construction = 0.f,
 		.other = 0.f,
 		.total = 0.f,
+		.army = 0.f,
+		.navy = 0.f,
+		.stockpile = 0.f,
 	};
 
 	float total = 0.0f;
@@ -3853,6 +5719,9 @@ spending_cost full_spending_cost(sys::state& state, dcon::nation_id n, float bas
 	//costs.construction = std::min(construction_budget, total_construction_costs);
 	//total += (std::min(land_budget, total_army_costs) + std::min(navy_budget, total_navy_costs) + costs.construction + std::min(stockpile_budget, total_stockpiling_costs));
 	costs.construction = total_construction_costs;
+	costs.army = total_army_costs;
+	costs.navy = total_navy_costs;
+	costs.stockpile = total_stockpiling_costs;
 	total += (total_army_costs + total_navy_costs + costs.construction + total_stockpiling_costs);
 
 	auto capital_state = state.world.province_get_state_membership(state.world.nation_get_capital(n));
@@ -4044,6 +5913,16 @@ void update_national_consumption(sys::state& state, dcon::nation_id n, float spe
 		for(uint32_t i = 1; i < total_commodities; ++i) {
 			dcon::commodity_id cid{ dcon::commodity_id::value_base_t(i) };
 			auto actual_stockpile_demand = economy::combined_government_stockpile_demand(state, market, cid);
+			trace_gov_register_demand(
+				state, n, market, cid,
+				state.world.market_get_army_demand(market, cid),
+				state.world.market_get_navy_demand(market, cid),
+				state.world.market_get_government_construction_demand(market, cid),
+				state.world.market_get_government_stockpile_demand(market, cid),
+				actual_stockpile_demand * spending_scale,
+				state.world.market_get_price(market, cid),
+				spending_scale
+			);
 			if(nan_watch && !std::isfinite(actual_stockpile_demand * spending_scale)) {
 				fprintf(stderr, "NANWATCH national_consumption nation=%u market=%u commodity=%u stockpile_demand=%g spending_scale=%g base_budget=%g\n",
 					n.index(), market.index(), cid.index(), actual_stockpile_demand, spending_scale, base_budget);
@@ -4694,7 +6573,507 @@ static double money_pool_total(sys::state& state) {
 		total += double(state.world.nation_get_treasury(n));
 		total += double(state.world.nation_get_national_bank(n));
 	});
+	total += government_purchase_escrow_total();
+	total += factory_input_escrow_total();
+	total += trade_credit_lender_balance();
 	return total;
+}
+// LOCAL TRACE (ALICE_TRACE_MONEY_LEDGER=1): wide pool definition used by the monthly MONEYAUDIT.
+// It adds producer, rent, dividend and private-investment pools so transfers are not mistaken for
+// money creation. Read-only; no economic effect.
+static double money_pool_total_wide(sys::state& state) {
+	double total = 0.0;
+	state.world.for_each_market([&](dcon::market_id m) {
+		total += double(state.world.market_get_stockpile(m, economy::money));
+		total += double(state.world.market_get_pop_investments(m));
+		total += double(state.world.market_get_pop_dividends(m));
+	});
+	state.world.for_each_pop([&](dcon::pop_id p) {
+		total += double(state.world.pop_get_savings(p));
+	});
+	state.world.for_each_nation([&](dcon::nation_id n) {
+		if(!state.world.nation_is_valid(n))
+			return;
+		total += double(state.world.nation_get_treasury(n));
+		total += double(state.world.nation_get_national_bank(n));
+		total += double(state.world.nation_get_private_investment(n));
+	});
+	state.world.for_each_province([&](dcon::province_id p) {
+		total += double(state.world.province_get_rgo_bank(p));
+		total += double(state.world.province_get_factory_bank(p));
+		total += double(state.world.province_get_artisan_bank(p));
+		for(int32_t i = 0; i < advanced_province_buildings::list::total; ++i)
+			total += double(state.world.province_get_advanced_province_building_private_savings(p, i));
+	});
+	total += government_purchase_escrow_total();
+	total += trade_credit_lender_balance();
+	return total;
+}
+
+// ===== LOCAL FORK (not upstream) =====
+// C0 observation only: snapshot every money pool and every commodity inventory at the day
+// boundary. The audit is deliberately aggregate at this stage; it is the reference against
+// which the later double-entry transaction kernel will be checked.
+static econ_money_snapshot econ_snapshot_money(sys::state& state) {
+	econ_money_snapshot s;
+	state.world.for_each_market([&](dcon::market_id m) {
+		s.market += double(state.world.market_get_stockpile(m, economy::money));
+		s.pop_investment += double(state.world.market_get_pop_investments(m));
+		s.pop_dividend += double(state.world.market_get_pop_dividends(m));
+	});
+	state.world.for_each_pop([&](dcon::pop_id p) {
+		s.savings += double(state.world.pop_get_savings(p));
+	});
+	state.world.for_each_nation([&](dcon::nation_id n) {
+		if(!state.world.nation_is_valid(n) || state.world.nation_get_owned_province_count(n) == 0)
+			return;
+		s.treasury += double(state.world.nation_get_treasury(n));
+		s.bank += double(state.world.nation_get_national_bank(n));
+		s.private_investment += double(state.world.nation_get_private_investment(n));
+	});
+	s.gov_escrow += government_purchase_escrow_total();
+	s.factory_input_escrow += factory_input_escrow_total();
+	s.trade_credit += trade_credit_total();
+	state.world.for_each_province([&](dcon::province_id p) {
+		s.rgo += double(state.world.province_get_rgo_bank(p));
+		s.factory += double(state.world.province_get_factory_bank(p));
+		s.artisan += double(state.world.province_get_artisan_bank(p));
+		for(int32_t i = 0; i < advanced_province_buildings::list::total; ++i)
+			s.rent += double(state.world.province_get_advanced_province_building_private_savings(p, i));
+	});
+	return s;
+}
+
+static void econ_closure_day_start(sys::state& state) {
+	if(!trace_econ_closure)
+		return;
+	econ_money_day_open = econ_money_last_close_valid ? econ_money_last_close : econ_snapshot_money(state);
+	econ_money_day_open_valid = true;
+	if(econ_goods_last_close.size() == size_t(state.world.commodity_size())) {
+		econ_goods_day_start = econ_goods_last_close;
+	} else {
+		econ_goods_day_start.assign(size_t(state.world.commodity_size()), 0.0);
+		state.world.for_each_market([&](dcon::market_id m) {
+			state.world.for_each_commodity([&](dcon::commodity_id c) {
+				if(c != economy::money)
+					econ_goods_day_start[size_t(c.index())] += double(state.world.market_get_stockpile(m, c));
+			});
+		});
+	}
+	econ_market_day.assign(size_t(state.world.market_size()), market_flow_snapshot{});
+	econ_market_good_day.assign(
+		size_t(state.world.market_size()) * size_t(state.world.commodity_size()),
+		econ_market_good_snapshot{});
+}
+
+static void econ_closure_day_end(sys::state& state) {
+	if(!trace_econ_closure || !econ_money_day_open_valid)
+		return;
+	auto const close = econ_snapshot_money(state);
+	auto const ymd = state.current_date.to_ymd(state.start_date);
+
+	double market_flow_delta = 0.0;
+	double market_expected = 0.0;
+	double market_payout = 0.0;
+	double market_sales = 0.0;
+	double market_buyer = 0.0;
+	double market_purchases = 0.0;
+	double market_imports = 0.0;
+	double market_exports = 0.0;
+	double market_gov_receipt = 0.0;
+	for(auto const& f : econ_market_day) {
+		// The market-flow snapshot is taken before the government settlement stage. That stage
+		// credits merchant receipts to the market money pool afterwards, so include it here once.
+		market_flow_delta += double(f.money_after) - double(f.money_before) + double(f.gov_receipt);
+		market_sales += double(f.sales);
+		market_buyer += double(f.buyer_payment);
+		market_purchases += double(f.purchases);
+		market_imports += double(f.imports);
+		market_exports += double(f.exports);
+		market_payout += double(f.payout);
+		market_gov_receipt += double(f.gov_receipt);
+		auto const receipts = economy::pops::buyer_escrow_enabled() ? double(f.buyer_payment) : double(f.sales);
+		market_expected += double(f.arb_pos) - double(f.arb_neg) + double(f.exports)
+			+ double(f.investments) + double(f.unused_dividends) + receipts + double(f.refund)
+			+ double(f.gov_receipt)
+			- double(f.imports) - double(f.purchases) - double(f.dividends)
+			- double(f.ship_build) - double(f.ship_maint);
+	}
+
+	auto const total_delta = close.total() - econ_money_day_open.total();
+	auto const market_pool_delta = close.market - econ_money_day_open.market;
+	auto const market_pool_residual = market_pool_delta + market_payout - market_flow_delta;
+	auto const market_flow_residual = market_flow_delta - market_expected;
+	auto const outside_market_delta = total_delta - market_pool_delta;
+	auto const unbacked_sales = market_sales - market_buyer;
+
+	fprintf(stderr,
+		"ECONMONEY %04d-%02d-%02d total_open=%.6f total_close=%.6f total_delta=%.6f "
+		"market=%.6f savings=%.6f treasury=%.6f bank=%.6f escrow=%.6f rgo=%.6f factory=%.6f artisan=%.6f "
+		"rent=%.6f private=%.6f popinv=%.6f popdiv=%.6f outside_market_delta=%.6f\n",
+		ymd.year, ymd.month, ymd.day,
+		econ_money_day_open.total(), close.total(), total_delta,
+		close.market - econ_money_day_open.market,
+		close.savings - econ_money_day_open.savings,
+		close.treasury - econ_money_day_open.treasury,
+		close.bank - econ_money_day_open.bank,
+		close.gov_escrow - econ_money_day_open.gov_escrow,
+		close.rgo - econ_money_day_open.rgo,
+		close.factory - econ_money_day_open.factory,
+		close.artisan - econ_money_day_open.artisan,
+		close.rent - econ_money_day_open.rent,
+		close.private_investment - econ_money_day_open.private_investment,
+		close.pop_investment - econ_money_day_open.pop_investment,
+		close.pop_dividend - econ_money_day_open.pop_dividend,
+		outside_market_delta);
+	fprintf(stderr,
+		"ECONMARKET %04d-%02d-%02d pool_delta=%.6f flow_delta=%.6f flow_residual=%.6f "
+		"pool_residual=%.6f unbacked_sales=%.6f sales=%.6f buyer=%.6f purchases=%.6f "
+		"imports=%.6f exports=%.6f payout=%.6f gov_receipt=%.6f\n",
+		ymd.year, ymd.month, ymd.day, market_pool_delta, market_flow_delta,
+		market_flow_residual, market_pool_residual, unbacked_sales, market_sales,
+		market_buyer, market_purchases, market_imports, market_exports, market_payout,
+		market_gov_receipt);
+
+	double stock_start = 0.0;
+	double stock_end = 0.0;
+	double production = 0.0;
+	double sold_from_stock = 0.0;
+	double unsold_direct = 0.0;
+	double imports = 0.0;
+	double exports = 0.0;
+	double consumption = 0.0;
+	double spoilage = 0.0;
+		// Legacy diagnostic value: it compares previous-close stock with the recorded import/export
+		// buffers. Under upstream trade accounting, exported units are not removed from the origin
+		// stockpile, so this value is dominated by recorded exports and is not a clearing leak.
+		// Use ECONSHADOWSTOCK for the clearing identity and ECONSHADOWSTOCKPOSTTOP for the trade gap.
+		double goods_residual = 0.0;
+	std::vector<double> goods_end(econ_goods_day_start.size(), 0.0);
+	std::vector<std::pair<double, dcon::commodity_id>> top_residual;
+	for(uint32_t i = 1; i < state.world.commodity_size() && i < econ_goods_day_start.size(); ++i) {
+		dcon::commodity_id c{ dcon::commodity_id::value_base_t(int(i)) };
+		double const start = econ_goods_day_start[i];
+		double end = 0.0;
+		double sold = 0.0;
+		double unsold = 0.0;
+		double direct_production = 0.0;
+		double imp = 0.0;
+		double exp = 0.0;
+		double cons = 0.0;
+		state.world.for_each_market([&](dcon::market_id m) {
+			end += double(state.world.market_get_stockpile(m, c));
+			auto const supply = double(state.world.market_get_supply(m, c));
+			auto const merchants = double(state.world.market_get_stockpile_sales(m, c));
+			auto const direct = std::max(0.0, supply - merchants);
+			direct_production += direct;
+			auto const p_sell = std::clamp(double(state.world.market_get_actual_probability_to_sell(m, c)), 0.0, 1.0);
+			sold += merchants * p_sell;
+			unsold += direct * (1.0 - p_sell);
+			imp += double(state.world.market_get_import(m, c));
+			exp += double(state.world.market_get_export(m, c));
+			cons += double(state.world.market_get_consumption(m, c));
+		});
+		auto const daily_loss = double(daily_spoilage());
+		auto const pre_spoil_factor = std::max(1e-12, 1.0 - daily_loss);
+		auto const pre_spoil_end = end / pre_spoil_factor;
+		auto const spoil = pre_spoil_end - end;
+		auto const residual = pre_spoil_end - (start - sold + unsold + imp - exp);
+		stock_start += start;
+		stock_end += end;
+		goods_end[i] = end;
+		production += direct_production;
+		sold_from_stock += sold;
+		unsold_direct += unsold;
+		imports += imp;
+		exports += exp;
+		consumption += cons;
+		spoilage += spoil;
+		goods_residual += residual;
+		if(std::abs(residual) > 1.0)
+			top_residual.emplace_back(residual, c);
+	}
+	fprintf(stderr,
+		"ECONGOODS %04d-%02d-%02d stock_open=%.6f stock_close=%.6f stock_delta=%.6f "
+		"production=%.6f sold_stock=%.6f unsold_direct=%.6f imports=%.6f exports=%.6f "
+		"consumption=%.6f spoilage=%.6f residual=%.6f\n",
+		ymd.year, ymd.month, ymd.day, stock_start, stock_end, stock_end - stock_start,
+		production, sold_from_stock, unsold_direct, imports, exports, consumption,
+		spoilage, goods_residual);
+	if(!top_residual.empty()) {
+		std::sort(top_residual.begin(), top_residual.end(), [](auto const& a, auto const& b) {
+			return std::abs(a.first) > std::abs(b.first);
+		});
+		fprintf(stderr, "ECONGOODTOP %04d-%02d-%02d", ymd.year, ymd.month, ymd.day);
+		for(size_t k = 0; k < top_residual.size() && k < 3; ++k) {
+			auto const name = text::produce_simple_string(state, state.world.commodity_get_name(top_residual[k].second));
+			fprintf(stderr, " %s=%.6f", name.c_str(), top_residual[k].first);
+		}
+		fprintf(stderr, "\n");
+	}
+
+	// LOCAL TRACE: compare the canonical cleared quantity with the quantity the market
+	// recorded as sold. This is the transaction-level version of the shadow summary below.
+	// It is read-only and only runs when ALICE_TRACE_ECON_CLOSURE is enabled.
+	{
+		double supply_qty = 0.0;
+		double merchant_qty = 0.0;
+		double cleared_qty = 0.0;
+		double sold_qty = 0.0;
+		double merchant_sold_qty = 0.0;
+		double direct_sold_qty = 0.0;
+		double direct_unsold_qty = 0.0;
+		double cleared_value = 0.0;
+		double sales_value = 0.0;
+		double merchant_sold_value = 0.0;
+		double direct_sold_value = 0.0;
+		double seller_gap_qty = 0.0;
+		double seller_value_gap = 0.0;
+		struct transaction_gap {
+			double value_gap = 0.0;
+			dcon::market_id market{};
+			dcon::commodity_id commodity{};
+		};
+		std::vector<transaction_gap> top_gaps;
+		auto const commodity_stride = size_t(state.world.commodity_size());
+		state.world.for_each_market([&](dcon::market_id m) {
+			state.world.for_each_commodity([&](dcon::commodity_id c) {
+				if(c == economy::money)
+					return;
+				auto const idx = size_t(m.index()) * commodity_stride + size_t(c.index());
+				if(idx >= econ_market_good_day.size())
+					return;
+				auto const& row = econ_market_good_day[idx];
+				if(!(row.price > 0.f) || !std::isfinite(row.sold_qty) || !std::isfinite(row.cleared_qty)
+					|| !std::isfinite(row.supply_qty) || !std::isfinite(row.merchant_qty)
+					|| !std::isfinite(row.sales_value) || !std::isfinite(row.price))
+					return;
+				auto const row_cleared_value = double(row.cleared_qty) * double(row.price);
+				auto const row_sales_value = double(row.sales_value);
+				auto const row_value_gap = row_cleared_value - row_sales_value;
+				auto const row_merchant_sold = double(row.merchant_sold_qty);
+				auto const row_direct_sold = double(row.direct_sold_qty);
+				auto const row_price = double(row.price);
+				supply_qty += double(row.supply_qty);
+				merchant_qty += double(row.merchant_qty);
+				cleared_qty += double(row.cleared_qty);
+				sold_qty += double(row.sold_qty);
+				merchant_sold_qty += row_merchant_sold;
+				direct_sold_qty += row_direct_sold;
+				direct_unsold_qty += double(row.direct_unsold_qty);
+				cleared_value += row_cleared_value;
+				sales_value += row_sales_value;
+				merchant_sold_value += row_merchant_sold * row_price;
+				direct_sold_value += row_direct_sold * row_price;
+				seller_gap_qty += double(row.cleared_qty) - row_merchant_sold - row_direct_sold;
+				seller_value_gap += (double(row.cleared_qty) - row_merchant_sold - row_direct_sold) * row_price;
+				if(std::abs(row_value_gap) > 1.0)
+					top_gaps.push_back({ row_value_gap, m, c });
+			});
+		});
+		fprintf(stderr,
+			"ECONSHADOWGOODS %04d-%02d-%02d supply_qty=%.6f merchant_qty=%.6f "
+			"cleared_qty=%.6f sold_qty=%.6f merchant_sold_qty=%.6f direct_sold_qty=%.6f "
+			"direct_unsold_qty=%.6f cleared_value=%.6f sales_value=%.6f "
+			"merchant_sold_value=%.6f direct_sold_value=%.6f "
+			"qty_gap=%.6f value_gap=%.6f seller_gap_qty=%.6f seller_value_gap=%.6f\n",
+			ymd.year, ymd.month, ymd.day, supply_qty, merchant_qty, cleared_qty, sold_qty,
+			merchant_sold_qty, direct_sold_qty, direct_unsold_qty, cleared_value, sales_value,
+			merchant_sold_value, direct_sold_value, cleared_qty - sold_qty,
+			cleared_value - sales_value, seller_gap_qty, seller_value_gap);
+		if(!top_gaps.empty()) {
+			std::sort(top_gaps.begin(), top_gaps.end(), [](auto const& a, auto const& b) {
+				return std::abs(a.value_gap) > std::abs(b.value_gap);
+			});
+			fprintf(stderr, "ECONSHADOWTOP %04d-%02d-%02d", ymd.year, ymd.month, ymd.day);
+			for(size_t k = 0; k < top_gaps.size() && k < 3; ++k) {
+				auto const name = text::produce_simple_string(state, state.world.commodity_get_name(top_gaps[k].commodity));
+				fprintf(stderr, " %d:%s=%.6f", int(top_gaps[k].market.index()), name.c_str(), top_gaps[k].value_gap);
+			}
+			fprintf(stderr, "\n");
+		}
+	}
+
+	// LOCAL TRACE: split the stock identity into the part the clearing pass actually changes and
+	// the part that arrives from the day boundary (imports/exports and any other stock transfer).
+	// The old ECONGOODS formula mixed a previous-close stock with a post-import clearing stock, so
+	// it could not distinguish a real inventory leak from a trace timing error.
+	{
+		double stock_before_clear_qty = 0.0;
+		double stock_after_clear_qty = 0.0;
+		double spoiled_qty = 0.0;
+		double clearing_stock_gap = 0.0;
+		double post_clear_stock_gap = 0.0;
+		struct stock_gap {
+			double gap = 0.0;
+			dcon::market_id market{};
+			dcon::commodity_id commodity{};
+		};
+		std::vector<stock_gap> top_stock_gaps;
+		std::vector<stock_gap> top_post_clear_gaps;
+		auto const commodity_stride = size_t(state.world.commodity_size());
+		state.world.for_each_market([&](dcon::market_id m) {
+			state.world.for_each_commodity([&](dcon::commodity_id c) {
+				if(c == economy::money)
+					return;
+				auto const idx = size_t(m.index()) * commodity_stride + size_t(c.index());
+				if(idx >= econ_market_good_day.size())
+					return;
+				auto const& row = econ_market_good_day[idx];
+				if(!std::isfinite(row.stock_before_clear) || !std::isfinite(row.stock_after_clear)
+					|| !std::isfinite(row.spoiled_qty) || !std::isfinite(row.merchant_sold_qty)
+					|| !std::isfinite(row.direct_unsold_qty))
+					return;
+				auto const actual_pre_spoil = double(row.stock_after_clear) + double(row.spoiled_qty);
+				auto const expected_pre_spoil = double(row.stock_before_clear)
+					- double(row.merchant_sold_qty) + double(row.direct_unsold_qty);
+				auto const gap = actual_pre_spoil - expected_pre_spoil;
+				auto const post_clear_gap = double(state.world.market_get_stockpile(m, c)) - double(row.stock_after_clear);
+				stock_before_clear_qty += double(row.stock_before_clear);
+				stock_after_clear_qty += double(row.stock_after_clear);
+				spoiled_qty += double(row.spoiled_qty);
+				clearing_stock_gap += gap;
+				post_clear_stock_gap += post_clear_gap;
+				if(std::abs(gap) > 1.0)
+					top_stock_gaps.push_back({ gap, m, c });
+				if(std::abs(post_clear_gap) > 1.0)
+					top_post_clear_gaps.push_back({ post_clear_gap, m, c });
+			});
+		});
+		auto const open_to_clear_gap = stock_before_clear_qty - stock_start - imports + exports;
+		fprintf(stderr,
+			"ECONSHADOWSTOCK %04d-%02d-%02d stock_open=%.6f stock_before_clear=%.6f "
+			"stock_after_clear=%.6f stock_close=%.6f spoiled=%.6f clearing_gap=%.6f "
+			"open_to_clear_gap=%.6f post_clear_gap=%.6f\n",
+			ymd.year, ymd.month, ymd.day, stock_start, stock_before_clear_qty,
+			stock_after_clear_qty, stock_after_clear_qty + post_clear_stock_gap, spoiled_qty,
+			clearing_stock_gap, open_to_clear_gap, post_clear_stock_gap);
+		if(!top_stock_gaps.empty()) {
+			std::sort(top_stock_gaps.begin(), top_stock_gaps.end(), [](auto const& a, auto const& b) {
+				return std::abs(a.gap) > std::abs(b.gap);
+			});
+			fprintf(stderr, "ECONSHADOWSTOCKTOP %04d-%02d-%02d", ymd.year, ymd.month, ymd.day);
+			for(size_t k = 0; k < top_stock_gaps.size() && k < 3; ++k) {
+				auto const name = text::produce_simple_string(state, state.world.commodity_get_name(top_stock_gaps[k].commodity));
+				fprintf(stderr, " %d:%s=%.6f", int(top_stock_gaps[k].market.index()), name.c_str(), top_stock_gaps[k].gap);
+			}
+			fprintf(stderr, "\n");
+		}
+		if(!top_post_clear_gaps.empty()) {
+			std::sort(top_post_clear_gaps.begin(), top_post_clear_gaps.end(), [](auto const& a, auto const& b) {
+				return std::abs(a.gap) > std::abs(b.gap);
+			});
+			fprintf(stderr, "ECONSHADOWSTOCKPOSTTOP %04d-%02d-%02d", ymd.year, ymd.month, ymd.day);
+			for(size_t k = 0; k < top_post_clear_gaps.size() && k < 3; ++k) {
+				auto const name = text::produce_simple_string(state, state.world.commodity_get_name(top_post_clear_gaps[k].commodity));
+				fprintf(stderr, " %d:%s=%.6f", int(top_post_clear_gaps[k].market.index()), name.c_str(), top_post_clear_gaps[k].gap);
+			}
+			fprintf(stderr, "\n");
+		}
+	}
+
+	// LOCAL TRACE: one-day shadow transaction summary. It reconstructs the buyer value by
+	// category and compares it with the cash that the settlement pass actually received, plus
+	// the producer payout recorded by the same pass. No economic state is written here.
+	{
+		double demand_qty = 0.0;
+		double cleared_qty = 0.0;
+		double bought_qty = 0.0;
+		double demand_value = 0.0;
+		double cleared_value = 0.0;
+		double bought_value = 0.0;
+		double untagged_value = 0.0;
+		double army_value = 0.0;
+		double navy_value = 0.0;
+		double gov_construction_value = 0.0;
+		double gov_stockpile_value = 0.0;
+		double private_construction_value = 0.0;
+		double intermediate_value = 0.0;
+		double trade_value = 0.0;
+		double category_sum_value = 0.0;
+		double residual_value = 0.0;
+		double over_tagged_qty = 0.0;
+		state.world.for_each_market([&](dcon::market_id m) {
+			auto const sid = state.world.market_get_zone_from_local_market(m);
+			auto const owner = state.world.state_instance_get_nation_from_state_ownership(sid);
+			auto const private_scale = owner
+				? double(state.world.nation_get_private_investment_effective_fraction(owner)) : 1.0;
+			state.world.for_each_commodity([&](dcon::commodity_id c) {
+				if(c == economy::money)
+					return;
+				auto const price = double(state.world.market_get_price(m, c));
+				auto const probability = std::clamp(double(state.world.market_get_actual_probability_to_buy(m, c)), 0.0, 1.0);
+				auto const demand = double(state.world.market_get_demand(m, c));
+				if(!std::isfinite(price) || !std::isfinite(probability) || !std::isfinite(demand) || price <= 0.0 || demand <= 0.0)
+					return;
+				auto const army = double(state.world.market_get_army_demand(m, c));
+				auto const navy = double(state.world.market_get_navy_demand(m, c));
+				auto const gov_construction = double(state.world.market_get_government_construction_demand(m, c));
+				auto const gov_stockpile = double(state.world.market_get_government_stockpile_demand(m, c));
+				auto const private_construction = double(state.world.market_get_private_construction_demand(m, c)) * private_scale;
+				auto const intermediate = double(state.world.market_get_intermediate_demand(m, c));
+				auto const trade = double(economy::trade_demand(state, m, c));
+				auto const tagged = army + navy + gov_construction + gov_stockpile + private_construction + intermediate + trade;
+				auto const untagged = std::max(0.0, demand - tagged);
+				auto const over_tagged = std::max(0.0, tagged - demand);
+				auto const cleared = double(state.world.market_get_consumption(m, c));
+				auto const cleared_share = demand > 0.0 ? cleared / demand : 0.0;
+				auto const value = demand * price;
+				auto const bought = value * probability;
+				demand_qty += demand;
+				cleared_qty += cleared;
+				bought_qty += demand * probability;
+				demand_value += value;
+				cleared_value += cleared * price;
+				bought_value += bought;
+				untagged_value += untagged * price * cleared_share;
+				army_value += army * price * cleared_share;
+				navy_value += navy * price * cleared_share;
+				gov_construction_value += gov_construction * price * cleared_share;
+				gov_stockpile_value += gov_stockpile * price * cleared_share;
+				private_construction_value += private_construction * price * cleared_share;
+				intermediate_value += intermediate * price * cleared_share;
+				trade_value += trade * price * cleared_share;
+				over_tagged_qty += over_tagged;
+			});
+		});
+		category_sum_value = untagged_value + army_value + navy_value + gov_construction_value
+			+ gov_stockpile_value + private_construction_value + intermediate_value + trade_value;
+		residual_value = cleared_value - category_sum_value;
+		double sales_value = 0.0;
+		double buyer_escrow = 0.0;
+		double seller_payout = 0.0;
+		for(auto const& f : econ_market_day) {
+			sales_value += double(f.sales);
+			buyer_escrow += double(f.buyer_payment);
+			seller_payout += double(f.payout);
+		}
+		double household_cash = 0.0;
+		state.world.for_each_market([&](dcon::market_id m) {
+			household_cash += double(economy::pops::market_consumption_spending(m));
+		});
+		fprintf(stderr,
+			"ECONSHADOW %04d-%02d-%02d demand_qty=%.6f cleared_qty=%.6f bought_qty=%.6f "
+			"demand_value=%.6f cleared_value=%.6f bought_value=%.6f "
+			"sales_value=%.6f household_cash=%.6f buyer_escrow=%.6f seller_payout=%.6f "
+			"untagged_value=%.6f army_value=%.6f navy_value=%.6f govcon_value=%.6f govstock_value=%.6f "
+			"privatecon_value=%.6f intermediate_value=%.6f trade_value=%.6f "
+			"category_sum_value=%.6f residual_value=%.6f over_tagged_qty=%.6f\n",
+			ymd.year, ymd.month, ymd.day, demand_qty, cleared_qty, bought_qty,
+			demand_value, cleared_value, bought_value,
+			sales_value, household_cash, buyer_escrow, seller_payout,
+			untagged_value, army_value, navy_value, gov_construction_value, gov_stockpile_value,
+			private_construction_value, intermediate_value, trade_value, category_sum_value,
+			residual_value, over_tagged_qty);
+	}
+	fflush(stderr);
+
+	std::fill(econ_market_day.begin(), econ_market_day.end(), market_flow_snapshot{});
+	econ_goods_day_start.clear();
+	econ_money_last_close = close;
+	econ_money_last_close_valid = true;
+	econ_goods_last_close = std::move(goods_end);
+	econ_money_day_open_valid = false;
 }
 // LOCAL TRACE (ALICE_TRACE_WAGE_CONSERVATION=1): compare the wage credits paid to pops with the
 // wage debits taken from producer banks on the same day.
@@ -4732,32 +7111,39 @@ static void money_ledger_mark(sys::state& state, char const* tag) {
 	if(!money_ledger_trace)
 		return;
 	static double prev = 0.0;
+	static double prev_wide = 0.0;
 	static bool has_prev = false;
 	auto const now = money_pool_total(state);
+	auto const now_wide = money_pool_total_wide(state);
 	if(!has_prev) {
 		has_prev = true;
 		prev = now;
+		prev_wide = now_wide;
 		return;
 	}
 	auto const delta = now - prev;
+	auto const delta_wide = now_wide - prev_wide;
 	auto const ymd = state.current_date.to_ymd(state.start_date);
 	static int32_t prev_day_key = -1;
 	static double day_open = 0.0;
+	static double day_open_wide = 0.0;
 	int32_t const day_key = int32_t(ymd.year) * 10000 + int32_t(ymd.month) * 100 + int32_t(ymd.day);
 	if(prev_day_key >= 0 && day_key != prev_day_key) {
-		fprintf(stderr, "MONEYDAY %04d-%02d-%02d net=%+.6f close=%.6f\n",
-			ymd.year, ymd.month, ymd.day, now - day_open, now);
+		fprintf(stderr, "MONEYDAY %04d-%02d-%02d net=%+.6f close=%.6f wide=%+.6f wide_close=%.6f\n",
+			ymd.year, ymd.month, ymd.day, now - day_open, now, now_wide - day_open_wide, now_wide);
 		fflush(stderr);
 	}
 	if(day_key != prev_day_key) {
 		prev_day_key = day_key;
 		day_open = now;
+		day_open_wide = now_wide;
 	}
-	if(std::abs(delta) > 1.0) {
-		fprintf(stderr, "MONEYLEDGER %04d-%02d-%02d %-34s total=%.6f delta=%+.6f\n",
-			ymd.year, ymd.month, ymd.day, tag, now, delta);
+	if(std::abs(delta) > 1.0 || std::abs(delta_wide) > 1.0) {
+		fprintf(stderr, "MONEYLEDGER %04d-%02d-%02d %-34s total=%.6f delta=%+.6f wide=%.6f delta_wide=%+.6f\n",
+			ymd.year, ymd.month, ymd.day, tag, now, delta, now_wide, delta_wide);
 	}
 	prev = now;
+	prev_wide = now_wide;
 }
 
 static void set_profile_point(sys::state& state, std::string name) {
@@ -4886,11 +7272,22 @@ void decay_government_stockpiles(sys::state& state) {
 }
 
 void daily_update(sys::state& state, bool presimulation, float presimulation_stage, int date_offset) {
+	presimulation_update_active = presimulation;
+	if(gov_purchase_settlement && !presimulation) {
+		auto const nation_count = size_t(state.world.nation_size());
+		if(gov_purchase_escrow.size() != nation_count)
+			gov_purchase_escrow.assign(nation_count, 0.0);
+		else
+			std::fill(gov_purchase_escrow.begin(), gov_purchase_escrow.end(), 0.0);
+	}
+	trace_gov_cash_day_start(state);
 	sanity_check(state);
 
 	wage_credit_day = 0.0;
 	wage_debit_day = 0.0;
 	wage_actual_day = 0.0;
+	if(trace_econ_closure && (!presimulation || trace_econ_closure_presim))
+		econ_closure_day_start(state);
 
 	set_profile_point(state, "start");
 
@@ -5007,7 +7404,21 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 		}
 	});
 
+	// LOCAL EXPERIMENT (ALICE_EXP_FUNDED_SUBSIDY=1): pay the per-unit production subsidy out of the
+	// national treasury instead of minting it. Today the three payout sites below add
+	// `last_token_price * effective_output` to a sector bank with no debit anywhere (M5 S11: 38
+	// sector-bank writes, none reads the treasury), so the subsidy budget is money creation. The
+	// rolling effect is a closed loop: nominal budget -> token price -> new money -> prices ->
+	// nominal budget. This makes each payment draw on an actual source, capped by what the treasury
+	// holds, which is an accounting constraint rather than a policy cap. Default 0 keeps upstream.
+	static bool const funded_subsidy = []() {
+		auto s = std::getenv("ALICE_EXP_FUNDED_SUBSIDY");
+		return s && std::atoi(s) != 0;
+	}();
+
 	/*
+
+
 
 	Subsidy tokens are  granted per effective produced unit to encourage actual production rather than raw employment or size.
 	Here we calculate their amount and pay them out immediately.
@@ -5033,7 +7444,13 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 
 				auto current_money = state.world.province_get_factory_bank(province);
 				auto last_token_price = state.world.nation_get_subsidy_token_price(nation);
-				state.world.province_set_factory_bank(province, current_money + last_token_price * effective_output);
+				auto subsidy_pay = last_token_price * effective_output;
+				if(funded_subsidy) {
+					auto const treasury_now = state.world.nation_get_treasury(nation);
+					subsidy_pay = std::min(subsidy_pay, std::max(0.f, treasury_now));
+					state.world.nation_set_treasury(nation, treasury_now - subsidy_pay);
+				}
+				state.world.province_set_factory_bank(province, current_money + subsidy_pay);
 			}
 		});
 	});
@@ -5055,7 +7472,13 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 
 				auto current_money = state.world.province_get_rgo_bank(province);
 				auto last_token_price = state.world.nation_get_subsidy_token_price(nation);
-				state.world.province_set_rgo_bank(province, current_money + last_token_price * effective_output);
+				auto subsidy_pay = last_token_price * effective_output;
+				if(funded_subsidy) {
+					auto const treasury_now = state.world.nation_get_treasury(nation);
+					subsidy_pay = std::min(subsidy_pay, std::max(0.f, treasury_now));
+					state.world.nation_set_treasury(nation, treasury_now - subsidy_pay);
+				}
+				state.world.province_set_rgo_bank(province, current_money + subsidy_pay);
 			}
 		});
 	});
@@ -5075,7 +7498,13 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 
 				auto current_money = state.world.province_get_artisan_bank(province);
 				auto last_token_price = state.world.nation_get_subsidy_token_price(nation);
-				state.world.province_set_artisan_bank(province, current_money + last_token_price * effective_output);
+				auto subsidy_pay = last_token_price * effective_output;
+				if(funded_subsidy) {
+					auto const treasury_now = state.world.nation_get_treasury(nation);
+					subsidy_pay = std::min(subsidy_pay, std::max(0.f, treasury_now));
+					state.world.nation_set_treasury(nation, treasury_now - subsidy_pay);
+				}
+				state.world.province_set_artisan_bank(province, current_money + subsidy_pay);
 			}
 		});
 	});
@@ -5369,6 +7798,7 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 		coastal_capital_buffer,
 		state_naval_trade_is_blockaded
 	);
+	dump_trade_probe_trace(state, state.current_date.to_ymd(state.start_date));
 
 	set_profile_point(state, "trade volume");
 
@@ -5859,7 +8289,8 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 
 			// interest is paid and we are not bankrupt,
 			// now we can assume that money stockpile is equal to BASE_BUDGET
-			auto base_budget = state.world.nation_get_treasury(n);
+			auto const treasury_after_interest = state.world.nation_get_treasury(n);
+			auto base_budget = treasury_after_interest;
 			auto additional_funding = 0.f;
 			auto costs = full_spending_cost(state, n, base_budget);
 			auto admin = costs.administration;
@@ -5890,11 +8321,22 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 			assert(std::isfinite(spending_scale));
 
 			// spend money
-			state.world.nation_set_treasury(
-				n, base_budget - std::min(base_budget, (costs.total - admin) * spending_scale + admin)
-			);
+			auto const budget_debit = std::min(base_budget, (costs.total - admin) * spending_scale + admin);
+			state.world.nation_set_treasury(n, base_budget - budget_debit);
 			state.world.nation_set_spending_level(n, spending_scale);
 			state.world.nation_set_last_base_budget(n, base_budget);
+			if(gov_purchase_settlement && !is_presimulation_update()) {
+				if(gov_purchase_escrow.size() <= size_t(n.index()))
+					gov_purchase_escrow.resize(size_t(n.index()) + 1, 0.0);
+				auto const goods_cost = costs.army + costs.navy + costs.construction + costs.stockpile;
+				auto const goods_after_admin = std::max(0.f, budget_debit - admin);
+				auto const goods_budget = std::min(goods_cost * spending_scale, goods_after_admin);
+					if(std::isfinite(goods_budget)) {
+						gov_purchase_escrow[size_t(n.index())] = double(goods_budget);
+						if(gov_cash_trace_active() && size_t(n.index()) < gov_budget_day.size())
+							gov_budget_day[size_t(n.index())].gov_purchase_reserved = double(goods_budget);
+					}
+			}
 
 			
 
@@ -5914,6 +8356,10 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 				// we do not increase national bank
 				// because it stores the sum of loaned money and money available for a loan
 			}
+			trace_gov_budget_snapshot(
+				state, n, base_budget, costs, spending_scale, required_additional_funding,
+				additional_funding, treasury_after_interest, base_budget - budget_debit,
+				state.world.nation_get_treasury(n));
 
 			spent_on_construction_buffer.set(n, spending_scale * costs.construction);
 
@@ -6018,7 +8464,10 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 	auto const trace_ymd = state.current_date.to_ymd(state.start_date);
 	if(trace_market_flow && market_flow_snap.size() < size_t(state.world.market_size()))
 		market_flow_snap.assign(size_t(state.world.market_size()), market_flow_snapshot{});
+	if(trace_econ_closure && econ_market_day.size() < size_t(state.world.market_size()))
+		econ_market_day.assign(size_t(state.world.market_size()), market_flow_snapshot{});
 	dump_market_flow_trace(state, trace_ymd);
+	dump_buyer_ledger_trace(state, trace_ymd);
 	dump_grain_trace(state, trace_ymd);
 	dump_grain_flow_trace(state, trace_ymd);
 	dump_needs_calib_trace(state, trace_ymd);
@@ -6028,21 +8477,22 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 	dump_rgo_subsistence_trace(state, trace_ymd);
 	dump_labor_reservation_trace(state, trace_ymd);
 
-	if(seller_payout) {
+	if(seller_payout || household_clearing) {
 		auto const today = state.current_date.to_ymd(state.start_date);
 		auto const key = int(today.year) * 12 + int(today.month);
 		if(key != seller_share_cache_key)
 			rebuild_seller_share_cache(state, key);
 	}
-
 	state.world.execute_parallel_over_market([&](auto market){
 		auto area = state.world.market_get_zone_from_local_market(market);
 		auto nation = state.world.state_instance_get_nation_from_state_ownership(area);
+		auto const trade_escrow_active = trade_escrow_enabled();
 
 		auto budget = state.world.market_get_stockpile(market, economy::money);
 		auto const money_before = budget;
 
-		auto arbitrage = state.world.market_get_arbitrage(market);
+		auto const trade_arbitrage = state.world.market_get_arbitrage(market);
+		auto arbitrage = trade_escrow_active ? ve::fp_vector{ 0.f } : trade_arbitrage;
 		auto investments = state.world.market_get_pop_investments(market);
 		state.world.market_set_pop_investments(market, 0.f);
 		auto unused_dividends = state.world.market_get_pop_dividends(market);
@@ -6051,15 +8501,31 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 		auto purchases = state.world.market_get_purchases(market);
 		if(market_cash)
 			purchases = ve::min(purchases, ve::max(0.f, budget));
-		auto export_gains = state.world.market_get_export_cut(market);
-		auto import_spent = state.world.market_get_import_spending(market);
+		auto const trade_export_gains = state.world.market_get_export_cut(market);
+		auto const trade_import_spent = state.world.market_get_import_spending(market);
+		auto export_gains = trade_escrow_active ? ve::fp_vector{ 0.f } : trade_export_gains;
+		auto import_spent = trade_escrow_active ? ve::fp_vector{ 0.f } : trade_import_spent;
 
 		auto reinvestment = ve::max(0.f, budget * 0.05f);
 		auto debt_payment = ve::max(0.f, -budget * 0.5f);
 		budget = budget - reinvestment + debt_payment;
 
 
-		auto earn = ve::select(arbitrage > 0.f, arbitrage, 0.f) + export_gains + investments + unused_dividends + sales + reinvestment;
+		auto const buyer_payment = economy::pops::buyer_escrow_enabled()
+			? ve::apply([](dcon::market_id m) { return economy::pops::market_consumption_spending(m); }, market)
+			: ve::fp_vector{ 0.f };
+		auto const market_receipts = household_clearing
+			? ve::fp_vector{ 0.f }
+			: (economy::pops::buyer_escrow_enabled() ? buyer_payment : sales);
+		auto earn = ve::select(arbitrage > 0.f, arbitrage, 0.f) + export_gains + investments + unused_dividends
+			+ market_receipts + reinvestment;
+		auto const earn_before_repayment = earn;
+		auto const credit_repayment = trade_escrow_active
+			? ve::apply([&](dcon::market_id m, float income) {
+				return float(trade_repay_credit(state, m, double(std::max(0.f, income))));
+			}, market, earn - reinvestment)
+			: ve::fp_vector{ 0.f };
+		earn = earn - credit_repayment;
 
 		auto next_dividends = earn * economy::pops::trade_dividends_rate;
 		state.world.market_set_pop_dividends(market, next_dividends);
@@ -6164,9 +8630,13 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 
 		state.world.market_set_port_services_demand(market, 0.f);
 
-		auto spending_ability_ratio = ve::min(1.f, ve::max(0.f, ve::select(spend == 0.f, 1.f, earn / spend)));
+		auto const trade_earn = earn_before_repayment + trade_export_gains
+			+ ve::select(trade_arbitrage > 0.f, trade_arbitrage, ve::fp_vector{ 0.f });
+		auto const trade_spend = spend + trade_import_spent
+			+ ve::select(trade_arbitrage > 0.f, ve::fp_vector{ 0.f }, -trade_arbitrage);
+		auto spending_ability_ratio = ve::min(1.f, ve::max(0.f, ve::select(trade_spend == 0.f, 1.f, trade_earn / trade_spend)));
 		// We don't want to spend a lot more than we earn on imports
-		auto import_ratio = ve::min(1.f, ve::max(0.f, ve::select(earn == 0.f, 1.f, import_spent / earn)));
+		auto import_ratio = ve::min(1.f, ve::max(0.f, ve::select(trade_earn == 0.f, 1.f, trade_import_spent / trade_earn)));
 
 		state.world.market_set_trade_house_budget_scale(market, spending_ability_ratio);
 		state.world.market_set_trade_house_budget_import_scale(market, import_ratio);
@@ -6176,7 +8646,8 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 		auto const next_money = budget + refund + earn - spend;
 		state.world.market_set_stockpile(market, economy::money, next_money);
 
-		if(seller_payout) {
+		if(seller_payout && !household_clearing) {
+			auto const payout_base = seller_payout_buyer_base ? buyer_payment : sales;
 			ve::apply([&](dcon::market_id m, float sold) {
 				if(!std::isfinite(sold) || !(sold > 0.f))
 					return;
@@ -6212,7 +8683,7 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 					if(ps.factory > 0.f)
 						state.world.province_set_factory_bank(ps.province, state.world.province_get_factory_bank(ps.province) + amount * ps.factory / own);
 				}
-			}, market, sales);
+			}, market, payout_base);
 		}
 		if(gov_stockpile_purchase) {
 			ve::apply([&](dcon::market_id m) {
@@ -6321,16 +8792,19 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 			}, market, sales);
 		}
 
-		if(trace_market_flow) {
+		if(trace_market_flow || trace_econ_closure) {
 			auto add_flow = [&](float market_flow_snapshot::*field, auto vec) {
 				ve::apply([&](dcon::market_id m, float v) {
-					if(size_t(m.index()) < market_flow_snap.size())
+					if(trace_market_flow && size_t(m.index()) < market_flow_snap.size())
 						market_flow_snap[size_t(m.index())].*field += v;
+					if(trace_econ_closure && size_t(m.index()) < econ_market_day.size())
+						econ_market_day[size_t(m.index())].*field += v;
 				}, market, vec);
 			};
 			add_flow(&market_flow_snapshot::money_before, money_before);
 			add_flow(&market_flow_snapshot::money_after, next_money);
 			add_flow(&market_flow_snapshot::sales, sales);
+			add_flow(&market_flow_snapshot::buyer_payment, buyer_payment);
 			add_flow(&market_flow_snapshot::purchases, purchases);
 			add_flow(&market_flow_snapshot::exports, export_gains);
 			add_flow(&market_flow_snapshot::imports, import_spent);
@@ -6346,8 +8820,8 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 			add_flow(&market_flow_snapshot::arb_neg, ve::select(arbitrage > 0.f, 0.f, -arbitrage));
 		}
 
-		state.world.market_set_total_earn(market, earn);
-		state.world.market_set_total_paid(market, spend);
+		state.world.market_set_total_earn(market, trade_earn);
+		state.world.market_set_total_paid(market, trade_spend);
 
 		state.world.market_set_shipbuilding_spending_ratio(market, spend_on_ships_ratio);
 		state.world.market_set_ships_maintenance_spending_ratio(market, spend_on_ships_maintenance_ratio);
@@ -6598,6 +9072,15 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 
 	services::match_supply_and_demand(state);
 
+	if(household_clearing) {
+		market_household_purchase_value.assign(size_t(state.world.market_size()), 0.f);
+		market_household_refund_ratio.assign(size_t(state.world.market_size()), 0.f);
+		if(household_batch_settlement) {
+			market_commodity_household_purchase_value.assign(
+				size_t(state.world.market_size()) * size_t(state.world.commodity_size()), 0.f);
+		}
+	}
+
 	state.world.execute_parallel_over_market([&](auto ids) {
 		auto zones = state.world.market_get_zone_from_local_market(ids);
 		auto market_capitals = state.world.state_instance_get_capital(zones);
@@ -6634,6 +9117,7 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 			*/
 
 			auto stockpiles = state.world.market_get_stockpile(ids, c);
+			auto const stock_before_clear = stockpiles;
 			auto merchants_supply = state.world.market_get_stockpile_sales(ids, c);
 
 			auto production_and_merchants_supply = state.world.market_get_supply(ids, c);
@@ -6654,8 +9138,8 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 			auto aggregated_demand = state.world.market_get_aggregated_demand_history(ids, c);
 			auto aggregated_supply = state.world.market_get_aggregated_supply_history(ids, c);
 
-			auto new_expected_probability_to_buy = ve::min(1.f, (aggregated_supply + 0.25f) / (aggregated_demand + 0.25f));
-			auto new_expected_probability_to_sell = ve::min(1.f, (aggregated_demand + 0.25f) / (aggregated_supply + 0.25f));
+			auto new_expected_probability_to_buy = ve::min(1.f, (aggregated_supply + expected_prob_smoothing) / ve::max(ve::fp_vector{ 1e-12f }, aggregated_demand + expected_prob_smoothing));
+			auto new_expected_probability_to_sell = ve::min(1.f, (aggregated_demand + expected_prob_smoothing) / ve::max(ve::fp_vector{ 1e-12f }, aggregated_supply + expected_prob_smoothing));
 
 			auto old_expected_probability_to_buy = state.world.market_get_expected_probability_to_buy(ids, c);
 			auto old_expected_probability_to_sell = state.world.market_get_expected_probability_to_sell(ids, c);
@@ -6699,14 +9183,79 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 				))
 			);
 
-			state.world.market_set_stockpile(ids, c, state.world.market_get_stockpile(ids, c) *(1.f - daily_spoilage()));
+			auto const stock_before_spoil = state.world.market_get_stockpile(ids, c);
+			state.world.market_set_stockpile(ids, c, stock_before_spoil *(1.f - daily_spoilage()));
+			auto const stock_after_clear = state.world.market_get_stockpile(ids, c);
+			auto const spoiled_qty = stock_before_spoil - stock_after_clear;
 
 			//if(presimulation) {
 				//state.world.market_set_stockpile(ids, c, state.world.market_get_stockpile(ids, c) + 5.f * production_and_merchants_supply);
 			//}
 
 			auto sales = state.world.market_get_sales(ids);
-			auto const sold_value = merchants_supply * new_actual_probability_to_sell * ve_price(state, ids, c);
+			auto const sold_quantity = (gross_sales_base ? production_and_merchants_supply : merchants_supply) * new_actual_probability_to_sell;
+			auto const sold_value = sold_quantity * ve_price(state, ids, c);
+			if(household_clearing) {
+				auto const household_demand = ve::apply([&](dcon::market_id m) {
+					return economy::pops::household_demand_qty(m, c);
+				}, ids);
+				auto const cleared_quantity = new_actual_probability_to_buy * total_demand;
+				auto const household_cleared = ve::min(household_demand * new_actual_probability_to_buy, cleared_quantity);
+				auto const household_value = household_cleared * ve_price(state, ids, c);
+				auto const commodity_stride = size_t(state.world.commodity_size());
+				auto const commodity_index = size_t(c.index());
+				ve::apply([&](dcon::market_id m, float value) {
+					if(m && std::isfinite(value) && value > 0.f && size_t(m.index()) < market_household_purchase_value.size()) {
+						market_household_purchase_value[size_t(m.index())] += value;
+						if(household_batch_settlement) {
+							auto const idx = size_t(m.index()) * commodity_stride + commodity_index;
+							if(idx < market_commodity_household_purchase_value.size())
+								market_commodity_household_purchase_value[idx] += value;
+						}
+					}
+				}, ids, household_value);
+			}
+			if(trace_econ_closure) {
+				auto const price_for_trace = ve_price(state, ids, c);
+				auto const cleared_quantity = new_actual_probability_to_buy * total_demand;
+				auto const direct_supply = production_and_merchants_supply - merchants_supply;
+				auto const merchant_sold_quantity = merchants_supply * new_actual_probability_to_sell;
+				auto const direct_sold_quantity = direct_supply * new_actual_probability_to_sell;
+				auto const direct_unsold_quantity = direct_supply * (1.f - new_actual_probability_to_sell);
+				auto const commodity_stride = size_t(state.world.commodity_size());
+				ve::apply([&](dcon::market_id m, float sold_q, float sold_v, float cleared_q, float supply_q, float merchant_q, float merchant_sold_q, float direct_sold_q, float direct_unsold_q, float price_v) {
+					if(!std::isfinite(sold_q) || !std::isfinite(sold_v) || !std::isfinite(cleared_q)
+						|| !std::isfinite(supply_q) || !std::isfinite(merchant_q)
+						|| !std::isfinite(merchant_sold_q) || !std::isfinite(direct_sold_q)
+						|| !std::isfinite(direct_unsold_q) || !std::isfinite(price_v))
+						return;
+					auto const idx = size_t(m.index()) * commodity_stride + size_t(c.index());
+					if(idx >= econ_market_good_day.size())
+						return;
+					auto& row = econ_market_good_day[idx];
+					row.sold_qty += sold_q;
+					row.cleared_qty += cleared_q;
+					row.supply_qty += supply_q;
+					row.merchant_qty += merchant_q;
+					row.merchant_sold_qty += merchant_sold_q;
+					row.direct_sold_qty += direct_sold_q;
+					row.direct_unsold_qty += direct_unsold_q;
+					row.sales_value += sold_v;
+					row.price = price_v;
+				}, ids, sold_quantity, sold_value, cleared_quantity, total_supply, merchants_supply,
+					merchant_sold_quantity, direct_sold_quantity, direct_unsold_quantity, price_for_trace);
+				ve::apply([&](dcon::market_id m, float stock_before_q, float stock_after_q, float spoiled_q) {
+					if(!std::isfinite(stock_before_q) || !std::isfinite(stock_after_q) || !std::isfinite(spoiled_q))
+						return;
+					auto const idx = size_t(m.index()) * commodity_stride + size_t(c.index());
+					if(idx >= econ_market_good_day.size())
+						return;
+					auto& row = econ_market_good_day[idx];
+					row.stock_before_clear += stock_before_q;
+					row.stock_after_clear += stock_after_q;
+					row.spoiled_qty += spoiled_q;
+				}, ids, stock_before_clear, stock_after_clear, spoiled_qty);
+			}
 			state.world.market_set_sales(ids, sales + sold_value);
 			if(market_cash) {
 				auto const cash = ve::max(0.f, state.world.market_get_stockpile(ids, economy::money));
@@ -6743,6 +9292,9 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 	});
 
 	set_profile_point(state, "clear_market");
+	dump_private_construction_trace(state, trace_ymd);
+	settle_household_clearing(state);
+	settle_factory_inputs(state);
 
 #ifndef NDEBUG
 	state.world.execute_serial_over_market([&](auto markets) {
@@ -6769,6 +9321,7 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 	// ################################################################################
 
 	// updates of national purchases:
+	trace_gov_cash_money_before(state);
 	concurrency::parallel_for(uint32_t(0), state.world.nation_size(), [&](uint32_t i) {
 		auto n = dcon::nation_id{ dcon::nation_id::value_base_t(i) };
 		if(state.world.nation_get_owned_province_count(n) == 0)
@@ -6779,7 +9332,9 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 		auto capital_market = state.world.state_instance_get_market_from_local_market(capital_state);
 
 		// refund national employment:
+		auto const treasury_before_admin_refund = state.world.nation_get_treasury(n);
 		refund_demand_administration(state, n);
+		auto const admin_refund = state.world.nation_get_treasury(n) - treasury_before_admin_refund;
 
 		/*
 		determine effective spending levels
@@ -6787,6 +9342,10 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 		*/
 		auto nations_commodity_spending = state.world.nation_get_spending_level(n);
 		float refund = 0.0f;
+		float goods_refund_nominal = 0.0f;
+		double gov_purchase_remaining = 0.0;
+		if(gov_purchase_settlement && !is_presimulation_update() && size_t(n.index()) < gov_purchase_escrow.size())
+			gov_purchase_remaining = gov_purchase_escrow[size_t(n.index())];
 
 		for(uint32_t k = 1; k < total_commodities; ++k) {
 			dcon::commodity_id c{ dcon::commodity_id::value_base_t(k) };
@@ -6796,18 +9355,55 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 				auto sat = state.world.market_get_actual_probability_to_buy(market, c);
 				auto combined_stockpile_demand = economy::combined_government_stockpile_demand(state, market, c);
 				if(combined_stockpile_demand > 0.f) {
-					add_government_stockpile(state, n, market, c, combined_stockpile_demand * nations_commodity_spending * sat);
+					auto const price = state.world.market_get_price(market, c);
+					auto const requested_qty = double(combined_stockpile_demand)
+						* double(nations_commodity_spending) * double(sat);
+					double delivered_qty = requested_qty;
+					if(gov_purchase_settlement && !is_presimulation_update()) {
+						delivered_qty = 0.0;
+						if(gov_purchase_remaining > 0.0) {
+							auto const total_demand = double(state.world.market_get_demand(market, c));
+							auto const government_demand = std::min(
+								double(combined_stockpile_demand) * double(nations_commodity_spending),
+								total_demand);
+							auto const government_qty = std::max(0.0, government_demand * double(sat));
+							auto const value = government_qty * double(price);
+							auto const payment = std::min(value, gov_purchase_remaining);
+							if(payment > 0.0 && std::isfinite(payment)) {
+								auto const escrow_before = gov_purchase_remaining;
+								auto const settlement = settle_seller_supply_batches(state, market, c, payment);
+								auto const credited = std::min(payment, settlement.paid);
+								gov_purchase_remaining = std::max(0.0, gov_purchase_remaining - credited);
+								if(size_t(n.index()) < gov_purchase_escrow.size())
+									gov_purchase_escrow[size_t(n.index())] = gov_purchase_remaining;
+								trace_gov_settlement_good(
+									state, n, market, c, payment, settlement, escrow_before, gov_purchase_remaining);
+								if(value > 0.0)
+									delivered_qty = government_qty * (credited / value);
+								if(trace_econ_closure && size_t(market.index()) < econ_market_day.size())
+									econ_market_day[size_t(market.index())].gov_receipt += float(settlement.merchant_receipt);
+								if(trace_market_flow && size_t(market.index()) < market_flow_snap.size())
+									market_flow_snap[size_t(market.index())].gov_receipt += float(settlement.merchant_receipt);
+							}
+						}
+					}
+					add_government_stockpile(state, n, market, c, float(std::max(0.0, delivered_qty)));
 					auto delta =
 						combined_stockpile_demand
 						* (1.0f - sat)
 						* nations_commodity_spending
-						* state.world.market_get_price(market, c);
+						* price;
 					assert(delta >= 0.f);
 					refund += delta;
+					goods_refund_nominal += delta;
+					trace_gov_refund_good(
+						state, n, market, c, combined_stockpile_demand,
+						price, nations_commodity_spending, sat, delta, float(delivered_qty));
 				}
 			});
 			
 		}
+		auto const refund_before_overseas = refund;
 
 		/*
 		calculate overseas penalty:
@@ -6850,11 +9446,34 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 		}
 
 		// finally, pay back refund:
+		auto const refund_total_nominal = refund;
 		if(refund_zeroed)
 			refund = 0.0f;
-		assert(std::isfinite(refund) && std::isfinite(state.world.nation_get_treasury(n) + refund) && refund >= 0.0f);
-		state.world.nation_set_treasury(n, state.world.nation_get_treasury(n) + refund);
+		auto refund_to_treasury = refund;
+		double gov_purchase_refund = 0.0;
+		if(gov_purchase_settlement && !is_presimulation_update()) {
+			gov_purchase_refund = std::max(0.0, gov_purchase_remaining);
+			// The upstream goods refund is the same unspent budget as the escrow residual.
+			// Replace the former with the latter instead of crediting the treasury twice.
+			auto const upstream_goods_refund = refund_zeroed ? 0.0f : goods_refund_nominal;
+			refund_to_treasury = std::max(0.0f, refund_to_treasury - upstream_goods_refund)
+				+ float(gov_purchase_refund);
+			if(size_t(n.index()) < gov_purchase_escrow.size())
+				gov_purchase_escrow[size_t(n.index())] = 0.0;
+		}
+		assert(std::isfinite(refund_to_treasury)
+			&& std::isfinite(state.world.nation_get_treasury(n) + refund_to_treasury)
+			&& refund_to_treasury >= 0.0f);
+		state.world.nation_set_treasury(n, state.world.nation_get_treasury(n) + refund_to_treasury);
+		if(gov_cash_trace_active() && size_t(n.index()) < gov_budget_day.size())
+			gov_budget_day[size_t(n.index())].gov_purchase_refund = gov_purchase_refund;
+		trace_gov_refund_nation(
+			state, n, treasury_before_admin_refund, admin_refund, refund_before_overseas,
+			std::max(0.f, refund_total_nominal - refund_before_overseas), refund_total_nominal,
+			refund_to_treasury,
+			state.world.nation_get_treasury(n));
 	});
+	trace_gov_cash_money_after(state);
 
 	set_profile_point(state, "refund_nations");
 
@@ -7238,7 +9857,7 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 		auto local_nation = state.world.province_get_nation_from_province_ownership(province);
 		auto invalid = local_nation == dcon::nation_id {};
 		auto pop_type = state.world.pop_get_poptype(ids);
-		if(refund_from_escrow)
+		if(refund_from_escrow || household_clearing)
 			refund_escrow_buffer.set(ids, ve::fp_vector{ 0.f });
 
 		if (state.world.consumption_category_size() == 0) {
@@ -7275,18 +9894,19 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 				}, local_market, pop_type);
 
 				auto pop_size = state.world.pop_get_size(ids);
-				auto unspent_money =
-					refund_paid_only
-					? ln_cost * ln_spent * (1.f - ln_satisfaction) * demand_life.get(ids)
-						+ en_cost * en_spent * (1.f - en_satisfaction) * demand_everyday.get(ids)
-						+ lx_cost * lx_spent * (1.f - lx_satisfaction) * demand_luxury.get(ids)
-					: ln_cost * (1.f - ln_spent) * demand_life.get(ids)
-						+ en_cost * (1.f - en_spent) * demand_everyday.get(ids)
-						+ lx_cost * (1.f - lx_spent) * demand_luxury.get(ids);
+				auto unspent_money = household_clearing
+					? ve::fp_vector{ 0.f }
+					: (refund_paid_only
+						? ln_cost * ln_spent * (1.f - ln_satisfaction) * demand_life.get(ids)
+							+ en_cost * en_spent * (1.f - en_satisfaction) * demand_everyday.get(ids)
+							+ lx_cost * lx_spent * (1.f - lx_satisfaction) * demand_luxury.get(ids)
+						: ln_cost * (1.f - ln_spent) * demand_life.get(ids)
+							+ en_cost * (1.f - en_spent) * demand_everyday.get(ids)
+							+ lx_cost * (1.f - lx_spent) * demand_luxury.get(ids));
 
 				auto savings = state.world.pop_get_savings(ids);
 				state.world.pop_set_savings(ids, savings + unspent_money);
-				if(refund_from_escrow)
+				if(refund_from_escrow && !household_clearing)
 					refund_escrow_buffer.set(ids, refund_escrow_buffer.get(ids) + unspent_money);
 			}
 			auto satisfaction = state.world.pop_get_satisfaction(ids);
@@ -7303,10 +9923,10 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 				auto cost = state.world.market_get_cost_per_consumption_category(local_market, cat_id);
 				auto actually_bought = state.world.market_get_satisfied_demand_ratio_per_consumption_category(local_market, cat_id);
 				auto demanded = demand_consumption_category[cat_id.index()].get(ids);
-				auto refund = refund_zeroed ? 0.f : (1.f - actually_bought) * cost * demanded;
+				auto refund = household_clearing ? 0.f : (refund_zeroed ? 0.f : (1.f - actually_bought) * cost * demanded);
 				auto savings = state.world.pop_get_savings(ids);
 				state.world.pop_set_savings(ids, savings + refund);
-				if(refund_from_escrow)
+				if(refund_from_escrow && !household_clearing)
 					refund_escrow_buffer.set(ids, refund_escrow_buffer.get(ids) + refund);
 				total_satisfaction_from_categories = total_satisfaction_from_categories + actually_bought * demanded * state.world.consumption_category_get_satisfaction_score(cat_id);
 			});
@@ -7360,9 +9980,23 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 					refund_escrow_buffer.set(ids, refund_escrow_buffer.get(ids) + paid_back);
 			}
 		}
+		if(household_clearing) {
+			auto const escrow = ve::apply([](dcon::pop_id p) {
+				return economy::pops::household_goods_escrow(p);
+			}, ids);
+			auto const refund_ratio = ve::apply([](dcon::market_id m) {
+				return m.index() >= 0 && size_t(m.index()) < market_household_refund_ratio.size()
+					? market_household_refund_ratio[size_t(m.index())]
+					: 0.f;
+			}, local_market);
+			auto const goods_refund = escrow * refund_ratio;
+			auto savings = state.world.pop_get_savings(ids);
+			state.world.pop_set_savings(ids, savings + goods_refund);
+			refund_escrow_buffer.set(ids, refund_escrow_buffer.get(ids) + goods_refund);
+		}
 	});
 
-	if(refund_from_escrow) {
+	if(refund_from_escrow || household_clearing) {
 		std::vector<double> market_refund(size_t(state.world.market_size()), 0.0);
 		state.world.execute_serial_over_pop([&](auto ids) {
 			auto province = state.world.pop_get_province_from_pop_location(ids);
@@ -7458,6 +10092,7 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 
 	// we bought something: register supply from stockpiles:
 
+	reset_seller_supply_batches(state);
 	state.world.for_each_commodity([&](dcon::commodity_id c) {
 		state.world.execute_serial_over_market([&](auto markets) {
 			state.world.market_set_supply(markets, c, ve::fp_vector{});
@@ -7514,11 +10149,39 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 					+ preserve_stockpiles_for_future * stockpile_is_running_out
 				) / total_score;
 
-				auto next_merchants_supply = ve::min(ve::max(historical_demand * 0.1f, stockpiles * stockpile_to_supply), current_merchants_supply * 0.5f + historical_balance * 0.4f + target * 0.10f); //+ desired_sales * 0.000002f ;
+				ve::fp_vector price_release{};
+				if(stock_release_price) {
+					auto const reference_cost = ve::max(ve::fp_vector{ state.world.commodity_get_cost(c) }, ve::fp_vector{ economy::price_properties::commodity::min });
+					auto const release_ratio = ve::max(ve::fp_vector{ 0.f }, price) / reference_cost;
+					price_release = ve::apply(
+						[](dcon::market_id, float const demand, float const ratio) {
+							return demand * std::pow(ratio, stock_release_elasticity);
+						}, markets, historical_demand, release_ratio);
+				}
+				auto next_merchants_supply = stock_release_price
+					? ve::min(stockpiles, ve::max(ve::fp_vector{ 0.f }, price_release))
+					: ve::min(ve::max(historical_demand * 0.1f, stockpiles * stockpile_to_supply), current_merchants_supply * 0.5f + historical_balance * 0.4f + target * 0.10f); //+ desired_sales * 0.000002f ;
+
+					if(stockpile_offer_lower_bound) {
+						auto const lower_bound = ve::max(historical_demand * 0.1f, stockpiles * stockpile_to_supply);
+						next_merchants_supply = ve::max(lower_bound, ve::min(next_merchants_supply, stockpiles));
+					}
+
+					if(stockpile_price_response) {
+						auto const replacement_cost = state.world.commodity_get_cost(c);
+						auto const reference_cost = ve::max(ve::fp_vector{ replacement_cost }, ve::fp_vector{ price_properties::commodity::min });
+						auto const price_ratio = price / reference_cost;
+						auto const response = (2.f * price_ratio) / (1.f + price_ratio);
+						next_merchants_supply = next_merchants_supply * response;
+					}
 
 				auto bounded_next_merchants_supply = ve::min(stockpiles, ve::max(0.f, next_merchants_supply));
 				state.world.market_set_stockpile_sales(markets, c, bounded_next_merchants_supply);
 				state.world.market_set_supply(markets, c, state.world.market_get_supply(markets, c) + bounded_next_merchants_supply);
+				ve::apply([&](dcon::market_id market, float quantity) {
+					record_seller_supply_batch(
+						state, market, c, dcon::province_id{}, quantity, economy_reason::stockpile);
+				}, markets, bounded_next_merchants_supply);
 
 				if(
 					presimulation
@@ -7865,6 +10528,8 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 	}
 	if(wage_conservation && province_wage_debit_cache.size() < size_t(state.world.province_size()))
 		province_wage_debit_cache.assign(size_t(state.world.province_size()), 0.f);
+	if(factory_input_settlement_active() && !is_presimulation_update())
+		ensure_factory_input_escrow_storage(state);
 
 	province::for_each_market_province_parallel_over_market(state, [&](dcon::market_id mid, dcon::state_instance_id sid, dcon::province_id pid){
 		auto province_factory_wage_bill = 0.f;
@@ -7879,6 +10544,8 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 				state.world.factory_set_profit(fac.id, profit.profit);
 				total_factory_profit += profit.profit;
 				total_input_cost += profit.inputs;
+				if(factory_input_settlement_active() && !is_presimulation_update())
+					record_factory_input_escrow(state, pid, mid, fac.id, profit.inputs);
 				total_wage_bill += profit.wages;
 			}
 
@@ -8324,15 +10991,64 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 
 	set_profile_point(state, "update labor prices");
 
+	if(price_regression && !presimulation) {
+		// L_m = median over commodities of [ln(price) - ln(cost)], one market at a time. Scalar
+		// reduction: markets < 10^3 and commodities < 10^2 per market, so this is a small loop.
+		auto const mcount = static_cast<std::size_t>(state.world.market_size());
+		if(price_regression_level.size() < mcount)
+			price_regression_level.resize(mcount, 0.f);
+		std::vector<float> samples;
+		samples.reserve(static_cast<std::size_t>(state.world.commodity_size()));
+		state.world.for_each_market([&](dcon::market_id m) {
+			samples.clear();
+			state.world.for_each_commodity([&](dcon::commodity_id c) {
+				if(state.world.commodity_get_money_rgo(c))
+					return;
+				auto const cost = state.world.commodity_get_cost(c);
+				if(!(cost > 0.f))
+					return;
+				auto const p = state.world.market_get_price(m, c);
+				if(!(p > 0.f) || !std::isfinite(p))
+					return;
+				samples.push_back(std::log(std::max(p, price_properties::commodity::min)) - std::log(cost));
+			});
+			if(samples.empty()) {
+				price_regression_level[static_cast<std::size_t>(m.index())] = 0.f;
+				return;
+			}
+			// Upper median; exact for the odd commodity count this mod has.
+			auto const mid = samples.begin() + static_cast<std::ptrdiff_t>(samples.size() / 2);
+			std::nth_element(samples.begin(), mid, samples.end());
+			price_regression_level[static_cast<std::size_t>(m.index())] = *mid;
+		});
+	}
+
+	init_price_update_trace(state);
+	char trace_price_datebuf[16] = {};
+	if(trace_price_update) {
+		auto const ymd = state.current_date.to_ymd(state.start_date);
+		std::snprintf(trace_price_datebuf, sizeof(trace_price_datebuf), "%04d-%02d-%02d", ymd.year, ymd.month, ymd.day);
+	}
+
 	concurrency::parallel_for(uint32_t(1), total_commodities, [&](uint32_t k) {
 		dcon::commodity_id cid{ dcon::commodity_id::value_base_t(k) };
 		//handling gold cost separetely
 		if(state.world.commodity_get_money_rgo(cid)) {
 			return;
 		}
+		bool const trace_this_good = trace_price_update && std::find(price_decomp_goods.begin(), price_decomp_goods.end(), cid) != price_decomp_goods.end();
+		std::string trace_good_name;
+		if(trace_this_good)
+			trace_good_name = text::produce_simple_string(state, state.world.commodity_get_name(cid));
 		state.world.execute_serial_over_market([&](auto ids) {
-			ve::fp_vector supply = state.world.market_get_aggregated_supply_history(ids, cid);
-			ve::fp_vector demand = state.world.market_get_aggregated_demand_history(ids, cid);
+			auto const agg_supply = state.world.market_get_aggregated_supply_history(ids, cid);
+			auto const agg_demand = state.world.market_get_aggregated_demand_history(ids, cid);
+			ve::fp_vector supply = agg_supply;
+			ve::fp_vector demand = agg_demand;
+				if(price_current_flow) {
+					supply = state.world.market_get_supply(ids, cid);
+					demand = state.world.market_get_demand(ids, cid);
+				}
 			if(price_flow_supply) {
 				auto const offer = state.world.market_get_stockpile_sales(ids, cid);
 				supply = ve::max(ve::fp_vector{ 0.f }, supply - offer);
@@ -8342,15 +11058,33 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 			}
 			auto current_price = ve_price(state, ids, cid);
 			auto next_price = current_price;
+				auto const balance_scale = ve::max(ve::max(supply, demand), ve::max(agg_supply, agg_demand));
 			if(presimulation) {
-				next_price = current_price + price_properties::commodity::change_fast<ve::fp_vector>(current_price, supply, demand) / (1.f + 100.f * presimulation_stage) ;				
-				next_price = ve::select(demand <= supply, next_price * (demand + 0.000'001f) / (supply + 0.000'002f), next_price);
+				auto const damping = 1.f + 100.f * presimulation_stage;
+					if(price_balance) {
+						next_price = price_properties::common::change_log_balance<ve::fp_vector>(current_price, supply, demand, balance_scale, price_properties::commodity::speed_multiplier);
+					} else if(presim_price_mode == 2) {
+					next_price = price_properties::commodity::change_exp_scaled<ve::fp_vector>(current_price, supply, demand, presim_price_speed, damping);
+				} else if(presim_price_mode == 1) {
+					next_price = price_properties::commodity::change_exp<ve::fp_vector>(current_price, supply, demand, damping);
+				} else if(presim_price_mode == 3 || presim_price_mode == 4) {
+					next_price = current_price + price_properties::commodity::change<ve::fp_vector>(current_price, supply, demand);
+				} else {
+					next_price = current_price + price_properties::commodity::change_fast<ve::fp_vector>(current_price, supply, demand) / damping;
+				}
+				if(!price_balance && presim_price_mode != 2 && presim_price_mode != 4) {
+					next_price = ve::select(demand <= supply, next_price * (demand + 0.000'001f) / (supply + 0.000'002f), next_price);
+				}
 				if(cost_plus_price && cost_plus_presim) {
 					auto const target = state.world.commodity_get_cost(cid) * (1.f + cost_plus_markup);
 					next_price = current_price + (target - current_price) * cost_plus_speed;
 				}
 			} else {
-				next_price = current_price + price_properties::commodity::change<ve::fp_vector>(current_price, supply, demand);
+					if(price_balance) {
+						next_price = price_properties::common::change_log_balance<ve::fp_vector>(current_price, supply, demand, balance_scale, price_properties::commodity::speed_multiplier);
+					} else {
+						next_price = current_price + price_properties::commodity::change<ve::fp_vector>(current_price, supply, demand);
+					}
 				if(cost_plus_price) {
 					auto const target = state.world.commodity_get_cost(cid) * (1.f + cost_plus_markup);
 					next_price = current_price + (target - current_price) * cost_plus_speed;
@@ -8390,10 +11124,56 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 					next_price = next_price + ve::select(mask, (target - current_price) * deficit_price_recovery_speed, ve::fp_vector{0.f});
 				}
 			}
+			if(price_regression && !presimulation) {
+				// Commodity side only: the labour price block (:10741-10808) is untouched.
+				// next_price is already the post-market-step value, so the correction is applied
+				// multiplicatively and exactly: p' = p * exp(-kappa*u).
+				auto const log_cost = std::log(std::max(state.world.commodity_get_cost(cid), price_properties::commodity::min));
+				next_price = ve::apply([&](dcon::market_id m, float p) {
+					auto const idx = static_cast<std::size_t>(m.index());
+					auto const lvl = idx < price_regression_level.size() ? price_regression_level[idx] : 0.f;
+					auto const u = std::log(std::max(p, price_properties::commodity::min)) - log_cost - lvl;
+					auto const k = price_regression_kappa(u);
+					return p * std::exp(-k * u);
+				}, ids, next_price);
+			}
+			if(price_zero_flow_hold) {
+				auto const no_observed_flow = (supply <= 0.f) && (demand <= 0.f);
+				next_price = ve::select(no_observed_flow, current_price, next_price);
+			}
 #ifndef NDEBUG
 			ve::apply([&](auto value) { assert(std::isfinite(value)); }, next_price);
 #endif
 			auto next_price_clamped = ve::min(ve::max(next_price, price_properties::commodity::min), price_properties::commodity::max);
+
+			if(trace_this_good && price_update_file) {
+				auto const current_supply = state.world.market_get_supply(ids, cid);
+				auto const current_demand = state.world.market_get_demand(ids, cid);
+				auto const stockpile = state.world.market_get_stockpile(ids, cid);
+				auto const stockpile_sales = state.world.market_get_stockpile_sales(ids, cid);
+				auto const confidence = state.world.market_get_price_confidence(ids, cid);
+				auto const cost = state.world.commodity_get_cost(cid);
+				ve::apply([&](dcon::market_id m, float agg_s, float agg_d, float flow_s, float flow_d,
+						float cur_s, float cur_d, float stock, float stock_sales, float cp, float np,
+						float npc, float conf) {
+					if(!price_update_market_selected(m))
+						return;
+					auto const raw_fast = price_properties::commodity::change_fast<float>(cp, flow_s, flow_d);
+					auto const damped_change = raw_fast / (1.f + 100.f * presimulation_stage);
+					auto const ratio_mult = (flow_d <= flow_s) ? (flow_d + 0.000001f) / (flow_s + 0.000002f) : 1.f;
+					auto const zone = state.world.market_get_zone_from_local_market(m);
+					auto const owner = state.world.state_instance_get_nation_from_state_ownership(zone);
+					auto const at_floor = npc <= price_properties::commodity::min * 1.0001f ? 1 : 0;
+					std::lock_guard<std::mutex> lock(price_update_mutex);
+					fprintf(price_update_file, "%s,%d,%d,%.6g,%d,%d,%s,%d,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%d,%.9g,%d\n",
+						trace_price_datebuf, date_offset, presimulation ? 1 : 0, double(presimulation_stage),
+						int(m.index()), int(owner.index()), trace_good_name.c_str(), int(cid.index()), double(cp), double(cost),
+						double(cp / std::max(1e-12f, cost)), double(agg_s), double(agg_d), double(flow_s), double(flow_d),
+						double(cur_s), double(cur_d), double(stock), double(stock_sales), double(raw_fast), double(damped_change),
+						double(ratio_mult), double(np), double(npc), at_floor, double(conf), presim_price_mode);
+				}, ids, agg_supply, agg_demand, supply, demand, current_supply, current_demand,
+					stockpile, stockpile_sales, current_price, next_price, next_price_clamped, confidence);
+			}
 
 			auto current_confidence = state.world.market_get_price_confidence(ids, cid);
 			ve::fp_vector next_confidence;
@@ -8434,6 +11214,8 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 	});
 
 	set_profile_point(state, "update commodity prices");
+	if(price_update_file)
+		fflush(price_update_file);
 
 	services::update_price(state);
 
@@ -8627,6 +11409,13 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 	apply_money_anchor(state);
 
 	set_profile_point(state, "random data");
+
+	if(trace_econ_closure && (!presimulation || trace_econ_closure_presim))
+		econ_closure_day_end(state);
+	if(trace_econ_shadowpay && !presimulation)
+		dump_econ_shadowpay(state, state.current_date.to_ymd(state.start_date));
+	if(trace_gov_cash && !presimulation)
+		dump_gov_cash(state, state.current_date.to_ymd(state.start_date));
 
 	sanity_check(state);
 }

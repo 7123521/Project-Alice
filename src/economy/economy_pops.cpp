@@ -15,6 +15,11 @@
 #include <string>
 #include <algorithm>
 
+namespace economy {
+// LOCAL EXPERIMENT: defined in economy.cpp; true while daily_update() is presimulating.
+bool is_presimulation_update();
+}
+
 // LOCAL TRACE (ALICE_TRACE_POP_BUDGET=1): per-day totals of the pops' required basket cost,
 // spending, savings and money income, written on the first day of each month. Read-only.
 static bool const pop_budget_trace = []() {
@@ -26,6 +31,29 @@ static bool pop_budget_file_init = false;
 static double trace_daily_wage_income = 0.0;
 static double trace_daily_natural_wage_credit = 0.0;
 static double trace_daily_property_income = 0.0;
+
+// LOCAL TRACE (ALICE_TRACE_PROPERTY_INCOME_SOURCE=1): decompose the non-labour income pools.
+// Read-only and written on the first day of each month.
+static bool const property_income_source_trace = []() {
+	auto env = std::getenv("ALICE_TRACE_PROPERTY_INCOME_SOURCE");
+	return env && std::atoi(env) != 0;
+}();
+
+// LOCAL TRACE (ALICE_TRACE_SERVICE_FLOW=1): read-only monthly province-level reconciliation of
+// pop housing/education payments, private service supply/demand, APB bank stocks, and the
+// market rent pool. It does not alter any economic state.
+static bool const service_flow_trace = []() {
+	auto env = std::getenv("ALICE_TRACE_SERVICE_FLOW");
+	return env && std::atoi(env) != 0;
+}();
+static FILE* service_flow_file = nullptr;
+static bool service_flow_file_init = false;
+static std::vector<float> service_trace_housing_required;
+static std::vector<float> service_trace_housing_spent;
+static std::vector<float> service_trace_education_required;
+static std::vector<float> service_trace_education_spent;
+static std::vector<float> service_trace_city_bank_before;
+static std::vector<float> service_trace_school_bank_before;
 
 // LOCAL TRACE (ALICE_TRACE_DEMAND_FORMATION=1): decomposition of the demand registered for one
 // probe commodity: base_life x scale_life(market,poptype) x life_mul x life_weight x lf_scale.
@@ -66,9 +94,74 @@ static bool const profit_to_households = []() {
 	auto s = std::getenv("ALICE_EXP_PROFIT_TO_HOUSEHOLDS");
 	return s && std::atoi(s) != 0;
 }();
+// ===== LOCAL FORK (not upstream) =====
+// LOCAL EXPERIMENT (ALICE_EXP_BUYER_ESCROW=1): pop goods spending is currently subtracted from
+// savings without being credited to the market, while market sales are created from nothing. This
+// records the actual goods spending by market so the market stage can use it as the buyer-side
+// cash inflow. Default 0 keeps upstream behaviour.
+static bool const buyer_escrow = []() {
+	auto s = std::getenv("ALICE_EXP_BUYER_ESCROW");
+	return s && std::atoi(s) != 0;
+}();
+// LOCAL EXPERIMENT (ALICE_EXP_HOUSEHOLD_CLEARING=1): deposit the goods spending deducted from
+// each pop into a same-day market escrow, pay producers from the actual cleared household value,
+// and return only the residual to the same pop. Default 0 keeps upstream behaviour.
+static bool const household_clearing = []() {
+	auto s = std::getenv("ALICE_EXP_HOUSEHOLD_CLEARING");
+	return s && std::atoi(s) != 0;
+}();
+// LOCAL TRACE (ALICE_TRACE_BUYER_LEDGER=1): fill the household spending buffer even when buyer
+// escrow is disabled, so the read-only buyer ledger can compare household cash with market sales.
+static bool const buyer_ledger_trace = []() {
+	auto s = std::getenv("ALICE_TRACE_BUYER_LEDGER");
+	return s && std::atoi(s) != 0;
+}();
+// LOCAL TRACE (ALICE_TRACE_ECON_SHADOWPAY=1): pop demand is the only buyer category upstream does
+// not expose as a market field. Keep an exact market/commodity accumulator so the buyer ledger
+// residual is not mislabeled as household demand.
+static bool const shadowpay_trace = []() {
+	auto s = std::getenv("ALICE_TRACE_ECON_SHADOWPAY");
+	return s && std::atoi(s) != 0;
+}();
+static bool const household_demand_tracking = shadowpay_trace || household_clearing;
+static bool const record_buyer_spending = buyer_escrow || buyer_ledger_trace || household_demand_tracking;
+static std::vector<float> shadow_household_demand;
+static uint32_t shadow_household_market_count = 0;
+static uint32_t shadow_household_commodity_count = 0;
 
 static std::vector<float> market_life_spending;
 static std::vector<float> market_disposable;
+static std::vector<float> market_consumption_spending_buffer;
+static ve::vectorizable_buffer<float, dcon::pop_id> pop_goods_spending(uint32_t(1));
+static uint32_t pop_goods_spending_count = 1;
+void begin_household_demand_trace(sys::state& state) {
+	if(!household_demand_tracking || (is_presimulation_update() && !household_clearing))
+		return;
+	auto const markets = uint32_t(state.world.market_size());
+	auto const commodities = uint32_t(state.world.commodity_size());
+	if(shadow_household_market_count != markets || shadow_household_commodity_count != commodities) {
+		shadow_household_market_count = markets;
+		shadow_household_commodity_count = commodities;
+		shadow_household_demand.assign(size_t(markets) * size_t(commodities), 0.f);
+	} else {
+		std::fill(shadow_household_demand.begin(), shadow_household_demand.end(), 0.f);
+	}
+}
+
+void trace_household_demand(dcon::market_id m, dcon::commodity_id c, float amount) {
+	if(!household_demand_tracking || (is_presimulation_update() && !household_clearing) || !std::isfinite(amount) || amount <= 0.f)
+		return;
+	auto const idx = size_t(m.index()) * size_t(shadow_household_commodity_count) + size_t(c.index());
+	if(idx < shadow_household_demand.size())
+		shadow_household_demand[idx] += amount;
+}
+
+float household_demand_qty(dcon::market_id m, dcon::commodity_id c) {
+	if(!household_demand_tracking || shadow_household_commodity_count == 0)
+		return 0.f;
+	auto const idx = size_t(m.index()) * size_t(shadow_household_commodity_count) + size_t(c.index());
+	return idx < shadow_household_demand.size() ? shadow_household_demand[idx] : 0.f;
+}
 static std::vector<float> pop_income_before;
 static std::vector<float> market_income_flow;
 static std::vector<float> market_poptype_income_flow;
@@ -95,6 +188,20 @@ float market_life_needs_spending(dcon::market_id m) {
 }
 float market_disposable_income(dcon::market_id m) {
 	return m.index() < market_disposable.size() ? market_disposable[m.index()] : 0.f;
+}
+bool buyer_escrow_enabled() {
+	return buyer_escrow;
+}
+bool household_clearing_enabled() {
+	return household_clearing;
+}
+float market_consumption_spending(dcon::market_id m) {
+	return m.index() < market_consumption_spending_buffer.size() ? market_consumption_spending_buffer[m.index()] : 0.f;
+}
+float household_goods_escrow(dcon::pop_id p) {
+	if(p.index() < 0 || p.index() >= pop_goods_spending_count)
+		return 0.f;
+	return pop_goods_spending.get(p);
 }
 
 void snapshot_income_start(sys::state& state) {
@@ -730,6 +837,7 @@ void update_consumption(
 	std::vector<ve::vectorizable_buffer<float, dcon::pop_id>>& demand_consumption_category
 ) {
 	uint32_t total_commodities = state.world.commodity_size();
+	begin_household_demand_trace(state);
 
 	if(demand_decomp_trace)
 		init_demand_decomp_grain(state);
@@ -763,17 +871,33 @@ void update_consumption(
 	static ve::vectorizable_buffer<float, dcon::pop_id> trace_required_life(uint32_t(1));
 	static ve::vectorizable_buffer<float, dcon::pop_id> trace_spent(uint32_t(1));
 	static ve::vectorizable_buffer<float, dcon::pop_id> trace_spent_life(uint32_t(1));
+	static ve::vectorizable_buffer<float, dcon::pop_id> trace_housing_required(uint32_t(1));
+	static ve::vectorizable_buffer<float, dcon::pop_id> trace_housing_spent(uint32_t(1));
+	static ve::vectorizable_buffer<float, dcon::pop_id> trace_education_required(uint32_t(1));
+	static ve::vectorizable_buffer<float, dcon::pop_id> trace_education_spent(uint32_t(1));
+	static ve::vectorizable_buffer<float, dcon::pop_id> trace_everyday_spent(uint32_t(1));
+	static ve::vectorizable_buffer<float, dcon::pop_id> trace_luxury_spent(uint32_t(1));
 	static ve::vectorizable_buffer<float, dcon::pop_id> trace_savings(uint32_t(1));
 	static ve::vectorizable_buffer<float, dcon::pop_id> trace_ratio_life(uint32_t(1));
 	static uint32_t trace_pop_count = 1;
-	if(pop_budget_trace && state.world.pop_size() > trace_pop_count) {
+	if((pop_budget_trace || service_flow_trace) && state.world.pop_size() > trace_pop_count) {
 		trace_required = state.world.pop_make_vectorizable_float_buffer();
 		trace_required_life = state.world.pop_make_vectorizable_float_buffer();
 		trace_spent = state.world.pop_make_vectorizable_float_buffer();
 		trace_spent_life = state.world.pop_make_vectorizable_float_buffer();
+		trace_housing_required = state.world.pop_make_vectorizable_float_buffer();
+		trace_housing_spent = state.world.pop_make_vectorizable_float_buffer();
+		trace_education_required = state.world.pop_make_vectorizable_float_buffer();
+		trace_education_spent = state.world.pop_make_vectorizable_float_buffer();
+		trace_everyday_spent = state.world.pop_make_vectorizable_float_buffer();
+		trace_luxury_spent = state.world.pop_make_vectorizable_float_buffer();
 		trace_savings = state.world.pop_make_vectorizable_float_buffer();
 		trace_ratio_life = state.world.pop_make_vectorizable_float_buffer();
 		trace_pop_count = state.world.pop_size();
+	}
+	if(record_buyer_spending && state.world.pop_size() > pop_goods_spending_count) {
+		pop_goods_spending = state.world.pop_make_vectorizable_float_buffer();
+		pop_goods_spending_count = state.world.pop_size();
 	}
 
 	state.world.execute_parallel_over_pop([&](auto ids) {
@@ -785,12 +909,18 @@ void update_consumption(
 		// get all data into vectors
 		vectorized_pops_budget<ve::fp_vector> data = prepare_pop_budget_templated(state, ids);
 
-		if(pop_budget_trace) {
+		if(pop_budget_trace || service_flow_trace) {
 			trace_required.set(ids,
 				data.life_needs.required + data.everyday_needs.required + data.luxury_needs.required);
 			trace_required_life.set(ids, data.life_needs.required);
 			trace_spent.set(ids, data.spent_total);
 			trace_spent_life.set(ids, data.life_needs.spent);
+			trace_housing_required.set(ids, data.housing.required);
+			trace_housing_spent.set(ids, data.housing.spent);
+			trace_education_required.set(ids, data.education.required);
+			trace_education_spent.set(ids, data.education.spent);
+			trace_everyday_spent.set(ids, data.everyday_needs.spent);
+			trace_luxury_spent.set(ids, data.luxury_needs.spent);
 			trace_savings.set(ids, state.world.pop_get_savings(ids));
 			trace_ratio_life.set(ids, data.life_needs.satisfied_with_money_ratio);
 		}
@@ -847,7 +977,30 @@ void update_consumption(
 		// we do save savings here because a part of education is given for free
 		// which leads to some part of wealth not being spent most of the time
 		state.world.pop_set_savings(ids, ve::max(0.f, data.remaining_savings));
+
+		if(record_buyer_spending) {
+			auto goods_spending = data.life_needs.spent + data.everyday_needs.spent + data.luxury_needs.spent;
+			state.world.for_each_consumption_category([&](auto cat) {
+				goods_spending = goods_spending + data.per_consumption_category[cat.index()].spent;
+			});
+			pop_goods_spending.set(ids, goods_spending);
+		}
 	});
+
+	if(record_buyer_spending) {
+		market_consumption_spending_buffer.assign(state.world.market_size(), 0.f);
+		state.world.execute_serial_over_pop([&](auto p) {
+			auto const prov = state.world.pop_get_province_from_pop_location(p);
+			auto const sid = state.world.province_get_state_membership(prov);
+			auto const mid = state.world.state_instance_get_market_from_local_market(sid);
+			auto const spending = pop_goods_spending.get(p);
+			ve::apply([&](dcon::market_id m, float v) {
+				if(m && std::isfinite(v) && v > 0.f && size_t(m.index()) < market_consumption_spending_buffer.size()) {
+					market_consumption_spending_buffer[size_t(m.index())] += v;
+				}
+			}, mid, spending);
+		});
+	}
 
 	if(les_actual_budget || les_income_budget || trace_pop_demand) {
 		state.world.execute_serial_over_pop([&](auto p) {
@@ -904,6 +1057,37 @@ void update_consumption(
 			state.world.province_set_service_demand_forbidden_public_supply(pid, services::list::urban_housing, housing_old + demand_housing.get(pop));
 		});
 	});
+
+	if(service_flow_trace && !economy::is_presimulation_update()) {
+		auto const ymd = state.current_date.to_ymd(state.start_date);
+		if(ymd.day == 1) {
+			auto const province_count = size_t(state.world.province_size());
+			service_trace_housing_required.assign(province_count, 0.f);
+			service_trace_housing_spent.assign(province_count, 0.f);
+			service_trace_education_required.assign(province_count, 0.f);
+			service_trace_education_spent.assign(province_count, 0.f);
+
+			state.world.for_each_province([&](dcon::province_id pid) {
+				if(pid.index() >= state.province_definitions.first_sea_province.index())
+					return;
+				auto housing_required = 0.f;
+				auto housing_spent = 0.f;
+				auto education_required = 0.f;
+				auto education_spent = 0.f;
+				state.world.province_for_each_pop_location(pid, [&](auto location) {
+					auto pop = state.world.pop_location_get_pop(location);
+					housing_required += trace_housing_required.get(pop);
+					housing_spent += trace_housing_spent.get(pop);
+					education_required += trace_education_required.get(pop);
+					education_spent += trace_education_spent.get(pop);
+				});
+				service_trace_housing_required[pid.index()] = housing_required;
+				service_trace_housing_spent[pid.index()] = housing_spent;
+				service_trace_education_required[pid.index()] = education_required;
+				service_trace_education_spent[pid.index()] = education_spent;
+			});
+		}
+	}
 
 	// commodities (actually groups of commodities) are at market level
 
@@ -1082,6 +1266,11 @@ void update_consumption(
 				register_demand(state, ids, cid, demand_life);
 				register_demand(state, ids, cid, demand_everyday);
 				register_demand(state, ids, cid, demand_luxury);
+				if(household_demand_tracking) {
+					ve::apply([&](dcon::market_id m, float amount) { trace_household_demand(m, cid, amount); }, ids, demand_life);
+					ve::apply([&](dcon::market_id m, float amount) { trace_household_demand(m, cid, amount); }, ids, demand_everyday);
+					ve::apply([&](dcon::market_id m, float amount) { trace_household_demand(m, cid, amount); }, ids, demand_luxury);
+				}
 			}
 		}
 		// do the same for new weights
@@ -1133,6 +1322,9 @@ void update_consumption(
 #endif
 			});
 			register_demand(state, ids, cid, total);
+			if(household_demand_tracking) {
+				ve::apply([&](dcon::market_id m, float amount) { trace_household_demand(m, cid, amount); }, ids, total);
+			}
 		});
 	});
 
@@ -1143,22 +1335,30 @@ void update_consumption(
 			if(path)
 				pop_budget_file = fopen(path, "w");
 			if(pop_budget_file)
-				fprintf(pop_budget_file, "date,pops,savings,required,required_life,spent,spent_life,ratio_life,wage_income,property_income,ratio_weighted,share_below25,share_below50,share_below100\n");
+				fprintf(pop_budget_file, "date,pops,savings,required,required_life,spent,spent_life,housing_required,housing_spent,education_required,education_spent,everyday_spent,luxury_spent,service_spent,ratio_life,wage_income,property_income,ratio_weighted,share_below25,share_below50,share_below100\n");
 		}
 		auto const ymd = state.current_date.to_ymd(state.start_date);
 		if(pop_budget_file && ymd.day == 1) {
 			double req = 0.0, req_life = 0.0, spent = 0.0, spent_life = 0.0, savings = 0.0, ratio = 0.0;
+			double req_housing = 0.0, spent_housing = 0.0, req_education = 0.0, spent_education = 0.0;
+			double spent_everyday = 0.0, spent_luxury = 0.0;
 			double ratio_w_num = 0.0, ratio_w_den = 0.0;
 			double below25 = 0.0, below50 = 0.0, below75 = 0.0, below100 = 0.0;
 			uint32_t count = 0;
 			state.world.execute_serial_over_pop([&](auto ids) {
-				ve::apply([&](float a, float b, float c, float d, float e, float g) {
+				ve::apply([&](float a, float b, float c, float d, float e, float g, float h, float i, float j, float k, float l, float m) {
 					req += double(a);
 					req_life += double(b);
 					spent += double(c);
 					spent_life += double(d);
 					savings += double(e);
 					ratio += double(g);
+					req_housing += double(h);
+					spent_housing += double(i);
+					req_education += double(j);
+					spent_education += double(k);
+					spent_everyday += double(l);
+					spent_luxury += double(m);
 					++count;
 					if(b > 0.f) {
 						ratio_w_num += double(b) * double(g);
@@ -1169,12 +1369,17 @@ void update_consumption(
 						if(g < 1.00f) below100 += double(b);
 					}
 				}, trace_required.get(ids), trace_required_life.get(ids), trace_spent.get(ids),
-					trace_spent_life.get(ids), trace_savings.get(ids), trace_ratio_life.get(ids));
+					trace_spent_life.get(ids), trace_savings.get(ids), trace_ratio_life.get(ids),
+					trace_housing_required.get(ids), trace_housing_spent.get(ids),
+					trace_education_required.get(ids), trace_education_spent.get(ids),
+					trace_everyday_spent.get(ids), trace_luxury_spent.get(ids));
 			});
 			char datebuf[16];
 			std::snprintf(datebuf, sizeof(datebuf), "%04d-%02d-%02d", ymd.year, ymd.month, ymd.day);
-			fprintf(pop_budget_file, "%s,%u,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g\n",
+			fprintf(pop_budget_file, "%s,%u,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g\n",
 				datebuf, count, savings, req, req_life, spent, spent_life,
+				req_housing, spent_housing, req_education, spent_education, spent_everyday, spent_luxury,
+				spent_housing + spent_education,
 				count > 0 ? ratio / double(count) : 0.0,
 				trace_daily_wage_income, trace_daily_property_income,
 				ratio_w_den > 0.0 ? ratio_w_num / ratio_w_den : 0.0,
@@ -1343,6 +1548,31 @@ float estimate_trade_income(sys::state const& state, dcon::pop_id pop) {
 }
 
 void update_income_non_labor(sys::state& state) {
+	if(pop_budget_trace) {
+		// LOCAL TRACE: property income is a daily flow; clear yesterday's total before this
+		// day's distribution so pop_budget.csv matches the daily wage_income column.
+		trace_daily_property_income = 0.0;
+	}
+
+	if(service_flow_trace && !economy::is_presimulation_update()) {
+		auto const ymd = state.current_date.to_ymd(state.start_date);
+		if(ymd.day == 1) {
+			auto const province_count = size_t(state.world.province_size());
+			service_trace_city_bank_before.assign(province_count, 0.f);
+			service_trace_school_bank_before.assign(province_count, 0.f);
+			state.world.for_each_province([&](dcon::province_id pid) {
+				if(pid.index() >= state.province_definitions.first_sea_province.index())
+					return;
+				service_trace_city_bank_before[pid.index()] =
+					state.world.province_get_advanced_province_building_private_savings(
+						pid, advanced_province_buildings::list::local_cities_and_towns);
+				service_trace_school_bank_before[pid.index()] =
+					state.world.province_get_advanced_province_building_private_savings(
+						pid, advanced_province_buildings::list::schools_and_universities);
+			});
+		}
+	}
+
 	/*
 
 	Sum up tokens of eligible pops.
@@ -1405,6 +1635,28 @@ void update_income_non_labor(sys::state& state) {
 	static ve::vectorizable_buffer<float, dcon::market_id> market_rgo_money(uint32_t(1));
 	static ve::vectorizable_buffer<float, dcon::market_id> market_factory_money(uint32_t(1));
 
+	// LOCAL EXPERIMENT (ALICE_EXP_PROPERTY_INCOME_FLOW=1): distribute current daily producer
+	// profit instead of a fixed share of the accumulated producer-bank stock. The flow buffers
+	// are market aggregates; bank totals cap the payout so a bank cannot pay more than it holds.
+	static bool const property_income_flow = []() {
+		auto e = std::getenv("ALICE_EXP_PROPERTY_INCOME_FLOW");
+		return e && std::atoi(e) != 0;
+	}();
+	static float const property_income_share = []() {
+		auto e = std::getenv("ALICE_PROPERTY_INCOME_SHARE");
+		return e ? std::clamp(float(std::atof(e)), 0.f, 1.f) : 0.5f;
+	}();
+	bool const flow_active = property_income_flow && !economy::is_presimulation_update();
+	static ve::vectorizable_buffer<float, dcon::market_id> market_rent_flow(uint32_t(1));
+	static ve::vectorizable_buffer<float, dcon::market_id> market_rgo_flow(uint32_t(1));
+	static ve::vectorizable_buffer<float, dcon::market_id> market_factory_flow(uint32_t(1));
+	static ve::vectorizable_buffer<float, dcon::market_id> market_rent_bank(uint32_t(1));
+	static ve::vectorizable_buffer<float, dcon::market_id> market_rgo_bank(uint32_t(1));
+	static ve::vectorizable_buffer<float, dcon::market_id> market_factory_bank(uint32_t(1));
+	static ve::vectorizable_buffer<float, dcon::market_id> market_rent_distributed(uint32_t(1));
+	static ve::vectorizable_buffer<float, dcon::market_id> market_rgo_distributed(uint32_t(1));
+	static ve::vectorizable_buffer<float, dcon::market_id> market_factory_distributed(uint32_t(1));
+
 	static ve::vectorizable_buffer<float, dcon::nation_id> nation_trade_tokens(uint32_t(1));
 	static ve::vectorizable_buffer<float, dcon::nation_id> nation_trade_money(uint32_t(1));
 	static ve::vectorizable_buffer<float, dcon::nation_id> nation_rgo_tokens(uint32_t(1));
@@ -1422,9 +1674,18 @@ void update_income_non_labor(sys::state& state) {
 			market_rgo_money = state.world.market_make_vectorizable_float_buffer();
 			market_factory_money = state.world.market_make_vectorizable_float_buffer();
 
+			market_rent_flow = state.world.market_make_vectorizable_float_buffer();
+			market_rgo_flow = state.world.market_make_vectorizable_float_buffer();
+			market_factory_flow = state.world.market_make_vectorizable_float_buffer();
+			market_rent_bank = state.world.market_make_vectorizable_float_buffer();
+			market_rgo_bank = state.world.market_make_vectorizable_float_buffer();
+			market_factory_bank = state.world.market_make_vectorizable_float_buffer();
+			market_rent_distributed = state.world.market_make_vectorizable_float_buffer();
+			market_rgo_distributed = state.world.market_make_vectorizable_float_buffer();
+			market_factory_distributed = state.world.market_make_vectorizable_float_buffer();
+
 			old_count = new_count;
 		}
-
 		static uint32_t old_count_nation = 1;
 		auto new_count_nation = state.world.nation_size();
 
@@ -1454,6 +1715,16 @@ void update_income_non_labor(sys::state& state) {
 		market_rent_money.set(mid_vector, 0.f);
 		market_rgo_money.set(mid_vector, 0.f);
 		market_factory_money.set(mid_vector, 0.f);
+
+		market_rent_flow.set(mid_vector, 0.f);
+		market_rgo_flow.set(mid_vector, 0.f);
+		market_factory_flow.set(mid_vector, 0.f);
+		market_rent_bank.set(mid_vector, 0.f);
+		market_rgo_bank.set(mid_vector, 0.f);
+		market_factory_bank.set(mid_vector, 0.f);
+		market_rent_distributed.set(mid_vector, 0.f);
+		market_rgo_distributed.set(mid_vector, 0.f);
+		market_factory_distributed.set(mid_vector, 0.f);
 	});
 
 	state.world.execute_serial_over_nation([&](auto nation_vector){
@@ -1471,6 +1742,8 @@ void update_income_non_labor(sys::state& state) {
 	constexpr float min_registered_token_size = 2.f;
 
 	constexpr float expected_share = production_dividends_rate;
+	// Flow mode already applies its payout share when the market amount is formed.
+	float const producer_income_scale = flow_active ? 1.f : expected_share;
 
 	auto const artisan_def = state.culture_definitions.artisans;
 	auto artisan_key = demographics::to_key(state, artisan_def);
@@ -1544,6 +1817,26 @@ void update_income_non_labor(sys::state& state) {
 		auto total_state_pops = state.world.state_instance_get_demographics(sid, demographics::total);
 		auto local_province_weight = total_pop / (total_state_pops + 1.f);
 
+		// LOCAL EXPERIMENT: daily producer-profit flows and the bank stocks that back them.
+		if(flow_active) {
+			auto const rgo_flow = std::max(0.f, state.world.province_get_rgo_profit(pid));
+			auto const rgo_bank = std::max(0.f, state.world.province_get_rgo_bank(pid));
+			market_rgo_flow.set(mid, market_rgo_flow.get(mid) + rgo_flow);
+			market_rgo_bank.set(mid, market_rgo_bank.get(mid) + rgo_bank);
+
+			auto factory_flow = 0.f;
+			auto factory_bank = std::max(0.f, state.world.province_get_factory_bank(pid));
+			for(auto f : state.world.province_get_factory_location(pid))
+				factory_flow += std::max(0.f, state.world.factory_get_profit(f.get_factory()));
+			market_factory_flow.set(mid, market_factory_flow.get(mid) + factory_flow);
+			market_factory_bank.set(mid, market_factory_bank.get(mid) + factory_bank);
+
+			auto const rent_current = std::max(0.f, state.world.province_get_advanced_province_building_private_savings(pid, advanced_province_buildings::list::local_cities_and_towns));
+			auto const rent_flow = std::max(0.f, advanced_province_buildings::get_daily_private_profit(pid, advanced_province_buildings::list::local_cities_and_towns));
+			market_rent_flow.set(mid, market_rent_flow.get(mid) + rent_flow);
+			market_rent_bank.set(mid, market_rent_bank.get(mid) + rent_current);
+		}
+
 		auto rgo_workers = ve::fp_vector{ 0.f };
 		state.world.for_each_pop_type([&](dcon::pop_type_id ptid) {
 			if(
@@ -1579,23 +1872,46 @@ void update_income_non_labor(sys::state& state) {
 
 		{
 			auto total = market_rent_money.get(mid);
-			auto current_money = state.world.province_get_advanced_province_building_private_savings(pid, advanced_province_buildings::list::local_cities_and_towns);
-			if (current_money > 0.f)
-				market_rent_money.set(mid, total + current_money);
+			if(!flow_active) {
+				auto current_money = state.world.province_get_advanced_province_building_private_savings(pid, advanced_province_buildings::list::local_cities_and_towns);
+				if (current_money > 0.f)
+					market_rent_money.set(mid, total + current_money);
+			}
 		}
 
 		{
 			auto total = market_rgo_money.get(mid);
-			auto current_money = state.world.province_get_rgo_bank(pid);
-			if(current_money > 0.f)
-				market_rgo_money.set(mid, total + current_money);
+			if(!flow_active) {
+				auto current_money = state.world.province_get_rgo_bank(pid);
+				if(current_money > 0.f)
+					market_rgo_money.set(mid, total + current_money);
+			}
 		}
 
 		{
 			auto total = market_factory_money.get(mid);
-			auto current_money = state.world.province_get_factory_bank(pid);
-			if(current_money > 0.f)
-				market_factory_money.set(mid, total + current_money);
+			if(!flow_active) {
+				auto current_money = state.world.province_get_factory_bank(pid);
+				if(current_money > 0.f)
+					market_factory_money.set(mid, total + current_money);
+			}
+		}
+	});
+
+	state.world.execute_serial_over_market([&](auto mid_vector) {
+		if(flow_active) {
+			auto const rent_has_recipients = market_rent_tokens.get(mid_vector) > min_registered_token_size;
+			auto const rgo_has_recipients = market_rgo_tokens.get(mid_vector) > min_registered_token_size;
+			auto const factory_has_recipients = market_factory_tokens.get(mid_vector) > min_registered_token_size;
+			auto const rent_payout = ve::select(rent_has_recipients, ve::min(market_rent_flow.get(mid_vector) * property_income_share, market_rent_bank.get(mid_vector)), 0.f);
+			auto const rgo_payout = ve::select(rgo_has_recipients, ve::min(market_rgo_flow.get(mid_vector) * property_income_share, market_rgo_bank.get(mid_vector)), 0.f);
+			auto const factory_payout = ve::select(factory_has_recipients, ve::min(market_factory_flow.get(mid_vector) * property_income_share, market_factory_bank.get(mid_vector)), 0.f);
+			market_rent_money.set(mid_vector, rent_payout);
+			market_rgo_money.set(mid_vector, rgo_payout);
+			market_factory_money.set(mid_vector, factory_payout);
+			market_rent_distributed.set(mid_vector, rent_payout);
+			market_rgo_distributed.set(mid_vector, rgo_payout);
+			market_factory_distributed.set(mid_vector, factory_payout);
 		}
 	});
 
@@ -1626,6 +1942,25 @@ void update_income_non_labor(sys::state& state) {
 		auto to_add = validated_money * local_province_weight * national_elites_weight / (local_weight + 1.f);
 		nation_trade_money.set(nation, current + to_add);
 	});
+
+	if(property_income_source_trace) {
+		auto const ymd = state.current_date.to_ymd(state.start_date);
+		if(ymd.day == 1) {
+			double rent = 0.0, trade = 0.0, national = 0.0, rgo = 0.0, factory = 0.0;
+			state.world.for_each_market([&](dcon::market_id m) {
+				rent += double(market_rent_money.get(m)) * double(producer_income_scale);
+				trade += double(state.world.market_get_pop_dividends(m));
+				rgo += double(market_rgo_money.get(m)) * double(producer_income_scale);
+				factory += double(market_factory_money.get(m)) * double(producer_income_scale);
+			});
+			state.world.for_each_nation([&](dcon::nation_id n) {
+				national += double(nation_trade_money.get(n));
+			});
+			fprintf(stderr, "PROPINC %04d-%02d-%02d rent=%.6f trade=%.6f national=%.6f rgo=%.6f factory=%.6f\n",
+				ymd.year, ymd.month, ymd.day, rent, trade, national, rgo, factory);
+			fflush(stderr);
+		}
+	}
 
 	/*
 
@@ -1664,9 +1999,9 @@ void update_income_non_labor(sys::state& state) {
 			auto income = ve::select((profit_to_households || pop_type == aristo_def || pop_type == capis_def) && candidates > min_registered_token_size, total_money / candidates * size, 0.f);
 #ifndef NDEBUG
 			ve::apply([](float v) { assert(std::isfinite(v) && v >= 0); }, income);
-			from_rent = income * expected_share;
+			from_rent = income * producer_income_scale;
 #endif // !NDEBUG
-			total_income = total_income + income * expected_share;
+			total_income = total_income + income * producer_income_scale;
 		}
 
 		{
@@ -1702,10 +2037,10 @@ void update_income_non_labor(sys::state& state) {
 			auto income = ve::select(candidates > min_registered_token_size, total_money / candidates * size * weight, 0.f);
 #ifndef NDEBUG
 			ve::apply([](float v) { assert(std::isfinite(v) && v >= 0); }, income);
-			from_rgo = income * expected_share;
+			from_rgo = income * producer_income_scale;
 #endif // !NDEBUG
 
-			total_income = total_income + income * expected_share;
+			total_income = total_income + income * producer_income_scale;
 		}
 
 		{
@@ -1714,9 +2049,9 @@ void update_income_non_labor(sys::state& state) {
 			auto income = ve::select((profit_to_households || pop_type == capis_def) && candidates > min_registered_token_size && size > 0.f, total_money / candidates * size, 0.f);
 #ifndef NDEBUG
 			ve::apply([](float v) { assert(std::isfinite(v) && v >= 0); }, income);
-			from_factories = income * expected_share;
+			from_factories = income * producer_income_scale;
 #endif // !NDEBUG
-			total_income = total_income + income * expected_share;
+			total_income = total_income + income * producer_income_scale;
 		}
 
 		auto initial_savings = state.world.pop_get_savings(pop_vector);
@@ -1756,29 +2091,154 @@ void update_income_non_labor(sys::state& state) {
 		auto market = state.world.state_instance_get_market_from_local_market(zone);
 		auto valid_market = market != dcon::market_id{ };
 
-		{
-			auto current_money = state.world.province_get_advanced_province_building_private_savings(pid_vector, advanced_province_buildings::list::local_cities_and_towns);
+		if(flow_active) {
+			// Flow mode pays out a market aggregate. Deduct each province's proportional share of
+			// that payout from the same bank that was used to form the market aggregate.
+			auto const rent_bank = market_rent_bank.get(market) + 1e-9f;
+			auto const rgo_bank = market_rgo_bank.get(market) + 1e-9f;
+			auto const factory_bank = market_factory_bank.get(market) + 1e-9f;
+
+			auto const rent_current = state.world.province_get_advanced_province_building_private_savings(pid_vector, advanced_province_buildings::list::local_cities_and_towns);
+			auto const rent_pay = ve::select(valid_market && rent_current > 0.f,
+				ve::min(rent_current, ve::max(0.f, market_rent_distributed.get(market) * rent_current / rent_bank)), 0.f);
 			state.world.province_set_advanced_province_building_private_savings(
 				pid_vector,
 				advanced_province_buildings::list::local_cities_and_towns,
-				ve::select(valid_market && market_rent_tokens.get(market) > min_registered_token_size && current_money > 0.f, current_money* (1.f - expected_share), current_money)
+				rent_current - rent_pay
 			);
-		}
-		{
-			auto current_money = state.world.province_get_rgo_bank(pid_vector);
-			state.world.province_set_rgo_bank(
-				pid_vector,
-				ve::select(valid_market && market_rgo_tokens.get(market) > min_registered_token_size && current_money > 0.f, current_money* (1.f - expected_share), current_money)
-			);
-		}
-		{
-			auto current_money = state.world.province_get_factory_bank(pid_vector);
-			state.world.province_set_factory_bank(
-				pid_vector,
-				ve::select(valid_market && market_factory_tokens.get(market) > min_registered_token_size && current_money > 0.f, current_money* (1.f - expected_share), current_money)
-			);
+
+			auto const rgo_current = state.world.province_get_rgo_bank(pid_vector);
+			auto const rgo_pay = ve::select(valid_market && rgo_current > 0.f,
+				ve::min(rgo_current, ve::max(0.f, market_rgo_distributed.get(market) * rgo_current / rgo_bank)), 0.f);
+			state.world.province_set_rgo_bank(pid_vector, rgo_current - rgo_pay);
+
+			auto const factory_current = state.world.province_get_factory_bank(pid_vector);
+			auto const factory_pay = ve::select(valid_market && factory_current > 0.f,
+				ve::min(factory_current, ve::max(0.f, market_factory_distributed.get(market) * factory_current / factory_bank)), 0.f);
+			state.world.province_set_factory_bank(pid_vector, factory_current - factory_pay);
+		} else {
+			{
+				auto current_money = state.world.province_get_advanced_province_building_private_savings(pid_vector, advanced_province_buildings::list::local_cities_and_towns);
+				state.world.province_set_advanced_province_building_private_savings(
+					pid_vector,
+					advanced_province_buildings::list::local_cities_and_towns,
+					ve::select(valid_market && market_rent_tokens.get(market) > min_registered_token_size && current_money > 0.f, current_money* (1.f - expected_share), current_money)
+				);
+			}
+			{
+				auto current_money = state.world.province_get_rgo_bank(pid_vector);
+				state.world.province_set_rgo_bank(
+					pid_vector,
+					ve::select(valid_market && market_rgo_tokens.get(market) > min_registered_token_size && current_money > 0.f, current_money* (1.f - expected_share), current_money)
+				);
+			}
+			{
+				auto current_money = state.world.province_get_factory_bank(pid_vector);
+				state.world.province_set_factory_bank(
+					pid_vector,
+					ve::select(valid_market && market_factory_tokens.get(market) > min_registered_token_size && current_money > 0.f, current_money* (1.f - expected_share), current_money)
+				);
+			}
 		}
 	});
+
+	if(service_flow_trace && !economy::is_presimulation_update()) {
+		auto const ymd = state.current_date.to_ymd(state.start_date);
+		if(ymd.day == 1) {
+			if(!service_flow_file_init) {
+				service_flow_file_init = true;
+				auto const path = std::getenv("ALICE_SERVICE_TRACE_FILE");
+				if(path)
+					service_flow_file = fopen(path, "w");
+				if(service_flow_file) {
+					fprintf(service_flow_file,
+						"date,province,nation,market,"
+						"pop_housing_required,pop_housing_spent,pop_education_required,pop_education_spent,"
+						"housing_supply,housing_demand,housing_sold_ratio,housing_satisfaction,housing_price,housing_output,housing_revenue,"
+						"city_size,city_bank_before,city_bank_after,"
+						"school_supply,school_demand,school_sold_ratio,school_satisfaction,school_price,school_output,school_revenue,school_labor_cost,school_bank_before,school_bank_after,"
+						"market_rent_tokens,market_rent_pool,market_rent_bank,market_rent_distributed,flow_active\n");
+				}
+			}
+			if(service_flow_file) {
+				char datebuf[16];
+				std::snprintf(datebuf, sizeof(datebuf), "%04d-%02d-%02d", ymd.year, ymd.month, ymd.day);
+				state.world.for_each_province([&](dcon::province_id pid) {
+					if(pid.index() >= state.province_definitions.first_sea_province.index())
+						return;
+					auto const pid_index = size_t(pid.index());
+					auto const nation = state.world.province_get_nation_from_province_ownership(pid);
+					auto const sid = state.world.province_get_state_membership(pid);
+					dcon::market_id market{};
+					if(sid.id.index() != 0)
+						market = state.world.state_instance_get_market_from_local_market(sid.id);
+
+					auto const pop_housing_required = pid_index < service_trace_housing_required.size() ? service_trace_housing_required[pid_index] : 0.f;
+					auto const pop_housing_spent = pid_index < service_trace_housing_spent.size() ? service_trace_housing_spent[pid_index] : 0.f;
+					auto const pop_education_required = pid_index < service_trace_education_required.size() ? service_trace_education_required[pid_index] : 0.f;
+					auto const pop_education_spent = pid_index < service_trace_education_spent.size() ? service_trace_education_spent[pid_index] : 0.f;
+
+					auto const housing_price = state.world.province_get_service_price(pid, services::list::urban_housing);
+					auto const housing_supply = state.world.province_get_service_supply_private(pid, services::list::urban_housing);
+					auto const housing_demand = state.world.province_get_service_demand_forbidden_public_supply(pid, services::list::urban_housing);
+					auto const housing_sold = state.world.province_get_service_sold(pid, services::list::urban_housing);
+					auto const housing_satisfaction = state.world.province_get_service_satisfaction(pid, services::list::urban_housing);
+					auto const housing_output = state.world.province_get_advanced_province_building_private_output(pid, advanced_province_buildings::list::local_cities_and_towns);
+					auto const housing_revenue = housing_output * housing_sold * housing_price;
+					auto const city_size = state.world.province_get_advanced_province_building_private_size(pid, advanced_province_buildings::list::local_cities_and_towns);
+					auto const city_bank_before = pid_index < service_trace_city_bank_before.size() ? service_trace_city_bank_before[pid_index] : 0.f;
+					auto const city_bank_after = state.world.province_get_advanced_province_building_private_savings(pid, advanced_province_buildings::list::local_cities_and_towns);
+
+					auto const school_price = state.world.province_get_service_price(pid, services::list::education);
+					auto const school_supply = state.world.province_get_service_supply_private(pid, services::list::education);
+					auto const school_demand = state.world.province_get_service_demand_forbidden_public_supply(pid, services::list::education);
+					auto const school_sold = state.world.province_get_service_sold(pid, services::list::education);
+					auto const school_satisfaction = state.world.province_get_service_satisfaction(pid, services::list::education);
+					auto const school_output = state.world.province_get_advanced_province_building_private_output(pid, advanced_province_buildings::list::schools_and_universities);
+					auto const school_size = state.world.province_get_advanced_province_building_private_size(pid, advanced_province_buildings::list::schools_and_universities);
+					auto const school_labor_cost = school_size
+						* state.world.province_get_labor_price(pid, economy::labor::high_education)
+						* state.world.province_get_labor_demand_satisfaction(pid, economy::labor::high_education);
+					auto const school_revenue = school_output * school_sold * school_price;
+					auto const school_bank_before = pid_index < service_trace_school_bank_before.size() ? service_trace_school_bank_before[pid_index] : 0.f;
+					auto const school_bank_after = state.world.province_get_advanced_province_building_private_savings(pid, advanced_province_buildings::list::schools_and_universities);
+
+					auto const market_rent_tokens_v = market != dcon::market_id{} ? market_rent_tokens.get(market) : 0.f;
+					auto const market_rent_money_v = market != dcon::market_id{} ? market_rent_money.get(market) : 0.f;
+					auto const market_rent_bank_v = market != dcon::market_id{} ? market_rent_bank.get(market) : 0.f;
+					auto const market_rent_distributed_v = market != dcon::market_id{}
+						? (flow_active ? market_rent_distributed.get(market) : market_rent_money.get(market) * expected_share)
+						: 0.f;
+
+					fprintf(service_flow_file,
+						"%s,%d,%d,%d,"
+						"%.6g,%.6g,%.6g,%.6g,"
+						"%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,"
+						"%.6g,%.6g,%.6g,"
+						"%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,"
+						"%.6g,%.6g,%.6g,%.6g,%d\n",
+						datebuf, int(pid.index()),
+						state.world.nation_is_valid(nation) ? int(nation.index()) : -1,
+						market != dcon::market_id{} ? int(market.index()) : -1,
+						double(pop_housing_required), double(pop_housing_spent),
+						double(pop_education_required), double(pop_education_spent),
+						double(housing_supply), double(housing_demand), double(housing_sold),
+						double(housing_satisfaction), double(housing_price), double(housing_output),
+						double(housing_revenue), double(city_size), double(city_bank_before),
+						double(city_bank_after), double(school_supply), double(school_demand),
+						double(school_sold), double(school_satisfaction), double(school_price),
+						double(school_output), double(school_revenue), double(school_labor_cost),
+						double(school_bank_before), double(school_bank_after),
+						double(market_rent_tokens_v), double(market_rent_money_v),
+						double(market_rent_bank_v), double(market_rent_distributed_v),
+						flow_active ? 1 : 0);
+				});
+				fflush(service_flow_file);
+			}
+		}
+	}
+
+	advanced_province_buildings::trace_apb_state(state, "post_rent");
 }
 
 
