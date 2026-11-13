@@ -140,8 +140,20 @@ void ui::console_edit::on_edit_command(sys::state& state, edit_command command, 
 }
 
 void ui::console_edit::on_text(sys::state& state, char32_t ch) noexcept {
+	// Swallow the key that opens the console instead of toggling on it.
+	//
+	// Opening the console is handled at key level (game_scene.cpp in_game_hotkeys, on TILDA or
+	// BACK_SLASH), and console_window::on_visible immediately hands keyboard focus to this edit
+	// box. GLFW emits a key event and then a character event for the same physical press
+	// (x11_window.c: the key callback runs before the char callback), so the character that
+	// follows the key that opened the console arrives here. Calling show_toggle from here
+	// therefore closed the console on the same press that opened it: the window flashed once and
+	// disappeared, every time. Adding the character to the buffer instead would type a stray
+	// backtick into the command.
+	//
+	// ESC still closes the console (game_scene.cpp handle_escape_basic, reached because ESCAPE
+	// bypasses the edit box), so nothing is lost by ignoring the character here.
 	if(ch == u'`' || ch == u'\\') {
-		ui::console_window::show_toggle(state);
 		return;
 	}
 	edit_box_element_base::on_text(state, ch);

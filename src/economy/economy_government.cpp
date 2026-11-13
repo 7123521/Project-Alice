@@ -20,7 +20,16 @@ namespace economy {
 // Set ALICE_EXP_ADMIN_SEGMENTED_WAGE=0 to restore upstream behaviour.
 static bool const admin_segmented_wage = []() {
 	auto s = std::getenv("ALICE_EXP_ADMIN_SEGMENTED_WAGE");
-	return s ? std::atoi(s) != 0 : true;
+	// LOCAL DEFAULT (landing branch): OFF, reversing the earlier dev-side default.
+	// With this on, demand = budget / max(market_wage, budget/supply) <= supply, which removes
+	// the only signal that can push the administrative wage up. The wage then sits on the
+	// 1e-12 floor, the labour distribution (which is proportional to price squared) collapses
+	// with it, administrative employment goes to zero and every province's control_ratio
+	// falls to about 0.001 -- the province panel shows 0.1% everywhere.
+	// Paired arms, same binary and seed, one year: on -> demand 2.86e4 / supply 1.43e5 (-34%);
+	// off -> 4.47e5 / 5.35e5 (+11%). With it off a single province can reach demand/supply of
+	// 1.2e10, so ALICE_EXP_ADMIN_DEMAND_CAP (on by default here) is required as the backstop.
+	return s ? std::atoi(s) != 0 : false;
 }();
 
 static std::vector<float> admin_wage_buffer;

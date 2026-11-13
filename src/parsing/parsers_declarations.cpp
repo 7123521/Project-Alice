@@ -3278,12 +3278,17 @@ void generic_event::picture(association_type, std::string_view name, error_handl
 	auto events = open_directory(pictures, NATIVE("events"));
 
 	std::string file_name = simple_fs::remove_double_backslashes(std::string("gfx\\pictures\\events\\") + [&]() {
+		// Each branch must return the extension it just probed. All three used to return ".tga",
+		// so an event picture that exists only as .dds (which is how this mod ships them) resolved
+		// to a .tga name that is not on disk. The texture loader then recorded the handle as 0
+		// without logging anything, and the event window drew a black rectangle where the picture
+		// belongs -- with no error anywhere. Found 2026-11-13.
 		if(peek_file(events, simple_fs::utf8_to_native(name) + NATIVE(".tga"))) {
 			return std::string(name) + ".tga";
 		} else if(peek_file(events, simple_fs::utf8_to_native(name) + NATIVE(".dds"))) {
-			return std::string(name) + ".tga";
+			return std::string(name) + ".dds";
 		} else if(peek_file(events, simple_fs::utf8_to_native(name) + NATIVE(".png"))) {
-			return std::string(name) + ".tga";
+			return std::string(name) + ".png";
 		} else {
 			return std::string("GFX_event_no_image.tga");
 		}
