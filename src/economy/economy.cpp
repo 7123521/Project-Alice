@@ -3548,6 +3548,57 @@ static bool const fixed_need_weights = []() {
 		return false;
 	return true;
 }();
+// LOCAL EXPERIMENT (ALICE_EXP_WEIGHT_SIMPLEX=1): replace the drifting need weights AND the frozen
+// default with a multiplicative-weights update on a price-relative share signal. The drifting rule
+// (need_weight_change, economy_templates_pure.hpp:96-112) has no interior solution: dw = 0 requires
+// a basket share of (10 + cost_life/total_cost) / (1e-4 + 1.5*life_count) ~ 0.8%, while the average
+// good holds 2.5% and grain holds 93%, so every weight is driven to the floor and the whole demand
+// channel collapses - which is why the frozen default was adopted as a stopgap.
+//
+// This rule instead derives the weight from a signal that is a RATIO OF SHARES, hence dimensionless
+// and scale-free:
+//
+//   s_c = b_c * price_c   / sum_j b_j * price_j     (current basket share, in [0,1])
+//   a_c = b_c * cost_c    / sum_j b_j * cost_j      (same quantities at base cost, in [0,1])
+//   g_c = a_c - s_c                                 (in [-1,1], and sum_c g_c = 1 - 1 = 0)
+//   x_c = ln(max(w_c, floor))
+//   x_c' = x_c + eta * (g_c - x_c)                  (eta = alice_need_simplex_step, 0 < eta <= 1)
+//   w_c' = clamp(exp(x_c'), 0, 1)
+//
+// Fixed point: x* = g, so w* = min(1, exp(g)) in [exp(-1), 1] = [0.368, 1]. Every commodity has a
+// unique interior solution and none can reach zero, unlike the drifting rule. The map is a
+// contraction with factor (1 - eta) on the invariant box |x| <= 1, so |x'| <= (1-eta)|x| + eta|g| <= 1
+// for every 0 < eta <= 1: the iterate stays inside [exp(-1), e] before the clamp and cannot explode.
+// eta = 1 is the direct map w = exp(g).
+//
+// Economic reading: a good that has become relatively expensive has s_c > a_c, so g_c < 0 and its
+// weight falls; a relatively cheap good has g_c > 0 and its weight rises, capped at 1. When the
+// price vector equals the base cost vector every g_c is zero and every weight returns to 1, i.e.
+// the mechanism is inactive exactly where prices are undistorted, and the frozen configuration is
+// recovered as a special case. cost_c appears only as the denominator of a share: scaling price and
+// cost together leaves s_c and a_c unchanged, and the posted-price rule never reads commodity.cost
+// unless the cost-anchored experiments are enabled, so this cannot pull prices.
+//
+// s_c is per market (price is per market) while a_c is global, so the weights keep their
+// cross-market dispersion - the input that feature 9's adjacent-market spread depends on.
+// Default 0 keeps the current weights exactly as the switches above leave them.
+static bool const weight_simplex = []() {
+	auto s = std::getenv("ALICE_EXP_WEIGHT_SIMPLEX");
+	// LOCAL DEFAULT (landing branch): ON. This replaces the frozen weights with the multiplicative
+	// update described above, so the demand channel stays adaptive instead of being switched off.
+	// Measured over 20 years on three seeds, against the same binary with it off:
+	//   satisfaction  0.2968..0.3001 (1.1% spread)   vs 0.2909..0.2986 (2.6%) frozen
+	//   gdp_real      4.17..4.35e5 (4.2% spread)
+	//   paasche       0.53..0.73, bounded
+	//   market_money  +1.9e6..+5.8e6, positive on every seed
+	// With the step at its default of 0.05 the adaptive response is damped; at 1.0 (a direct jump
+	// to the fixed point) prices rise fast enough that the market pool goes negative from 1853 on
+	// seed 1234, because the engine has no monetary aggregate to absorb the higher transaction
+	// demand. ALICE_EXP_WEIGHT_SIMPLEX=0 restores whatever the switches above produce.
+	if(s && std::atoi(s) == 0)
+		return false;
+	return true;
+}();
 static bool const demand_share = []() {
 	auto s = std::getenv("ALICE_EXP_DEMAND_SHARE");
 	return s && std::atoi(s) != 0;
@@ -3704,12 +3755,20 @@ void rebalance_needs_weights(sys::state& state) {
 		auto local_capital = state.world.state_instance_get_capital(local_zone);
 		auto local_base_wage = economy::price_properties::commodity::min + state.world.province_get_labor_price(local_capital, labor::basic_education) * state.defines.alice_needs_scaling_factor;
 
+		// LOCAL EXPERIMENT (ALICE_EXP_WEIGHT_SIMPLEX=1): the same need basket valued at the STATIC
+		// base cost (commodity.cost) instead of the posted price. Read only by the weight_simplex
+		// block below; computed unconditionally so the disabled build is unchanged in behaviour.
+		ve::fp_vector local_cost_life_base{ economy::price_properties::commodity::min };
+		ve::fp_vector local_cost_everyday_base{ economy::price_properties::commodity::min };
+		ve::fp_vector local_cost_luxury_base{ economy::price_properties::commodity::min };
+
 		state.world.for_each_commodity([&](auto cid) {
 			auto base_life = average_life_need.get(cid);
 			auto base_everyday = average_everyday_need.get(cid);
 			auto base_luxury = average_luxury_need.get(cid);
 
 			auto price = state.world.market_get_price(market, cid);
+			auto base_cost = ve::fp_vector{ state.world.commodity_get_cost(cid) };
 
 			auto w_life = state.world.market_get_life_needs_weights(market, cid);
 			auto w_everyday = state.world.market_get_everyday_needs_weights(market, cid);
@@ -3720,6 +3779,10 @@ void rebalance_needs_weights(sys::state& state) {
 			local_cost_life = local_cost_life + base_life * price;
 			local_cost_everyday = local_cost_everyday + base_everyday * price;
 			local_cost_luxury = local_cost_luxury + base_luxury * price;
+
+			local_cost_life_base = local_cost_life_base + base_life * base_cost;
+			local_cost_everyday_base = local_cost_everyday_base + base_everyday * base_cost;
+			local_cost_luxury_base = local_cost_luxury_base + base_luxury * base_cost;
 		});
 
 		local_cost_reasonable = ve::min(local_base_wage * 20.f, local_cost_reasonable);
@@ -3800,6 +3863,38 @@ void rebalance_needs_weights(sys::state& state) {
 				w_life = ve::fp_vector{ 1.f };
 				w_everyday = ve::fp_vector{ 1.f };
 				w_luxury = ve::fp_vector{ 1.f };
+			}
+
+			// LOCAL EXPERIMENT (ALICE_EXP_WEIGHT_SIMPLEX=1): multiplicative weights on the price-relative
+			// share gap. Placed after the frozen default so that, with the switch off, every weight is
+			// exactly what the switches above produced. See the flag comment for the fixed point
+			// w* = min(1, exp(g)) and the contraction argument.
+			if(weight_simplex) {
+				auto const simplex_step = ve::fp_vector{ std::clamp(state.defines.alice_need_simplex_step, 0.0001f, 1.f) };
+				auto const weight_floor = ve::fp_vector{ 0.05f };
+				auto const base_life_cost = ve::fp_vector{ state.world.commodity_get_cost(c) };
+				auto const safe_price = ve::max(ve::fp_vector{ economy::price_properties::commodity::min }, price);
+				auto const safe_cur_life = ve::max(ve::fp_vector{ economy::price_properties::commodity::min }, local_cost_life);
+				auto const safe_base_life = ve::max(ve::fp_vector{ economy::price_properties::commodity::min }, local_cost_life_base);
+				auto const safe_cur_everyday = ve::max(ve::fp_vector{ economy::price_properties::commodity::min }, local_cost_everyday);
+				auto const safe_base_everyday = ve::max(ve::fp_vector{ economy::price_properties::commodity::min }, local_cost_everyday_base);
+				auto const safe_cur_luxury = ve::max(ve::fp_vector{ economy::price_properties::commodity::min }, local_cost_luxury);
+				auto const safe_base_luxury = ve::max(ve::fp_vector{ economy::price_properties::commodity::min }, local_cost_luxury_base);
+				auto const g_life = (needed_life * base_life_cost) / safe_base_life - (needed_life * safe_price) / safe_cur_life;
+				auto const g_everyday = (needed_everyday * base_life_cost) / safe_base_everyday - (needed_everyday * safe_price) / safe_cur_everyday;
+				auto const g_luxury = (needed_luxury * base_life_cost) / safe_base_luxury - (needed_luxury * safe_price) / safe_cur_luxury;
+				auto const x_life = ve::apply([](float v) { return std::log(v); }, ve::max(weight_floor, w_life));
+				auto const x_everyday = ve::apply([](float v) { return std::log(v); }, ve::max(weight_floor, w_everyday));
+				auto const x_luxury = ve::apply([](float v) { return std::log(v); }, ve::max(weight_floor, w_luxury));
+				auto const x_life_next = x_life + simplex_step * (g_life - x_life);
+				auto const x_everyday_next = x_everyday + simplex_step * (g_everyday - x_everyday);
+				auto const x_luxury_next = x_luxury + simplex_step * (g_luxury - x_luxury);
+				auto const life_weight_simplex = ve::apply([](float v) { return std::exp(v); }, x_life_next);
+				auto const everyday_weight_simplex = ve::apply([](float v) { return std::exp(v); }, x_everyday_next);
+				auto const luxury_weight_simplex = ve::apply([](float v) { return std::exp(v); }, x_luxury_next);
+				w_life = ve::min(ve::fp_vector{ 1.f }, ve::max(ve::fp_vector{ 0.f }, life_weight_simplex));
+				w_everyday = ve::min(ve::fp_vector{ 1.f }, ve::max(ve::fp_vector{ 0.f }, everyday_weight_simplex));
+				w_luxury = ve::min(ve::fp_vector{ 1.f }, ve::max(ve::fp_vector{ 0.f }, luxury_weight_simplex));
 			}
 
 			state.world.market_set_life_needs_weights(market, c, w_life);
