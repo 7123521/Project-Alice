@@ -53,7 +53,8 @@ bool is_presimulation_update() {
 // never debited. Refund only the paid-but-undelivered part: paid_ratio * (1 - bought_ratio).
 static bool const refund_paid_only = []() {
 	auto e = std::getenv("ALICE_EXP_REFUND_PAID_ONLY");
-	return e && std::atoi(e) != 0;
+	// LOCAL DEFAULT (landing branch): on unless explicitly disabled. 90-year gate passed.
+	return e ? std::atoi(e) != 0 : true;
 }();
 // LOCAL EXPERIMENT (ALICE_EXP_REFUND_FROM_ESCROW=1): pay pop refunds by transferring money back
 // from the market's money pool (where the consumption payment went) instead of creating it.
@@ -494,7 +495,7 @@ static bool const price_balance = []() {
 // and no buffer is allocated.
 static bool const price_regression = []() {
 	auto s = std::getenv("ALICE_EXP_PRICE_REGRESSION");
-	return s && std::atoi(s) != 0;
+	return s ? std::atoi(s) != 0 : true;
 }();
 static float const price_regression_k0 = []() {
 	auto s = std::getenv("ALICE_PRICE_REGRESSION_K0");
@@ -7413,7 +7414,7 @@ void daily_update(sys::state& state, bool presimulation, float presimulation_sta
 	// holds, which is an accounting constraint rather than a policy cap. Default 0 keeps upstream.
 	static bool const funded_subsidy = []() {
 		auto s = std::getenv("ALICE_EXP_FUNDED_SUBSIDY");
-		return s && std::atoi(s) != 0;
+		return s ? std::atoi(s) != 0 : true;
 	}();
 
 	/*

@@ -58,7 +58,9 @@ static bool administration_has_supply(sys::state const& state, dcon::province_id
 // inactive wherever the segmented wage keeps demand <= supply. Default 0 = upstream behaviour.
 static bool const admin_demand_cap = []() {
 	auto e = std::getenv("ALICE_EXP_ADMIN_DEMAND_CAP");
-	return e && std::atoi(e) != 0;
+	// LOCAL DEFAULT (landing branch): on unless explicitly disabled. Guards budget/supply
+	// overflow when labour supply decays to a denormal.
+	return e ? std::atoi(e) != 0 : true;
 }();
 
 // Mirrors the total_high_education_and_accepted sum of economy.cpp:10250-10267: same pop types, same
