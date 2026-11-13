@@ -2399,8 +2399,29 @@ constexpr inline float employment_strategy_caution_multiplier = 1.f / (1.f - emp
 // locks factories into permanent under-employment when input/sales conditions are uncertain.
 static bool const smooth_hiring = []() {
 	auto s = std::getenv("ALICE_EXP_SMOOTH_HIRING");
+	// LOCAL DEFAULT (landing branch): on unless explicitly disabled. The upstream 0.7 caution
+	// threshold multiplies positive hiring by zero below it, which locks a factory into permanent
+	// under-employment whenever input or sales conditions are merely uncertain. Measured over 20
+	// years (seed 1234) against the same tree with it off: factory employment +18%, satisfaction
+	// +5%, owned zero-employment provinces 231 -> 167 (-28%), and trade/supply 0.415 -> 0.338,
+	// i.e. from the top edge of the historical 0.10-0.45 band into its middle.
+	return s ? std::atoi(s) != 0 : true;
+}();
+// LOCAL EXPERIMENT (ALICE_EXP_RGO_RECOVERY_SPEED=1): the additive +1 in the employment step is one
+// person per day, so an employer that has fallen to zero re-hires at |gradient| persons/day and needs
+// months to come back. Measured steady-state target/rgo_size spans 0.013..1.000 on one trace, so the
+// deficit below capacity is not what makes recovery slow, and a capacity-relative term would move the
+// equilibrium. This switch enlarges only the additive term, and only while that term is still the
+// dominant part of the coefficient: once 0.001*current_employment >= 1 the addend is exactly 1 again
+// and every expression is the upstream one, bit for bit. No target, no floor and no upper bound is
+// introduced; the crossover is the reciprocal of the 0.001 coefficient already present in the same
+// expression. Default 0 leaves the function byte-identical.
+static bool const rgo_recovery_speed = []() {
+	auto s = std::getenv("ALICE_EXP_RGO_RECOVERY_SPEED");
 	return s && std::atoi(s) != 0;
 }();
+// how many persons/day the additive term reaches at current_employment == 0
+inline constexpr float rgo_recovery_addend_k = 10.f;
 
 template<typename VALUE>
 VALUE hiring_caution_multiplier(VALUE sat) {
@@ -2422,6 +2443,11 @@ VALUE gradient_to_employment_change(VALUE gradient, VALUE wage, VALUE current_em
 			gradient > 0.f
 			? hiring_caution_multiplier(sat)
 			: 1.f;
+		if(rgo_recovery_speed) {
+			auto const scaled = current_employment * 0.001f;
+			auto const addend = 1.f + rgo_recovery_addend_k * (1.f - std::min(scaled, 1.f));
+			return (scaled + addend) * gradient * mult;
+		}
 		return (current_employment * 0.001f + 1.f) * gradient * mult;
 	} else {
 		auto mult = ve::select(
@@ -2429,6 +2455,12 @@ VALUE gradient_to_employment_change(VALUE gradient, VALUE wage, VALUE current_em
 			hiring_caution_multiplier(sat),
 			1.f
 		);
+		if(rgo_recovery_speed) {
+			auto const one = ve::fp_vector{ 1.f };
+			auto const scaled = current_employment * 0.001f;
+			auto const addend = one + rgo_recovery_addend_k * (one - ve::min(scaled, one));
+			return (scaled + addend) * gradient * mult;
+		}
 		return (current_employment * 0.001f + 1.f) * gradient * mult;
 	}
 }
