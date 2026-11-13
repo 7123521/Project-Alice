@@ -53,6 +53,10 @@ jobs:
     #     cmake --build build --parallel --target AliceIncremental
 
   windows-build:
+    # LOCAL: Windows CI disabled on this fork. The economy work on this branch is developed and
+    # verified on Linux only, and the Windows job is the slowest part of the matrix. Flip this
+    # back to `if: true` (or delete the line) to re-enable it.
+    if: false
     strategy:
       matrix:
         config: [debug-windows]
@@ -76,7 +80,7 @@ jobs:
         cmake --build build --parallel --target AliceIncremental
 
   build-check:
-    needs: [windows-build, linux-build]
+    needs: [linux-build]
     runs-on: ubuntu-latest
     name: Build Matrix
     steps:
