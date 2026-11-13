@@ -3526,7 +3526,27 @@ static bool const weight_normalize = []() {
 // Default 0 keeps upstream behaviour.
 static bool const fixed_need_weights = []() {
 	auto s = std::getenv("ALICE_EXP_FIXED_NEED_WEIGHTS");
-	return (s && std::atoi(s) != 0) || level_price_package;
+	// LOCAL DEFAULT (landing branch): ON. The drifting weights use a penalty of
+	// 1.5 * life_count (about 1364 for this mod's twelve poptypes) against a reward of 10, a
+	// ratio of roughly 136 to 1, so every weight walks down to the floor once a good is even
+	// briefly scarce. A pop then "wants" less of a good precisely because that good is hard to
+	// get, which inverts the intended direction, and it also makes the satisfaction ratio
+	// meaningless because the denominator shrinks with it. Measured on seed 1234, grain's
+	// effective weight fell from 0.144 to 0.0021 and registered grain demand from 59,662 to
+	// 1,417 while 72M units sat in warehouses.
+	//
+	// With the weights held at their base values (three seeds, 20 years):
+	//   satisfaction 0.187 -> 0.291..0.299 (spread 2.6% across seeds)
+	//   gdp_real     3.67e5 -> 4.02..4.35e5
+	//   paasche      0.995 -> 0.50..0.60, i.e. goods get cheaper as industry grows
+	//   market_money positive at 1856 on all three seeds
+	// Forty years on seed 1234 holds satisfaction at 0.286..0.310; market money turns negative
+	// from 1864 and bottoms at -8.3e6, two orders of magnitude shallower than the earlier
+	// PRICE_BALANCE + FIXED_NEED_WEIGHTS candidate (-1.3e9).
+	// ALICE_EXP_FIXED_NEED_WEIGHTS=0 restores drifting weights.
+	if(s && std::atoi(s) == 0)
+		return false;
+	return true;
 }();
 static bool const demand_share = []() {
 	auto s = std::getenv("ALICE_EXP_DEMAND_SHARE");
